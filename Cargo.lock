@@ -935,9 +935,9 @@ dependencies = [
 
 [[package]]
 name = "toasty"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2135127a69dedb70bbcae991e7eb40ad9eb63a244073dd74e3cb1b71663040b2"
+checksum = "cc77cbee8c7502039b47dd877c4acd8c1fedd4381e99379d0d72e6a21ed035bf"
 dependencies = [
  "async-trait",
  "bit-set",
@@ -958,9 +958,9 @@ dependencies = [
 
 [[package]]
 name = "toasty-core"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35cd65fdc499388c3d955759ab12069c5a000d625f04090145b903f45d77dd8d"
+checksum = "ff7b7064c138f10f25cd50a7faca915e6071b7e19ee46f4f43c2f93f2a9d0c3f"
 dependencies = [
  "async-trait",
  "bit-set",
@@ -973,9 +973,9 @@ dependencies = [
 
 [[package]]
 name = "toasty-driver-sqlite"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2dbcace43db2c6d3b428e7c0795bf7a348b9f95a19307814128e4754614d58ed"
+checksum = "8c1fce87202e58d73a0b1535bddcd33ea9b8c24729beac22c25e77d72a90579b"
 dependencies = [
  "async-trait",
  "rusqlite",
@@ -990,9 +990,9 @@ dependencies = [
 
 [[package]]
 name = "toasty-macros"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cd536358556be39e3efd42447ee1857ee75af8cb30c2fe3d8466e705e2fa08b"
+checksum = "10845df339b1302d781970805ae76be9e63acb7f8c2ba5675125b05b7774e7c5"
 dependencies = [
  "heck",
  "pluralizer",
@@ -1004,9 +1004,9 @@ dependencies = [
 
 [[package]]
 name = "toasty-sql"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c1da373278b0715f6bee9f6c960e89b6ddef6aca09f227f0f01a87bd57cec37"
+checksum = "5d78bdf83d5654c9c0c4397daa16d1620325294af42b8e798714e4cbef45ee24"
 dependencies = [
  "toasty-core",
 ]
