@@ -1,15 +1,30 @@
-use clap::Command;
+use clap::{Parser, Subcommand};
 
-use super::init;
+use super::chat;
 
-pub async fn run() -> toasty::Result<()> {
-    let matches = Command::new("shion")
-        .about("Program entry commands")
-        .subcommand(Command::new("init").about("Initialize the local database and seed sample data"))
-        .get_matches();
+#[derive(Parser)]
+#[command(name = "shion", about = "Personal agent framework")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    match matches.subcommand() {
-        Some(("init", _)) => init::run().await,
-        _ => Ok(()),
+#[derive(Subcommand)]
+enum Commands {
+    /// Start an interactive chat session
+    Chat {
+        /// SQLite database URL
+        #[arg(long, default_value = "sqlite:./shion.db")]
+        db: String,
+        /// Session identifier (reuse to continue a prior conversation)
+        #[arg(long, default_value = "default")]
+        session: String,
+    },
+}
+
+pub async fn run() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Chat { db, session } => chat::run(&db, &session).await,
     }
 }

@@ -1,4 +1,4 @@
+mod chat;
 mod cli;
-mod init;
 
 pub use cli::run;
