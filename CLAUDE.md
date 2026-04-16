@@ -5,46 +5,65 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-cargo check          # verify compilation without building
-cargo build          # build the project
-cargo run -- init    # run the init command (creates test.db, pushes schema, seeds one user)
-cargo test           # run all tests
-cargo fmt            # format code
+cargo check                        # fast compile check
+cargo build                        # build
+cargo run -- chat                  # start interactive chat (creates shion.db)
+cargo run -- chat --db sqlite:./my.db --session foo  # custom db / session
+cargo test                         # run all tests
+cargo test tools::time             # run a single test module
+cargo fmt                          # format
 ```
 
-`cargo run -- init` is not idempotent — if `test.db` already exists with the schema, it will fail with a table-already-exists error. Delete `test.db` and rerun.
+`shion.db` is disposable developer state — delete it freely to reset.
 
 ## Architecture
 
-This is an early-stage personal Agent framework in Rust. The current code implements a minimal CLI skeleton with SQLite persistence via the `toasty` ORM.
+Personal Agent framework v0.1, implemented in Rust. The codebase follows a DDD-style layered architecture.
 
-**Request flow (target architecture):**
+**Request flow:**
 ```
-CLI -> AgentRuntime -> Planner/Router -> LLM Orchestrator -> Tool Executor -> MemoryStore -> Response
+CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Response
 ```
 
-**Current source layout** (`src/`):
-- `main.rs` — async entry point, delegates to `cli::run()`
-- `cli/cli.rs` — clap command parsing, subcommand dispatch
-- `cli/init.rs` — `init` subcommand: connects to SQLite, pushes schema, seeds a `User`
+**Layers and their responsibilities:**
 
-**Planned module expansion** (from `ARCHITECTURE.md`):
-- `agent/` — `AgentRuntime`, `Session`, `Planner`, `Executor`
-- `domain/` — core trait abstractions: `Message`, `Task`, `Tool`, `MemoryStore`
-- `services/` — LLM client, tool registry, workflow orchestration
-- `tools/` — built-in tools: `time`, `file`, `shell` (shell disabled by default)
-- `infra/` — SQLite, config, logging, model provider adapters
+`domain/` — pure interfaces, no I/O, no external crates
+- `repository.rs` — `SessionRepository` (find/save) and `MessageRepository` (list_by_session/save); the two traits `AgentRuntime` depends on
+- `planner.rs` — `Planner` trait + `Plan` enum (`RespondDirectly`, `CallTool`, `MultiStep`)
+- `tool.rs` — `Tool` trait (name / description / execute)
+- `message.rs`, `session.rs` — core value types
 
-**Key design constraints from `ARCHITECTURE.md`:**
-- `LlmClient`, `Tool`, `Planner`, and `MemoryStore` are all trait-based for substitutability
-- Tool inputs/outputs are plain strings in v0.1; typed schemas come later
-- SQLite is the only persistence backend for v0.1
-- Configuration via `config.toml` + env var overrides (not yet implemented)
+`infra/db.rs` — the only place toasty (SQLite ORM) appears
+- `Db` struct wraps `Arc<Mutex<toasty::Db>>`
+- implements both `SessionRepository` and `MessageRepository`
+- `Db::connect(url)` checks if the db file exists; calls `push_schema()` only for new databases (toasty's `push_schema` is not idempotent)
+- toasty model structs (`SessionRecord`, `MessageRecord`) are private to this file
+- SQLite URL format: `sqlite:./path.db` (single colon, not `sqlite://`)
+
+`agent/runtime.rs` — application logic
+- `AgentRuntime` holds `Arc<dyn SessionRepository>` + `Arc<dyn MessageRepository>` — no knowledge of toasty
+- `handle_input` owns the session lifecycle: load-or-create, append messages, dispatch plan, persist reply
+
+`agent/planner.rs` — `KeywordPlanner`
+- v0.1 rule-based: routes "time" / "now" / "时间" keywords to the `time` tool; everything else → `RespondDirectly` (echo stub until LLM is wired)
+
+`services/tool_registry.rs` — `HashMap<String, Box<dyn Tool>>` with `register` / `execute`
+
+`tools/time.rs` — first built-in tool; returns RFC 3339 UTC timestamp
+
+`cli/chat.rs` — wires everything together; creates `Arc<Db>` and passes it as both repos
+
+## Key extension points
+
+- **Add a tool**: implement `Tool` in `src/tools/`, register it in `cli/chat.rs`
+- **Add LLM**: implement an `LlmClient` trait (not yet in domain), replace the echo stub in `runtime.rs`
+- **Swap persistence**: implement `SessionRepository + MessageRepository` for a different backend; no changes needed in `agent/` or `domain/`
+- **Upgrade planner**: replace `KeywordPlanner` with a model-based impl of `Planner`
 
 ## Testing
 
-Place unit tests with `#[cfg(test)] mod tests` beside the code they cover. Use `#[tokio::test]` for async code. Name tests by behavior (e.g., `init_creates_user_record`). Each new CLI or database behavior needs at least one success-path and one failure-path test.
+Tests live beside the code with `#[cfg(test)] mod tests`. Use `#[tokio::test]` for async. Name tests by behavior (`time_tool_returns_non_empty_string`).
 
-## Commit Style
+## Commit style
 
-Short imperative messages matching the existing history (e.g., `add user lookup`, `wire init command`).
+Short imperative messages: `add file tool`, `wire llm client`.
