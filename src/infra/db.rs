@@ -4,9 +4,11 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::domain::{
+    memory::{Memory, MemoryRepository, parse_memory_kind},
     message::{Message, Role},
-    repository::{MessageRepository, SessionRepository},
+    repository::{MessageRepository, SessionRepository, SkillRepository},
     session::Session,
+    skill::Skill,
 };
 
 // ── toasty models (infra-internal) ───────────────────────────────────────────
@@ -38,6 +40,24 @@ struct MessageRecord {
     timestamp: i64,
 }
 
+#[derive(Debug, toasty::Model)]
+struct MemoryRecord {
+    #[key]
+    id: String,
+    kind: String,
+    content: String,
+    created_at: i64,
+}
+
+#[derive(Debug, toasty::Model)]
+struct SkillRecord {
+    #[key]
+    name: String,
+    description: String,
+    instructions: String,
+    protected: bool,
+}
+
 // ── Db ───────────────────────────────────────────────────────────────────────
 
 pub struct Db {
@@ -52,7 +72,12 @@ impl Db {
             .unwrap_or(true);
 
         let db = toasty::Db::builder()
-            .models(toasty::models!(SessionRecord, MessageRecord))
+            .models(toasty::models!(
+                SessionRecord,
+                MessageRecord,
+                MemoryRecord,
+                SkillRecord
+            ))
             .connect(url)
             .await?;
 
@@ -66,6 +91,90 @@ impl Db {
     }
 }
 
+// ── MemoryRepository ──────────────────────────────────────────────────────────
+
+#[async_trait]
+impl MemoryRepository for Db {
+    async fn list(&self) -> anyhow::Result<Vec<Memory>> {
+        let mut db = self.inner.lock().await;
+        let mut rows = toasty::query!(MemoryRecord).exec(&mut *db).await?;
+        rows.sort_by_key(|r| r.created_at);
+        Ok(rows.into_iter().map(memory_from_record).collect())
+    }
+
+    async fn save(&self, memory: &Memory) -> anyhow::Result<()> {
+        let mut db = self.inner.lock().await;
+        match MemoryRecord::get_by_id(&mut *db, &memory.id).await {
+            Ok(mut record) => {
+                record
+                    .update()
+                    .kind(memory.kind.as_str().to_string())
+                    .content(memory.content.clone())
+                    .created_at(memory.created_at)
+                    .exec(&mut *db)
+                    .await?;
+            }
+            Err(_) => {
+                toasty::create!(MemoryRecord {
+                    id: memory.id.clone(),
+                    kind: memory.kind.as_str().to_string(),
+                    content: memory.content.clone(),
+                    created_at: memory.created_at,
+                })
+                .exec(&mut *db)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+// ── SkillRepository ───────────────────────────────────────────────────────────
+
+#[async_trait]
+impl SkillRepository for Db {
+    async fn find(&self, name: &str) -> anyhow::Result<Option<Skill>> {
+        let mut db = self.inner.lock().await;
+        match SkillRecord::get_by_name(&mut *db, name).await {
+            Ok(record) => Ok(Some(skill_from_record(record))),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<Skill>> {
+        let mut db = self.inner.lock().await;
+        let mut rows = toasty::query!(SkillRecord).exec(&mut *db).await?;
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(rows.into_iter().map(skill_from_record).collect())
+    }
+
+    async fn save(&self, skill: &Skill) -> anyhow::Result<()> {
+        let mut db = self.inner.lock().await;
+        match SkillRecord::get_by_name(&mut *db, &skill.name).await {
+            Ok(mut record) => {
+                record
+                    .update()
+                    .description(skill.description.clone())
+                    .instructions(skill.instructions.clone())
+                    .protected(skill.protected)
+                    .exec(&mut *db)
+                    .await?;
+            }
+            Err(_) => {
+                toasty::create!(SkillRecord {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    instructions: skill.instructions.clone(),
+                    protected: skill.protected,
+                })
+                .exec(&mut *db)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
 // ── SessionRepository ─────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -73,26 +182,21 @@ impl SessionRepository for Db {
     async fn find(&self, id: &str) -> anyhow::Result<Option<Session>> {
         let mut db = self.inner.lock().await;
         match SessionRecord::get_by_id(&mut *db, id).await {
-            Ok(record) => {
-                let created_at = record.created_at;
-                let rows = record.messages().exec(&mut *db).await?;
-                let mut messages: Vec<Message> = rows
-                    .into_iter()
-                    .map(|r| Message {
-                        role: parse_role(&r.role),
-                        content: r.content,
-                        timestamp: r.timestamp,
-                    })
-                    .collect();
-                messages.sort_by_key(|m| m.timestamp);
-                Ok(Some(Session {
-                    id: id.to_string(),
-                    messages,
-                    created_at,
-                }))
-            }
+            Ok(record) => Ok(Some(session_from_record(&mut db, record).await?)),
             Err(_) => Ok(None),
         }
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<Session>> {
+        let mut db = self.inner.lock().await;
+        let mut rows = toasty::query!(SessionRecord).exec(&mut *db).await?;
+        rows.sort_by_key(|r| r.created_at);
+
+        let mut sessions = Vec::with_capacity(rows.len());
+        for record in rows {
+            sessions.push(session_from_record(&mut db, record).await?);
+        }
+        Ok(sessions)
     }
 
     async fn save(&self, session: &Session) -> anyhow::Result<()> {
@@ -151,5 +255,128 @@ fn parse_role(s: &str) -> Role {
         "assistant" => Role::Assistant,
         "tool" => Role::Tool,
         _ => Role::User,
+    }
+}
+
+async fn session_from_record(
+    db: &mut toasty::Db,
+    record: SessionRecord,
+) -> anyhow::Result<Session> {
+    let id = record.id.clone();
+    let created_at = record.created_at;
+    let rows = record.messages().exec(db).await?;
+    let mut messages: Vec<Message> = rows
+        .into_iter()
+        .map(|r| Message {
+            role: parse_role(&r.role),
+            content: r.content,
+            timestamp: r.timestamp,
+        })
+        .collect();
+    messages.sort_by_key(|m| m.timestamp);
+    Ok(Session {
+        id,
+        messages,
+        created_at,
+    })
+}
+
+fn memory_from_record(record: MemoryRecord) -> Memory {
+    Memory {
+        id: record.id,
+        kind: parse_memory_kind(&record.kind),
+        content: record.content,
+        created_at: record.created_at,
+    }
+}
+
+fn skill_from_record(record: SkillRecord) -> Skill {
+    Skill {
+        name: record.name,
+        description: record.description,
+        instructions: record.instructions,
+        protected: record.protected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::memory::MemoryKind;
+
+    fn sqlite_url(name: &str) -> String {
+        let path = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_file(&path);
+        format!("sqlite:{}", path.display())
+    }
+
+    #[tokio::test]
+    async fn memory_repository_roundtrip() {
+        let db = Db::connect(&sqlite_url("shion_memory_repo_test.db"))
+            .await
+            .unwrap();
+        let memory = Memory::new(MemoryKind::Project, "project uses Rust");
+
+        MemoryRepository::save(&db, &memory).await.unwrap();
+        let rows = MemoryRepository::list(&db).await.unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, MemoryKind::Project);
+        assert_eq!(rows[0].content, "project uses Rust");
+    }
+
+    #[tokio::test]
+    async fn session_repository_lists_sessions() {
+        let db = Db::connect(&sqlite_url("shion_session_repo_test.db"))
+            .await
+            .unwrap();
+        let first = Session::new("first");
+        let second = Session::new("second");
+
+        SessionRepository::save(&db, &first).await.unwrap();
+        MessageRepository::save(&db, "first", &Message::user("hello"))
+            .await
+            .unwrap();
+        SessionRepository::save(&db, &second).await.unwrap();
+
+        let rows = SessionRepository::list(&db).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "first");
+        assert_eq!(rows[0].user_turns(), 1);
+        assert_eq!(rows[1].id, "second");
+    }
+
+    #[tokio::test]
+    async fn skill_repository_upserts_by_name() {
+        let db = Db::connect(&sqlite_url("shion_skill_repo_test.db"))
+            .await
+            .unwrap();
+        let skill = Skill {
+            name: "debug-builds".to_string(),
+            description: "Debug build failures".to_string(),
+            instructions: "Check compiler errors first.".to_string(),
+            protected: true,
+        };
+
+        SkillRepository::save(&db, &skill).await.unwrap();
+        SkillRepository::save(
+            &db,
+            &Skill {
+                instructions: "Check compiler errors, then run focused tests.".to_string(),
+                ..skill.clone()
+            },
+        )
+        .await
+        .unwrap();
+
+        let found = SkillRepository::find(&db, "debug-builds")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(found.protected);
+        assert!(found.instructions.contains("focused tests"));
+
+        let rows = SkillRepository::list(&db).await.unwrap();
+        assert_eq!(rows.len(), 1);
     }
 }

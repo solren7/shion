@@ -17,4 +17,11 @@ impl Session {
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
         }
     }
+
+    pub fn user_turns(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|m| m.role == super::message::Role::User)
+            .count()
+    }
 }

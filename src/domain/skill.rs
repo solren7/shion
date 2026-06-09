@@ -5,6 +5,7 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub instructions: String,
+    pub protected: bool,
 }
 
 impl Skill {
@@ -38,6 +39,7 @@ impl Skill {
             name,
             description: description.unwrap_or_default(),
             instructions: body,
+            protected: false,
         })
     }
 }
