@@ -1,3 +1,4 @@
+mod approver;
 mod chat;
 mod cli;
 

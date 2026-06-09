@@ -17,7 +17,9 @@ impl Planner for KeywordPlanner {
             .map(|m| m.content.to_lowercase());
 
         match last_user_msg.as_deref() {
-            Some(text) if text.contains("time") || text.contains("时间") || text.contains("now") => {
+            Some(text)
+                if text.contains("time") || text.contains("时间") || text.contains("now") =>
+            {
                 Plan::CallTool {
                     tool_name: "time".to_string(),
                     input: String::new(),

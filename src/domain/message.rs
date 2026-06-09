@@ -18,19 +18,35 @@ pub struct Message {
 
 impl Message {
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: Role::User, content: content.into(), timestamp: now() }
+        Self {
+            role: Role::User,
+            content: content.into(),
+            timestamp: now(),
+        }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, content: content.into(), timestamp: now() }
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            timestamp: now(),
+        }
     }
 
     pub fn tool(content: impl Into<String>) -> Self {
-        Self { role: Role::Tool, content: content.into(), timestamp: now() }
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            timestamp: now(),
+        }
     }
 
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: Role::System, content: content.into(), timestamp: now() }
+        Self {
+            role: Role::System,
+            content: content.into(),
+            timestamp: now(),
+        }
     }
 }
 

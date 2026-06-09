@@ -4,6 +4,7 @@ use tracing::{debug, info};
 
 use crate::{
     domain::{
+        llm::LlmClient,
         message::Message,
         planner::{Plan, Planner},
         repository::{MessageRepository, SessionRepository},
@@ -14,6 +15,7 @@ use crate::{
 
 pub struct AgentRuntime {
     pub planner: Box<dyn Planner>,
+    pub llm: Arc<dyn LlmClient>,
     pub tools: ToolRegistry,
     pub sessions: Arc<dyn SessionRepository>,
     pub messages: Arc<dyn MessageRepository>,
@@ -43,7 +45,7 @@ impl AgentRuntime {
         debug!(?plan, "planner decision");
 
         let reply = match plan {
-            Plan::RespondDirectly => format!("(echo) {}", user_input),
+            Plan::RespondDirectly => self.llm.complete(&session).await?,
             Plan::CallTool { tool_name, input } => {
                 info!(tool = %tool_name, "executing tool");
                 let output = self.tools.execute(&tool_name, input).await?;
@@ -66,7 +68,9 @@ impl AgentRuntime {
             }
         };
 
-        self.messages.save(session_id, &Message::assistant(&reply)).await?;
+        self.messages
+            .save(session_id, &Message::assistant(&reply))
+            .await?;
 
         Ok(reply)
     }

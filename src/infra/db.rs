@@ -18,7 +18,7 @@ struct SessionRecord {
     created_at: i64,
 
     #[has_many]
-    messages: toasty::HasMany<MessageRecord>,
+    messages: toasty::Deferred<Vec<MessageRecord>>,
 }
 
 #[derive(Debug, toasty::Model)]
@@ -31,7 +31,7 @@ struct MessageRecord {
     session_id: String,
 
     #[belongs_to(key = session_id, references = id)]
-    session_record: toasty::BelongsTo<SessionRecord>,
+    session_record: toasty::Deferred<SessionRecord>,
 
     role: String,
     content: String,
@@ -60,7 +60,9 @@ impl Db {
             db.push_schema().await?;
         }
 
-        Ok(Self { inner: Arc::new(Mutex::new(db)) })
+        Ok(Self {
+            inner: Arc::new(Mutex::new(db)),
+        })
     }
 }
 
@@ -83,7 +85,11 @@ impl SessionRepository for Db {
                     })
                     .collect();
                 messages.sort_by_key(|m| m.timestamp);
-                Ok(Some(Session { id: id.to_string(), messages, created_at }))
+                Ok(Some(Session {
+                    id: id.to_string(),
+                    messages,
+                    created_at,
+                }))
             }
             Err(_) => Ok(None),
         }

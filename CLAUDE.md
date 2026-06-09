@@ -45,7 +45,13 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 - `handle_input` owns the session lifecycle: load-or-create, append messages, dispatch plan, persist reply
 
 `agent/planner.rs` — `KeywordPlanner`
-- v0.1 rule-based: routes "time" / "now" / "时间" keywords to the `time` tool; everything else → `RespondDirectly` (echo stub until LLM is wired)
+- v0.1 rule-based: routes "time" / "now" / "时间" keywords to the `time` tool; everything else → `RespondDirectly` (answered by the LLM)
+
+`domain/llm.rs` — `LlmClient` trait (`complete(&Session) -> String`); the abstraction `AgentRuntime` calls for `RespondDirectly`
+
+`infra/llm.rs` — `DeepSeekClient`: `LlmClient` backed by the `rig` framework (`rig-core`, aliased as `rig`) against DeepSeek
+- `from_env()` reads `DEEPSEEK_API_KEY`; model `deepseek-chat`
+- v0.1 sends only the latest user message (multi-turn history wiring is TODO)
 
 `services/tool_registry.rs` — `HashMap<String, Box<dyn Tool>>` with `register` / `execute`
 
@@ -56,7 +62,7 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 ## Key extension points
 
 - **Add a tool**: implement `Tool` in `src/tools/`, register it in `cli/chat.rs`
-- **Add LLM**: implement an `LlmClient` trait (not yet in domain), replace the echo stub in `runtime.rs`
+- **Swap LLM provider**: implement `LlmClient` (`domain/llm.rs`) for another backend and construct it in `cli/chat.rs`
 - **Swap persistence**: implement `SessionRepository + MessageRepository` for a different backend; no changes needed in `agent/` or `domain/`
 - **Upgrade planner**: replace `KeywordPlanner` with a model-based impl of `Planner`
 
