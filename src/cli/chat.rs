@@ -1,5 +1,6 @@
 use std::{
-    io::{self, Write},
+    io::{self, BufRead, Write},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -45,20 +46,36 @@ pub async fn run(db_url: &str, session_id: &str) -> anyhow::Result<()> {
     let sub_llm = build_llm(&model_config.aux_variant(), Vec::new(), None)?;
     tools.register(Arc::new(DelegateTool::new(sub_llm)));
 
-    // Skills: instruction playbooks discovered from <workspace>/skills.
-    let skills_dir = workspace
-        .roots()
-        .first()
-        .cloned()
-        .unwrap_or_default()
-        .join("skills");
-    let skills = Arc::new(SkillRegistry::load_from_dir(&skills_dir));
+    // Skills load from, in priority order (first to define a name wins):
+    //   SHION_SKILLS_PATH (colon-separated), <workspace>/skills,
+    //   <workspace>/.claude/skills, and the user-global ~/.claude/skills shared
+    //   by general agents (Claude Agent Skills `SKILL.md` format).
+    let root = workspace.roots().first().cloned().unwrap_or_default();
+    let mut skill_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(extra) = std::env::var("SHION_SKILLS_PATH") {
+        skill_dirs.extend(
+            extra
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+        );
+    }
+    skill_dirs.push(root.join("skills"));
+    skill_dirs.push(root.join(".claude/skills"));
+    if let Ok(home) = std::env::var("HOME") {
+        skill_dirs.push(PathBuf::from(home).join(".claude/skills"));
+    }
+    let skills = Arc::new(SkillRegistry::load_from_dirs(&skill_dirs));
+
+    // Keep the always-on preamble small: list a bounded catalog, the rest is
+    // discoverable on demand via the `skill` tool.
+    const SKILL_CATALOG_CAP: usize = 30;
     let skills_note = (!skills.is_empty()).then(|| {
         format!(
             "You have skills (instruction playbooks) available. To use one, call the \
              `skill` tool with action=view and the skill name to load its instructions, \
              then follow them. Available skills:\n{}",
-            skills.catalog()
+            skills.catalog_capped(SKILL_CATALOG_CAP)
         )
     });
     tools.register(Arc::new(SkillTool::new(skills.clone())));
@@ -80,12 +97,15 @@ pub async fn run(db_url: &str, session_id: &str) -> anyhow::Result<()> {
     // tools (e.g. the shell approval gate) can read stdin while a turn is in
     // flight.
     loop {
-        let mut input = String::new();
-        let bytes = io::stdin().read_line(&mut input)?;
+        // Read raw bytes and decode lossily: `read_line` aborts the whole
+        // program on any non-UTF-8 byte ("stream did not contain valid UTF-8"),
+        // which is too brittle for interactive input.
+        let mut buf = Vec::new();
+        let bytes = io::stdin().lock().read_until(b'\n', &mut buf)?;
         if bytes == 0 {
             break; // EOF (Ctrl-D)
         }
-        let input = input.trim().to_string();
+        let input = String::from_utf8_lossy(&buf).trim().to_string();
         if input.is_empty() {
             continue;
         }

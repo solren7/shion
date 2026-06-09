@@ -1,8 +1,13 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::domain::skill::Skill;
+
+/// How deep to recurse when discovering `SKILL.md` files (plugin trees nest
+/// skills several levels down, e.g. `plugins/<mp>/plugins/<p>/skills/<name>/`).
+const MAX_SCAN_DEPTH: usize = 8;
 
 /// Discovers and holds skills loaded from a directory of `<name>/SKILL.md` files.
 pub struct SkillRegistry {
@@ -14,15 +19,38 @@ impl SkillRegistry {
         Self { skills }
     }
 
-    /// Scan `dir` for `*/SKILL.md` files and parse each into a [`Skill`].
+    /// Scan a single `dir` for `*/SKILL.md` files and parse each into a [`Skill`].
     /// A missing directory yields an empty registry (skills are optional).
     pub fn load_from_dir(dir: &Path) -> Self {
+        let mut skills = Self::scan_dir(dir);
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        Self::new(skills)
+    }
+
+    /// Load skills from multiple directories (e.g. shion's own `skills/`, the
+    /// project's `.claude/skills/`, and the user's `~/.claude/skills/`). The
+    /// first directory to define a given skill name wins, so workspace-local
+    /// skills override globally-shared ones.
+    pub fn load_from_dirs(dirs: &[PathBuf]) -> Self {
+        let mut skills = Vec::new();
+        let mut seen = HashSet::new();
+        for dir in dirs {
+            for skill in Self::scan_dir(dir) {
+                if seen.insert(skill.name.clone()) {
+                    skills.push(skill);
+                }
+            }
+        }
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        Self::new(skills)
+    }
+
+    fn scan_dir(dir: &Path) -> Vec<Skill> {
         let mut skills = Vec::new();
         let Ok(entries) = std::fs::read_dir(dir) else {
-            debug!(?dir, "no skills directory; skills disabled");
-            return Self::new(skills);
+            debug!(?dir, "no skills directory; skipped");
+            return skills;
         };
-
         for entry in entries.flatten() {
             let manifest = entry.path().join("SKILL.md");
             if !manifest.is_file() {
@@ -31,7 +59,7 @@ impl SkillRegistry {
             match std::fs::read_to_string(&manifest) {
                 Ok(content) => match Skill::parse(&content) {
                     Some(skill) => {
-                        debug!(name = %skill.name, "loaded skill");
+                        debug!(name = %skill.name, ?dir, "loaded skill");
                         skills.push(skill);
                     }
                     None => warn!(?manifest, "SKILL.md missing valid frontmatter; skipped"),
@@ -39,8 +67,30 @@ impl SkillRegistry {
                 Err(e) => warn!(?manifest, %e, "failed to read SKILL.md"),
             }
         }
-        skills.sort_by(|a, b| a.name.cmp(&b.name));
-        Self::new(skills)
+        skills
+    }
+
+    pub fn len(&self) -> usize {
+        self.skills.len()
+    }
+
+    /// A capped `- name: description` catalog for the system prompt: lists up to
+    /// `max` skills, noting how many more exist (use the `skill` tool to list all).
+    pub fn catalog_capped(&self, max: usize) -> String {
+        if self.skills.len() <= max {
+            return self.catalog();
+        }
+        let shown = self
+            .skills
+            .iter()
+            .take(max)
+            .map(|s| format!("- {}: {}", s.name, s.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "{shown}\n- …and {} more — call the `skill` tool with action=list to see all.",
+            self.skills.len() - max
+        )
     }
 
     pub fn list(&self) -> &[Skill] {
@@ -92,5 +142,27 @@ mod tests {
     fn missing_directory_is_empty() {
         let reg = SkillRegistry::load_from_dir(Path::new("/nonexistent/shion/skills"));
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn first_directory_wins_on_name_collision() {
+        let base = std::env::temp_dir().join("shion_skill_dirs_test");
+        let local = base.join("local");
+        let global = base.join("global");
+        for (dir, body) in [(&local, "LOCAL version"), (&global, "GLOBAL version")] {
+            let d = dir.join("dup");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!("---\nname: dup\ndescription: d\n---\n{body}"),
+            )
+            .unwrap();
+        }
+
+        let reg = SkillRegistry::load_from_dirs(&[local.clone(), global.clone()]);
+        assert_eq!(reg.len(), 1);
+        assert!(reg.get("dup").unwrap().instructions.contains("LOCAL"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
