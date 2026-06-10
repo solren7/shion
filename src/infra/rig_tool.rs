@@ -44,7 +44,7 @@ impl ToolDyn for RigTool {
             // `args` is the JSON arguments object produced by the model, matching
             // the tool's `parameters_schema`. Pass it through; each tool parses
             // its own arguments (argument-less tools simply ignore it).
-            tool.execute(args)
+            crate::services::tool_registry::execute_isolated(tool, args)
                 .await
                 .map_err(|e| ToolError::ToolCallError(format!("{e:#}").into()))
         })

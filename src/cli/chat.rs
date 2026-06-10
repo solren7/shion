@@ -33,7 +33,17 @@ pub async fn run(db_url: &str) -> anyhow::Result<()> {
     let mut editor = DefaultEditor::new()?;
 
     loop {
-        let input = match editor.readline("->") {
+        // `readline` blocks until the user submits a line; run it on tokio's
+        // blocking thread pool so it never pins an async worker thread. The
+        // editor moves into the closure and back out each iteration.
+        let (line, returned_editor) = tokio::task::spawn_blocking(move || {
+            let line = editor.readline("->");
+            (line, editor)
+        })
+        .await?;
+        editor = returned_editor;
+
+        let input = match line {
             Ok(line) => line.trim().to_string(),
             Err(ReadlineError::Eof) => break,         // Ctrl-D
             Err(ReadlineError::Interrupted) => break, // Ctrl-C
@@ -54,9 +64,13 @@ pub async fn run(db_url: &str) -> anyhow::Result<()> {
         }
 
         // No need to echo the input — `rustyline` already left it on the prompt
-        // line, so re-printing it would double every message.
-        let reply = runtime.handle_input(&current_session, input).await?;
-        println!("Agent: {}\n", reply);
+        // line, so re-printing it would double every message. A failed turn
+        // (tool panic, network error, …) is reported and the loop continues;
+        // only readline/session errors above end the REPL.
+        match runtime.handle_input(&current_session, input).await {
+            Ok(reply) => println!("Agent: {}\n", reply),
+            Err(e) => eprintln!("Error: {e:#}\n"),
+        }
     }
 
     Ok(())
