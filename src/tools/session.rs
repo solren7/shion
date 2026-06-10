@@ -108,6 +108,9 @@ mod tests {
         async fn save(&self, _session: &Session) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn delete_empty_sessions(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
     }
 
     #[tokio::test]

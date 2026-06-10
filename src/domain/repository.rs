@@ -10,6 +10,8 @@ pub trait SessionRepository: Send + Sync {
     async fn list(&self) -> anyhow::Result<Vec<Session>>;
     /// Persist a session (insert or update).
     async fn save(&self, session: &Session) -> anyhow::Result<()>;
+    /// Delete every session that has zero messages. Returns the count removed.
+    async fn delete_empty_sessions(&self) -> anyhow::Result<usize>;
 }
 
 #[async_trait]

@@ -1,4 +1,4 @@
-//! Read-only inspection subcommands (`shion cron list`, `shion session list`).
+//! Operator subcommands (`shion cron list`, `shion session list/clean`).
 //!
 //! These query the database directly and print to stdout — no LLM, no agent
 //! runtime. They are the operator's view into what the gateway will act on.
@@ -64,5 +64,14 @@ pub async fn session_list(db_url: &str) -> anyhow::Result<()> {
             s.user_turns()
         );
     }
+    Ok(())
+}
+
+/// Delete every session with zero messages. An operator action — run it by
+/// hand or from an external scheduler (launchd/cron), e.g. daily at 4am.
+pub async fn session_clean(db_url: &str) -> anyhow::Result<()> {
+    let db = Db::connect(db_url).await?;
+    let removed = SessionRepository::delete_empty_sessions(&db).await?;
+    println!("Removed {removed} empty session(s).");
     Ok(())
 }

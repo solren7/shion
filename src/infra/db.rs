@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
+use tracing::info;
 
 use crate::domain::{
-    memory::{Memory, MemoryRepository, parse_memory_kind},
     message::{Message, Role},
     reminder::{Reminder, ReminderRepository, ReminderStatus, parse_reminder_status},
     repository::{MessageRepository, SessionRepository, SkillRepository},
@@ -39,15 +39,6 @@ struct MessageRecord {
     role: String,
     content: String,
     timestamp: i64,
-}
-
-#[derive(Debug, toasty::Model)]
-struct MemoryRecord {
-    #[key]
-    id: String,
-    kind: String,
-    content: String,
-    created_at: i64,
 }
 
 #[derive(Debug, toasty::Model)]
@@ -87,7 +78,6 @@ impl Db {
             .models(toasty::models!(
                 SessionRecord,
                 MessageRecord,
-                MemoryRecord,
                 SkillRecord,
                 ReminderRecord
             ))
@@ -101,44 +91,6 @@ impl Db {
         Ok(Self {
             inner: Arc::new(Mutex::new(db)),
         })
-    }
-}
-
-// ── MemoryRepository ──────────────────────────────────────────────────────────
-
-#[async_trait]
-impl MemoryRepository for Db {
-    async fn list(&self) -> anyhow::Result<Vec<Memory>> {
-        let mut db = self.inner.lock().await;
-        let mut rows = toasty::query!(MemoryRecord).exec(&mut *db).await?;
-        rows.sort_by_key(|r| r.created_at);
-        Ok(rows.into_iter().map(memory_from_record).collect())
-    }
-
-    async fn save(&self, memory: &Memory) -> anyhow::Result<()> {
-        let mut db = self.inner.lock().await;
-        match MemoryRecord::get_by_id(&mut *db, &memory.id).await {
-            Ok(mut record) => {
-                record
-                    .update()
-                    .kind(memory.kind.as_str().to_string())
-                    .content(memory.content.clone())
-                    .created_at(memory.created_at)
-                    .exec(&mut *db)
-                    .await?;
-            }
-            Err(_) => {
-                toasty::create!(MemoryRecord {
-                    id: memory.id.clone(),
-                    kind: memory.kind.as_str().to_string(),
-                    content: memory.content.clone(),
-                    created_at: memory.created_at,
-                })
-                .exec(&mut *db)
-                .await?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -222,6 +174,25 @@ impl SessionRepository for Db {
         .exec(&mut *db)
         .await;
         Ok(())
+    }
+
+    async fn delete_empty_sessions(&self) -> anyhow::Result<usize> {
+        let mut db = self.inner.lock().await;
+        let rows = toasty::query!(SessionRecord).exec(&mut *db).await?;
+
+        let mut removed = 0usize;
+        for record in rows {
+            let msgs = record.messages().exec(&mut *db).await?;
+            if msgs.is_empty() {
+                record.delete().exec(&mut *db).await?;
+                removed += 1;
+            }
+        }
+
+        if removed > 0 {
+            info!(removed, "pruned empty sessions");
+        }
+        Ok(removed)
     }
 }
 
@@ -343,15 +314,6 @@ async fn session_from_record(
     })
 }
 
-fn memory_from_record(record: MemoryRecord) -> Memory {
-    Memory {
-        id: record.id,
-        kind: parse_memory_kind(&record.kind),
-        content: record.content,
-        created_at: record.created_at,
-    }
-}
-
 fn skill_from_record(record: SkillRecord) -> Skill {
     Skill {
         name: record.name,
@@ -375,27 +337,12 @@ fn reminder_from_record(record: ReminderRecord) -> Reminder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{memory::MemoryKind, reminder::ReminderStatus};
+    use crate::domain::reminder::ReminderStatus;
 
     fn sqlite_url(name: &str) -> String {
         let path = std::env::temp_dir().join(name);
         let _ = std::fs::remove_file(&path);
         format!("sqlite:{}", path.display())
-    }
-
-    #[tokio::test]
-    async fn memory_repository_roundtrip() {
-        let db = Db::connect(&sqlite_url("shion_memory_repo_test.db"))
-            .await
-            .unwrap();
-        let memory = Memory::new(MemoryKind::Project, "project uses Rust");
-
-        MemoryRepository::save(&db, &memory).await.unwrap();
-        let rows = MemoryRepository::list(&db).await.unwrap();
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, MemoryKind::Project);
-        assert_eq!(rows[0].content, "project uses Rust");
     }
 
     #[tokio::test]
@@ -417,6 +364,52 @@ mod tests {
         assert_eq!(rows[0].id, "first");
         assert_eq!(rows[0].user_turns(), 1);
         assert_eq!(rows[1].id, "second");
+    }
+
+    #[tokio::test]
+    async fn delete_empty_sessions_prunes_only_sessions_without_messages() {
+        let db = Db::connect(&sqlite_url("shion_delete_empty_test.db"))
+            .await
+            .unwrap();
+
+        // Session with messages — must survive.
+        let keep = Session::new("keep");
+        SessionRepository::save(&db, &keep).await.unwrap();
+        MessageRepository::save(&db, "keep", &Message::user("hello"))
+            .await
+            .unwrap();
+
+        // Empty session — must be pruned.
+        let drop = Session::new("drop");
+        SessionRepository::save(&db, &drop).await.unwrap();
+
+        // Another empty session.
+        let drop2 = Session::new("drop2");
+        SessionRepository::save(&db, &drop2).await.unwrap();
+
+        let removed = SessionRepository::delete_empty_sessions(&db).await.unwrap();
+        assert_eq!(removed, 2);
+
+        let survivors = SessionRepository::list(&db).await.unwrap();
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].id, "keep");
+    }
+
+    #[tokio::test]
+    async fn delete_empty_sessions_returns_zero_when_none_empty() {
+        let db = Db::connect(&sqlite_url("shion_delete_none_test.db"))
+            .await
+            .unwrap();
+
+        let s = Session::new("only");
+        SessionRepository::save(&db, &s).await.unwrap();
+        MessageRepository::save(&db, "only", &Message::user("hi"))
+            .await
+            .unwrap();
+
+        let removed = SessionRepository::delete_empty_sessions(&db).await.unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(SessionRepository::list(&db).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

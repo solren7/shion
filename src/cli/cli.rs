@@ -61,6 +61,8 @@ enum CronAction {
 enum SessionAction {
     /// List stored sessions with creation time and message counts
     List,
+    /// Delete sessions that contain no messages
+    Clean,
 }
 
 #[derive(Subcommand)]
@@ -99,6 +101,7 @@ pub async fn run() -> anyhow::Result<()> {
         },
         Commands::Session { action } => match action {
             SessionAction::List => inspect::session_list(&db).await,
+            SessionAction::Clean => inspect::session_clean(&db).await,
         },
         Commands::Model { action } => match action {
             ModelAction::List => model::list(),
