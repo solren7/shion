@@ -1,6 +1,7 @@
 pub mod delegate;
 pub mod file;
 pub mod memory;
+pub mod session;
 pub mod shell;
 pub mod skill;
 pub mod time;

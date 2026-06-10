@@ -74,8 +74,7 @@ pub fn ensure_shion_home() -> PathBuf {
         let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
         let env_path = home.join(".env");
         if env_path.exists() {
-            let _ =
-                std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
         }
     }
     home
@@ -268,13 +267,21 @@ mod tests {
         let original = fs::read_to_string(&path).unwrap();
         let cfg = FileConfig::load(&dir);
         assert!(cfg.provider.is_none());
-        assert_eq!(fs::read_to_string(&path).unwrap(), original, "file must not be modified");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original,
+            "file must not be modified"
+        );
     }
 
     #[test]
     fn file_config_loads_provider_and_model() {
         let dir = tmp("valid");
-        fs::write(dir.join("config.toml"), "provider = \"openai\"\nmodel = \"gpt-4o\"\n").unwrap();
+        fs::write(
+            dir.join("config.toml"),
+            "provider = \"openai\"\nmodel = \"gpt-4o\"\n",
+        )
+        .unwrap();
         let cfg = FileConfig::load(&dir);
         assert_eq!(cfg.provider.as_deref(), Some("openai"));
         assert_eq!(cfg.model.as_deref(), Some("gpt-4o"));
@@ -308,7 +315,10 @@ mod tests {
             aux_model: None,
         };
         let s = format!("{cfg:?}");
-        assert!(!s.contains("sk-abcdefghijklmnopqr"), "full key must not appear in Debug output");
+        assert!(
+            !s.contains("sk-abcdefghijklmnopqr"),
+            "full key must not appear in Debug output"
+        );
         assert!(s.contains("sk-"), "prefix should be visible");
     }
 }

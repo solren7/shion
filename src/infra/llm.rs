@@ -23,7 +23,11 @@ use crate::{
 
 const PREAMBLE: &str = "You are Shion, a concise and helpful personal agent. \
     When a request needs live information or an action, call one of your tools \
-    (for example, use the `time` tool to get the current date and time).";
+    (for example, use the `time` tool to get the current date and time). \
+    Questions about your own state — your sessions, conversation history, \
+    memories, or skills — refer to Shion's database, not the operating system: \
+    answer them with the `session`, `memory`, or `skill` tools, never with \
+    shell commands like `tmux ls` or `who`.";
 
 /// Maximum tool-calling round-trips per user turn before the agent must answer.
 const MAX_TURNS: usize = 5;
