@@ -37,9 +37,29 @@ const DANGEROUS_PATTERNS: &[&str] = &[
     ":(){",
 ];
 
+/// Commands that are never run, even with user approval (hermes calls this the
+/// "hardline floor"): the blast radius is the whole machine, not the workspace.
+const HARDLINE_PATTERNS: &[&str] = &[
+    "rm -rf /",
+    "rm -fr /",
+    "mkfs",
+    "dd if=/dev/zero of=/dev/",
+    "of=/dev/sd",
+    "of=/dev/disk",
+    ":(){",
+    "shutdown",
+    "reboot",
+    "halt",
+];
+
 fn dangerous_pattern(command: &str) -> Option<&'static str> {
     let lc = command.to_lowercase();
     DANGEROUS_PATTERNS.iter().copied().find(|p| lc.contains(p))
+}
+
+fn hardline_pattern(command: &str) -> Option<&'static str> {
+    let lc = command.to_lowercase();
+    HARDLINE_PATTERNS.iter().copied().find(|p| lc.contains(p))
 }
 
 #[derive(Deserialize)]
@@ -72,8 +92,9 @@ impl Tool for ShellTool {
 
     fn description(&self) -> &'static str {
         "Run a shell command on the local machine via `sh -c` and return its \
-         combined stdout/stderr. Every invocation requires user approval; \
-         destructive commands require an explicit dangerous-action confirmation."
+         combined stdout/stderr. Safe (read-only) commands run without a \
+         prompt; destructive commands require an explicit dangerous-action \
+         confirmation, and a few catastrophic ones are always refused."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -93,14 +114,26 @@ impl Tool for ShellTool {
         let args: ShellArgs = serde_json::from_str(&input)
             .map_err(|e| anyhow::anyhow!("invalid shell arguments: {e}"))?;
 
-        // Approval gate, escalated for destructive commands.
+        // Hardline floor: catastrophic commands are refused outright — no
+        // approval can unlock them.
+        if let Some(pattern) = hardline_pattern(&args.command) {
+            return Ok(format!(
+                "Command refused: matched hardline pattern `{pattern}`. \
+                 This command is never run, even with approval. Do not retry it."
+            ));
+        }
+
+        // Approval gate (hermes-style): commands matching a dangerous pattern
+        // prompt the user; everything else is `Risk::Safe` and an interactive
+        // approver lets it through without asking.
         let summary = format!("run shell command: {}", args.command);
         let request = match dangerous_pattern(&args.command) {
             Some(pattern) => ApprovalRequest::dangerous(
                 summary,
                 format!("matched dangerous pattern `{pattern}`"),
-            ),
-            None => ApprovalRequest::normal(summary),
+            )
+            .with_scope_key(format!("shell:{pattern}")),
+            None => ApprovalRequest::safe(summary),
         };
         if !self.approver.approve(&request) {
             return Ok("Command rejected by user; nothing was run.".to_string());
@@ -187,11 +220,27 @@ mod tests {
     async fn rejected_command_does_not_run() {
         let tool = ShellTool::new(workspace(), Arc::new(AlwaysReject));
         let out = tool
-            .execute(json!({ "command": "echo should_not_appear" }).to_string())
+            .execute(json!({ "command": "rm -r should_not_appear" }).to_string())
             .await
             .unwrap();
         assert!(out.contains("rejected"));
-        assert!(!out.contains("should_not_appear"));
+        assert!(!out.contains("--- stdout ---"));
+    }
+
+    #[tokio::test]
+    async fn hardline_command_is_refused_without_consulting_approver() {
+        let rec = Arc::new(Recording {
+            risk: Mutex::new(None),
+            approve: true,
+        });
+        let tool = ShellTool::new(workspace(), rec.clone());
+        let out = tool
+            .execute(json!({ "command": "sudo rm -rf / --no-preserve-root" }).to_string())
+            .await
+            .unwrap();
+        assert!(out.contains("refused"));
+        // The approver was never asked: hardline sits above the approval gate.
+        assert_eq!(*rec.risk.lock().unwrap(), None);
     }
 
     #[tokio::test]
@@ -212,7 +261,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn safe_commands_are_normal_risk() {
+    async fn safe_commands_are_safe_risk() {
         let rec = Arc::new(Recording {
             risk: Mutex::new(None),
             approve: true,
@@ -221,6 +270,6 @@ mod tests {
         let _ = tool
             .execute(json!({ "command": "echo hi" }).to_string())
             .await;
-        assert_eq!(*rec.risk.lock().unwrap(), Some(Risk::Normal));
+        assert_eq!(*rec.risk.lock().unwrap(), Some(Risk::Safe));
     }
 }

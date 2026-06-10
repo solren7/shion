@@ -100,12 +100,14 @@ impl Tool for FileTool {
                     .content
                     .ok_or_else(|| anyhow::anyhow!("`content` is required for action=write"))?;
 
-                // Approval gate: writing mutates the filesystem.
+                // Approval gate: writing mutates the filesystem. Answering
+                // "session" at the prompt allows further writes this session.
                 let request = ApprovalRequest::normal(format!(
                     "write {} bytes to {}",
                     content.len(),
                     args.path
-                ));
+                ))
+                .with_scope_key("file:write");
                 if !self.approver.approve(&request) {
                     return Ok("Write rejected by user; nothing was changed.".to_string());
                 }

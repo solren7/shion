@@ -15,7 +15,7 @@ pub async fn run(db_url: &str) -> anyhow::Result<()> {
     let mut current_session = new_session_id();
 
     // Interactive approval at the TTY for side-effecting tools.
-    let approver: Arc<dyn Approver> = Arc::new(CliApprover);
+    let approver: Arc<dyn Approver> = Arc::new(CliApprover::new());
     let runtime = wiring::build(db.clone(), approver).await?.runtime;
 
     ensure_session(&db, &current_session).await?;
