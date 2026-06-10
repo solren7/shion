@@ -8,16 +8,18 @@ Guidance for coding agents (Claude Code and others) working in this repository.
 ```bash
 cargo check                        # fast compile check
 cargo build                        # build
-cargo run -- chat                  # start interactive chat (creates shion.db)
-cargo run -- chat --db sqlite:./my.db  # custom db
+cargo run -- chat                  # start interactive chat (db lives at ~/.shion/shion.db)
 cargo run -- gateway               # always-on process: maintenance + unix-socket ingress
-cargo run -- gateway --schedule "*/30 * * * *"  # custom 5-field cron expression
 cargo test                         # run all tests
 cargo test tools::time             # run a single test module
 cargo fmt                          # format
 ```
 
-`shion.db` is disposable developer state — delete it freely to reset.
+`~/.shion/shion.db` is disposable developer state — delete it freely to reset.
+
+Runtime settings (provider/model/base_url/aux_model, maintenance `schedule`) live in
+`~/.shion/config.toml`; secrets (API keys) in `~/.shion/.env`. Priority: built-in
+defaults < config.toml < `SHION_*` env vars. `SHION_HOME` relocates the whole directory.
 
 ## Architecture
 

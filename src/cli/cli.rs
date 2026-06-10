@@ -12,19 +12,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start an interactive chat session
-    Chat {
-        /// SQLite database URL
-        #[arg(long, default_value = "sqlite:./shion.db")]
-        db: String,
-    },
-    /// Run the always-on gateway: maintenance scheduler + message ingress
+    Chat,
+    /// Run the always-on gateway: maintenance scheduler + message ingress.
+    /// Maintenance cron comes from `schedule` in ~/.shion/config.toml
+    /// (or SHION_SCHEDULE); default hourly.
     Gateway {
-        /// SQLite database URL
-        #[arg(long, default_value = "sqlite:./shion.db")]
-        db: String,
-        /// 5-field Unix cron expression for the maintenance schedule
-        #[arg(long, default_value = "0 * * * *")]
-        schedule: String,
         /// Unix socket path for message ingress
         /// (default: $SHION_GATEWAY_SOCKET or ~/.shion/gateway.sock)
         #[arg(long)]
@@ -34,12 +26,14 @@ enum Commands {
 
 pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // The database always lives in the config directory; use SHION_HOME to
+    // point at a different home (e.g. for tests or a second instance).
+    let db = crate::config::default_db_url();
     match cli.command {
-        Commands::Chat { db } => chat::run(&db).await,
-        Commands::Gateway {
-            db,
-            schedule,
-            socket,
-        } => gateway::run(&db, &schedule, socket.as_deref()).await,
+        Commands::Chat => chat::run(&db).await,
+        Commands::Gateway { socket } => {
+            let schedule = crate::config::maintenance_schedule();
+            gateway::run(&db, &schedule, socket.as_deref()).await
+        }
     }
 }

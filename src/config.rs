@@ -81,6 +81,22 @@ pub fn ensure_shion_home() -> PathBuf {
     home
 }
 
+/// Default database URL: `sqlite:<shion_home>/shion.db`.
+/// Creates the config directory on first use so SQLite can create the file.
+pub fn default_db_url() -> String {
+    format!("sqlite:{}", ensure_shion_home().join("shion.db").display())
+}
+
+/// Maintenance cron schedule: `SHION_SCHEDULE` env > config.toml `schedule`
+/// > hourly default.
+pub fn maintenance_schedule() -> String {
+    std::env::var("SHION_SCHEDULE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| FileConfig::load(&shion_home()).schedule)
+        .unwrap_or_else(|| "0 * * * *".to_string())
+}
+
 /// Settings read from `~/.shion/config.toml`. All fields are optional;
 /// absent keys fall back to `SHION_*` env vars then built-in defaults.
 /// API keys must never appear here — keep them in `~/.shion/.env`.
@@ -91,6 +107,8 @@ pub struct FileConfig {
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub aux_model: Option<String>,
+    /// 5-field Unix cron expression for gateway maintenance (default: hourly).
+    pub schedule: Option<String>,
 }
 
 impl FileConfig {
@@ -260,6 +278,14 @@ mod tests {
         let cfg = FileConfig::load(&dir);
         assert_eq!(cfg.provider.as_deref(), Some("openai"));
         assert_eq!(cfg.model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn file_config_loads_schedule() {
+        let dir = tmp("schedule");
+        fs::write(dir.join("config.toml"), "schedule = \"*/30 * * * *\"\n").unwrap();
+        let cfg = FileConfig::load(&dir);
+        assert_eq!(cfg.schedule.as_deref(), Some("*/30 * * * *"));
     }
 
     #[test]
