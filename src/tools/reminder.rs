@@ -4,9 +4,12 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::domain::{
-    reminder::{Reminder, ReminderRepository, ReminderStatus},
-    tool::Tool,
+use crate::{
+    agent::daemon::next_occurrence_local,
+    domain::{
+        reminder::{Reminder, ReminderRepository, ReminderStatus},
+        tool::Tool,
+    },
 };
 
 #[derive(Deserialize)]
@@ -18,6 +21,8 @@ struct ReminderArgs {
     after: Option<String>,
     #[serde(default)]
     at: Option<String>,
+    #[serde(default)]
+    cron: Option<String>,
     #[serde(default)]
     id: Option<String>,
 }
@@ -39,9 +44,9 @@ impl Tool for ReminderTool {
     }
 
     fn description(&self) -> &'static str {
-        "Schedule one-shot reminders delivered as desktop notifications by the \
-         gateway process. action=\"create\" schedules a new reminder (requires \
-         message + either after or at); action=\"list\" returns pending reminders; \
+        "Schedule reminders delivered as desktop notifications by the gateway \
+         process. action=\"create\" schedules a new reminder (requires message + \
+         one of after/at/cron); action=\"list\" returns pending reminders; \
          action=\"cancel\" cancels a reminder by id."
     }
 
@@ -64,7 +69,11 @@ impl Tool for ReminderTool {
                 },
                 "at": {
                     "type": "string",
-                    "description": "Absolute RFC3339 fire time, e.g. \"2025-01-01T09:00:00+08:00\" (action=create, pick one of after/at)."
+                    "description": "Absolute RFC3339 fire time, e.g. \"2025-01-01T09:00:00+08:00\" (action=create, pick one of after/at/cron)."
+                },
+                "cron": {
+                    "type": "string",
+                    "description": "5-field cron expression in the user's local timezone, e.g. \"0 9 * * *\" for 9 AM daily (action=create, pick one of after/at/cron)."
                 },
                 "id": {
                     "type": "string",
@@ -85,34 +94,54 @@ impl Tool for ReminderTool {
                     .message
                     .ok_or_else(|| anyhow::anyhow!("`message` is required for action=create"))?;
 
-                let run_at = match (args.after, args.at) {
-                    (Some(after), _) => {
+                let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+                match (args.after, args.at, args.cron) {
+                    (Some(after), _, _) => {
                         let delay = parse_after(&after)?;
-                        time::OffsetDateTime::now_utc().unix_timestamp() + delay.as_secs() as i64
+                        let run_at = now + delay.as_secs() as i64;
+                        let reminder = Reminder::new(message, run_at);
+                        let id = reminder.id.clone();
+                        let fire_time = chrono::DateTime::from_timestamp(run_at, 0)
+                            .map(|dt| dt.with_timezone(&chrono::Local).to_rfc3339())
+                            .unwrap_or_else(|| run_at.to_string());
+                        self.reminders.save(&reminder).await?;
+                        Ok(format!(
+                            "Reminder {id} set for {fire_time}. \
+                             Delivered by the gateway process — make sure `shion gateway` is running."
+                        ))
                     }
-                    (None, Some(at)) => {
+                    (_, Some(at), _) => {
                         let dt = chrono::DateTime::parse_from_rfc3339(&at)
                             .map_err(|e| anyhow::anyhow!("invalid `at` time `{at}`: {e}"))?;
-                        dt.timestamp()
+                        let run_at = dt.timestamp();
+                        let reminder = Reminder::new(message, run_at);
+                        let id = reminder.id.clone();
+                        let fire_time = dt.with_timezone(&chrono::Local).to_rfc3339();
+                        self.reminders.save(&reminder).await?;
+                        Ok(format!(
+                            "Reminder {id} set for {fire_time}. \
+                             Delivered by the gateway process — make sure `shion gateway` is running."
+                        ))
                     }
-                    (None, None) => {
-                        return Err(anyhow::anyhow!(
-                            "either `after` or `at` is required for action=create"
-                        ));
+                    (_, _, Some(cron)) => {
+                        let run_at = next_occurrence_local(&cron, now)
+                            .map_err(|e| anyhow::anyhow!("invalid `cron` expression: {e}"))?;
+                        let reminder = Reminder::recurring(message, run_at, cron.clone());
+                        let id = reminder.id.clone();
+                        let next_time = chrono::DateTime::from_timestamp(run_at, 0)
+                            .map(|dt| dt.with_timezone(&chrono::Local).to_rfc3339())
+                            .unwrap_or_else(|| run_at.to_string());
+                        self.reminders.save(&reminder).await?;
+                        Ok(format!(
+                            "Recurring reminder {id} set: {cron} (next at {next_time}). \
+                             Delivered by the gateway process — make sure `shion gateway` is running."
+                        ))
                     }
-                };
-
-                let reminder = Reminder::new(message, run_at);
-                let id = reminder.id.clone();
-                let fire_time = chrono::DateTime::from_timestamp(run_at, 0)
-                    .map(|dt| dt.to_rfc3339())
-                    .unwrap_or_else(|| run_at.to_string());
-
-                self.reminders.save(&reminder).await?;
-                Ok(format!(
-                    "Reminder {id} set for {fire_time}. \
-                     Delivered by the gateway process — make sure `shion gateway` is running."
-                ))
+                    (None, None, None) => Err(anyhow::anyhow!(
+                        "one of `after`, `at`, or `cron` is required for action=create"
+                    )),
+                }
             }
 
             "list" => {
@@ -124,9 +153,16 @@ impl Tool for ReminderTool {
                     .iter()
                     .map(|r| {
                         let fire_time = chrono::DateTime::from_timestamp(r.run_at, 0)
-                            .map(|dt| dt.to_rfc3339())
+                            .map(|dt| dt.with_timezone(&chrono::Local).to_rfc3339())
                             .unwrap_or_else(|| r.run_at.to_string());
-                        format!("{}: {} (due {})", r.id, r.message, fire_time)
+                        if r.is_recurring() {
+                            format!(
+                                "{}: {} (due {}, repeats: {})",
+                                r.id, r.message, fire_time, r.schedule
+                            )
+                        } else {
+                            format!("{}: {} (due {})", r.id, r.message, fire_time)
+                        }
                     })
                     .collect();
                 Ok(lines.join("\n"))
@@ -232,6 +268,19 @@ mod tests {
             }
             Ok(())
         }
+
+        async fn reschedule(&self, id: &str, next_run_at: i64) -> anyhow::Result<()> {
+            if let Some(r) = self
+                .reminders
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|r| r.id == id)
+            {
+                r.run_at = next_run_at;
+            }
+            Ok(())
+        }
     }
 
     fn tool() -> (ReminderTool, Arc<FakeRepo>) {
@@ -271,5 +320,40 @@ mod tests {
             repo.reminders.lock().unwrap()[0].status,
             ReminderStatus::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn reminder_tool_create_with_cron_persists_schedule() {
+        let (t, repo) = tool();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let result = t
+            .execute(
+                json!({"action": "create", "message": "take medication", "cron": "0 9 * * *"})
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Recurring"));
+        assert!(result.contains("0 9 * * *"));
+
+        let rems = repo.reminders.lock().unwrap();
+        assert_eq!(rems.len(), 1);
+        assert_eq!(rems[0].schedule, "0 9 * * *");
+        assert!(rems[0].run_at > now);
+        assert_eq!(rems[0].status, ReminderStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn reminder_tool_rejects_invalid_cron() {
+        let (t, repo) = tool();
+        let result = t
+            .execute(
+                json!({"action": "create", "message": "foo", "cron": "not a cron"}).to_string(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(repo.reminders.lock().unwrap().is_empty());
     }
 }

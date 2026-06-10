@@ -106,6 +106,33 @@ impl Maintenance for ReviewSweep {
 /// (with a "missed" prefix); older ones are marked missed without re-notifying.
 const REMINDER_GRACE_SECS: i64 = 600;
 
+/// Compute the next occurrence of a cron expression strictly after `after`.
+/// Timezone-generic so tests can use `FixedOffset` for determinism while
+/// production uses `Local`.
+pub fn next_occurrence_in<Tz>(
+    expr: &str,
+    after: chrono::DateTime<Tz>,
+) -> anyhow::Result<chrono::DateTime<Tz>>
+where
+    Tz: chrono::TimeZone + Clone,
+{
+    let cron = expr
+        .parse::<Cron>()
+        .map_err(|e| anyhow::anyhow!("invalid cron expression `{expr}`: {e}"))?;
+    Ok(cron.find_next_occurrence(&after, false)?)
+}
+
+/// Production wrapper: compute the next local-time occurrence after `after_unix`
+/// and return it as a Unix timestamp. Computes from the given time (usually
+/// `now`) so a resting daemon always jumps to the next future slot.
+pub fn next_occurrence_local(expr: &str, after_unix: i64) -> anyhow::Result<i64> {
+    let after_utc = chrono::DateTime::from_timestamp(after_unix, 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid unix timestamp: {after_unix}"))?;
+    let after_local = after_utc.with_timezone(&chrono::Local);
+    let next = next_occurrence_in(expr, after_local)?;
+    Ok(next.timestamp())
+}
+
 /// Sweep due reminders every minute and deliver them as desktop notifications.
 pub struct ReminderSweep {
     pub reminders: Arc<dyn ReminderRepository>,
@@ -123,32 +150,66 @@ impl Maintenance for ReminderSweep {
                 continue;
             }
             let late = now - r.run_at;
-            // Notify first, then mark — prefer a duplicate delivery over silent loss.
-            if late > REMINDER_GRACE_SECS {
-                self.notifier
-                    .notify("Shion (missed reminder)", &r.message)
-                    .await
-                    .ok();
-                if let Err(e) = self
-                    .reminders
-                    .set_status(&r.id, ReminderStatus::Missed)
-                    .await
-                {
-                    warn!(error = %e, id = %r.id, "failed to mark reminder missed");
+
+            if r.is_recurring() {
+                // Notify first, then reschedule — prefer duplicate over silent loss.
+                let title = if late > REMINDER_GRACE_SECS {
+                    "Shion (missed reminder)"
+                } else {
+                    "Shion reminder"
+                };
+                self.notifier.notify(title, &r.message).await.ok();
+                // Compute next occurrence from now (not run_at) so a resting daemon
+                // always jumps to a future slot without replaying missed ticks.
+                match next_occurrence_local(&r.schedule, now) {
+                    Ok(next) => {
+                        if let Err(e) = self.reminders.reschedule(&r.id, next).await {
+                            warn!(error = %e, id = %r.id, "failed to reschedule recurring reminder");
+                        } else {
+                            summary.reminders_fired += 1;
+                        }
+                    }
+                    Err(e) => {
+                        // Broken expression (bypassed tool validation): degrade to
+                        // missed so we don't spam errors on every tick.
+                        warn!(error = %e, id = %r.id, "broken schedule; marking missed");
+                        if let Err(e) = self
+                            .reminders
+                            .set_status(&r.id, ReminderStatus::Missed)
+                            .await
+                        {
+                            warn!(error = %e, id = %r.id, "failed to mark reminder missed");
+                        }
+                    }
                 }
             } else {
-                self.notifier
-                    .notify("Shion reminder", &r.message)
-                    .await
-                    .ok();
-                if let Err(e) = self
-                    .reminders
-                    .set_status(&r.id, ReminderStatus::Fired)
-                    .await
-                {
-                    warn!(error = %e, id = %r.id, "failed to mark reminder fired");
+                // One-shot path — original v1 logic unchanged.
+                if late > REMINDER_GRACE_SECS {
+                    self.notifier
+                        .notify("Shion (missed reminder)", &r.message)
+                        .await
+                        .ok();
+                    if let Err(e) = self
+                        .reminders
+                        .set_status(&r.id, ReminderStatus::Missed)
+                        .await
+                    {
+                        warn!(error = %e, id = %r.id, "failed to mark reminder missed");
+                    }
                 } else {
-                    summary.reminders_fired += 1;
+                    self.notifier
+                        .notify("Shion reminder", &r.message)
+                        .await
+                        .ok();
+                    if let Err(e) = self
+                        .reminders
+                        .set_status(&r.id, ReminderStatus::Fired)
+                        .await
+                    {
+                        warn!(error = %e, id = %r.id, "failed to mark reminder fired");
+                    } else {
+                        summary.reminders_fired += 1;
+                    }
                 }
             }
         }
@@ -226,6 +287,7 @@ where
 mod tests {
     use super::*;
     use crate::domain::reminder::{Reminder, ReminderStatus};
+    use chrono::{Datelike, TimeZone, Timelike};
     use std::sync::Mutex;
 
     // ── FakeReminderRepository ────────────────────────────────────────────────
@@ -262,6 +324,19 @@ mod tests {
                 .find(|r| r.id == id)
             {
                 r.status = status;
+            }
+            Ok(())
+        }
+
+        async fn reschedule(&self, id: &str, next_run_at: i64) -> anyhow::Result<()> {
+            if let Some(r) = self
+                .reminders
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|r| r.id == id)
+            {
+                r.run_at = next_run_at;
             }
             Ok(())
         }
@@ -315,6 +390,11 @@ mod tests {
     fn future_reminder() -> Reminder {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         Reminder::new("future".to_string(), now + 3600)
+    }
+
+    fn recurring_reminder(secs_ago: i64, schedule: &str) -> Reminder {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        Reminder::recurring("test".to_string(), now - secs_ago, schedule.to_string())
     }
 
     #[tokio::test]
@@ -387,6 +467,81 @@ mod tests {
                 .iter()
                 .all(|s| *s == ReminderStatus::Fired || *s == ReminderStatus::Pending)
         );
+    }
+
+    // ── cron helpers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn next_occurrence_in_computes_strictly_future_fire() {
+        let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let expr = "0 9 * * *"; // 9 AM daily
+
+        // 8 AM local → next occurrence is 9 AM the same day
+        let at_8am = tz.with_ymd_and_hms(2024, 1, 1, 8, 0, 0).unwrap();
+        let next = next_occurrence_in(expr, at_8am).unwrap();
+        assert_eq!(next.hour(), 9);
+        assert_eq!(next.day(), 1);
+
+        // exactly 9 AM local → next is 9 AM the following day (strictly future)
+        let at_9am = tz.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap();
+        let next = next_occurrence_in(expr, at_9am).unwrap();
+        assert_eq!(next.hour(), 9);
+        assert_eq!(next.day(), 2);
+    }
+
+    #[test]
+    fn next_occurrence_in_rejects_invalid_expr() {
+        let result = next_occurrence_in("not a cron", chrono::Utc::now());
+        assert!(result.is_err());
+    }
+
+    // ── recurring sweep ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sweep_advances_recurring_reminder() {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let r = recurring_reminder(30, "* * * * *");
+        let id = r.id.clone();
+        let (sweep, repo, notifier) = sweep_with(vec![r], false);
+        sweep.run().await.unwrap();
+
+        assert_eq!(notifier.calls.lock().unwrap().len(), 1);
+        assert_eq!(notifier.calls.lock().unwrap()[0].0, "Shion reminder");
+
+        let rems = repo.reminders.lock().unwrap();
+        let updated = rems.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(updated.status, ReminderStatus::Pending);
+        assert!(updated.run_at > now);
+    }
+
+    #[tokio::test]
+    async fn sweep_recurring_overdue_fires_once_and_skips_catchup() {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let r = recurring_reminder(3 * 86400, "0 9 * * *");
+        let id = r.id.clone();
+        let (sweep, repo, notifier) = sweep_with(vec![r], false);
+        sweep.run().await.unwrap();
+
+        // Only one notification (missed)
+        assert_eq!(notifier.calls.lock().unwrap().len(), 1);
+        assert!(notifier.calls.lock().unwrap()[0].0.contains("missed"));
+
+        let rems = repo.reminders.lock().unwrap();
+        let updated = rems.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(updated.status, ReminderStatus::Pending);
+        assert!(updated.run_at > now);
+    }
+
+    #[tokio::test]
+    async fn sweep_marks_recurring_with_broken_schedule_missed() {
+        let r = recurring_reminder(30, "not a valid cron");
+        let id = r.id.clone();
+        let (sweep, repo, _) = sweep_with(vec![r], false);
+        sweep.run().await.unwrap();
+
+        let rems = repo.reminders.lock().unwrap();
+        let updated = rems.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(updated.status, ReminderStatus::Missed);
     }
 
     #[test]

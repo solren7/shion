@@ -34,6 +34,8 @@ pub struct Reminder {
     pub message: String,
     pub run_at: i64,
     pub status: ReminderStatus,
+    /// 5-field cron expression (local timezone). Empty string = one-shot reminder.
+    pub schedule: String,
     pub created_at: i64,
 }
 
@@ -47,8 +49,27 @@ impl Reminder {
             message,
             run_at,
             status: ReminderStatus::Pending,
+            schedule: String::new(),
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
         }
+    }
+
+    pub fn recurring(message: String, run_at: i64, schedule: String) -> Self {
+        Self {
+            id: format!(
+                "rem-{}",
+                time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+            ),
+            message,
+            run_at,
+            status: ReminderStatus::Pending,
+            schedule,
+            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+        }
+    }
+
+    pub fn is_recurring(&self) -> bool {
+        !self.schedule.is_empty()
     }
 }
 
@@ -59,4 +80,6 @@ pub trait ReminderRepository: Send + Sync {
     async fn list_pending(&self) -> anyhow::Result<Vec<Reminder>>;
     /// Transition a reminder's status (Pending → Fired / Missed / Cancelled).
     async fn set_status(&self, id: &str, status: ReminderStatus) -> anyhow::Result<()>;
+    /// Advance a recurring reminder to its next occurrence (status stays Pending).
+    async fn reschedule(&self, id: &str, next_run_at: i64) -> anyhow::Result<()>;
 }

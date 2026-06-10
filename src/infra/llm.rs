@@ -32,7 +32,10 @@ const PREAMBLE: &str = "You are Shion, a concise and helpful personal agent. \
     message and a delay. Reminders are delivered as desktop notifications by the \
     `shion gateway` background process — you do NOT count down yourself, and you \
     must never pretend to track time in the conversation. If the user asks for a \
-    reminder, create it with the tool and relay the tool's confirmation.";
+    reminder, create it with the tool and relay the tool's confirmation. \
+    For recurring reminders (\"every day at 9am\"), pass a 5-field cron expression \
+    via the `cron` parameter (e.g. \"0 9 * * *\"); times are the user's local \
+    timezone. One-shot reminders use `after` or `at` as before.";
 
 /// Maximum tool-calling round-trips per user turn before the agent must answer.
 const MAX_TURNS: usize = 5;
