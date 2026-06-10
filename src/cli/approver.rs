@@ -32,3 +32,19 @@ impl Approver for CliApprover {
         matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
     }
 }
+
+/// Non-interactive approver for unattended contexts (the gateway): there is no
+/// human at a TTY to consent, so every approval-gated action is denied. This
+/// mirrors hermes disabling interactive/dangerous toolsets in its cron/gateway
+/// context — read-only tools still work; side-effecting ones are refused.
+pub struct DenyApprover;
+
+impl Approver for DenyApprover {
+    fn approve(&self, request: &ApprovalRequest) -> bool {
+        tracing::warn!(
+            summary = %request.summary,
+            "approval auto-denied (non-interactive gateway)"
+        );
+        false
+    }
+}

@@ -11,21 +11,31 @@ use rig::{
 };
 
 use crate::{
+    config::{ModelConfig, Provider},
     domain::{
         llm::LlmClient,
         message::{Message, Role},
         session::Session,
         tool::Tool,
     },
-    infra::{
-        config::{ModelConfig, Provider},
-        rig_tool::RigTool,
-    },
+    infra::rig_tool::RigTool,
 };
 
 const PREAMBLE: &str = "You are Shion, a concise and helpful personal agent. \
     When a request needs live information or an action, call one of your tools \
-    (for example, use the `time` tool to get the current date and time).";
+    (for example, use the `time` tool to get the current date and time). \
+    Questions about your own state — your sessions, conversation history, \
+    memories, or skills — refer to Shion's database, not the operating system: \
+    answer them with the `session`, `memory`, or `skill` tools, never with \
+    shell commands like `tmux ls` or `who`. \
+    You CAN schedule reminders: call the `reminder` tool (action=create) with a \
+    message and a delay. Reminders are delivered as desktop notifications by the \
+    `shion gateway` background process — you do NOT count down yourself, and you \
+    must never pretend to track time in the conversation. If the user asks for a \
+    reminder, create it with the tool and relay the tool's confirmation. \
+    For recurring reminders (\"every day at 9am\"), pass a 5-field cron expression \
+    via the `cron` parameter (e.g. \"0 9 * * *\"); times are the user's local \
+    timezone. One-shot reminders use `after` or `at` as before.";
 
 /// Maximum tool-calling round-trips per user turn before the agent must answer.
 const MAX_TURNS: usize = 5;

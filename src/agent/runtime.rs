@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     domain::{
@@ -8,6 +8,7 @@ use crate::{
         message::Message,
         planner::{Plan, Planner},
         repository::{MessageRepository, SessionRepository},
+        reviewer::Reviewer,
         session::Session,
     },
     services::tool_registry::ToolRegistry,
@@ -19,6 +20,8 @@ pub struct AgentRuntime {
     pub tools: ToolRegistry,
     pub sessions: Arc<dyn SessionRepository>,
     pub messages: Arc<dyn MessageRepository>,
+    pub reviewer: Option<Arc<dyn Reviewer>>,
+    pub review_interval: usize,
 }
 
 impl AgentRuntime {
@@ -68,9 +71,26 @@ impl AgentRuntime {
             }
         };
 
-        self.messages
-            .save(session_id, &Message::assistant(&reply))
-            .await?;
+        let assistant_msg = Message::assistant(&reply);
+        self.messages.save(session_id, &assistant_msg).await?;
+        session.messages.push(assistant_msg);
+
+        if let Some(reviewer) = &self.reviewer {
+            let interval = self.review_interval.max(1);
+            if session.user_turns() % interval == 0 {
+                let reviewer = reviewer.clone();
+                let snapshot = session.clone();
+                tokio::spawn(async move {
+                    match reviewer.review(&snapshot).await {
+                        Ok(outcome) if !outcome.is_empty() => {
+                            info!(?outcome, "self-improvement review")
+                        }
+                        Ok(_) => {}
+                        Err(error) => warn!(%error, "review failed (non-fatal)"),
+                    }
+                });
+            }
+        }
 
         Ok(reply)
     }

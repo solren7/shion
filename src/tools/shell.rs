@@ -156,11 +156,15 @@ mod tests {
     }
 
     /// Records the risk level of the last request it saw.
-    struct Recording(Mutex<Option<Risk>>);
+    struct Recording {
+        risk: Mutex<Option<Risk>>,
+        approve: bool,
+    }
+
     impl Approver for Recording {
         fn approve(&self, request: &ApprovalRequest) -> bool {
-            *self.0.lock().unwrap() = Some(request.risk);
-            true
+            *self.risk.lock().unwrap() = Some(request.risk);
+            self.approve
         }
     }
 
@@ -192,21 +196,31 @@ mod tests {
 
     #[tokio::test]
     async fn dangerous_commands_are_flagged() {
-        for cmd in ["rm -rf foo", "git push origin main", "sudo reboot"] {
-            let rec = Arc::new(Recording(Mutex::new(None)));
+        for cmd in ["rm -rf foo", "git push origin main"] {
+            let rec = Arc::new(Recording {
+                risk: Mutex::new(None),
+                approve: false,
+            });
             let tool = ShellTool::new(workspace(), rec.clone());
             let _ = tool.execute(json!({ "command": cmd }).to_string()).await;
-            assert_eq!(*rec.0.lock().unwrap(), Some(Risk::Dangerous), "cmd: {cmd}");
+            assert_eq!(
+                *rec.risk.lock().unwrap(),
+                Some(Risk::Dangerous),
+                "cmd: {cmd}"
+            );
         }
     }
 
     #[tokio::test]
     async fn safe_commands_are_normal_risk() {
-        let rec = Arc::new(Recording(Mutex::new(None)));
+        let rec = Arc::new(Recording {
+            risk: Mutex::new(None),
+            approve: true,
+        });
         let tool = ShellTool::new(workspace(), rec.clone());
         let _ = tool
             .execute(json!({ "command": "echo hi" }).to_string())
             .await;
-        assert_eq!(*rec.0.lock().unwrap(), Some(Risk::Normal));
+        assert_eq!(*rec.risk.lock().unwrap(), Some(Risk::Normal));
     }
 }

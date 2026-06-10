@@ -99,6 +99,7 @@ mod tests {
             name: "greet".to_string(),
             description: "Say hello".to_string(),
             instructions: "Greet the user warmly.".to_string(),
+            protected: false,
         }]))
     }
 
