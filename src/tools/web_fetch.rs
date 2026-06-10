@@ -70,12 +70,23 @@ impl Tool for WebFetchTool {
             .map_err(|e| anyhow::anyhow!("failed to read body: {e}"))?;
 
         let mut text = strip_html(&body);
-        if text.len() > MAX_BYTES {
-            text.truncate(MAX_BYTES);
-            text.push_str("\n…[truncated]");
-        }
+        truncate_to_char_boundary(&mut text, MAX_BYTES);
         Ok(format!("HTTP {status}\n\n{text}"))
     }
+}
+
+/// Truncates to at most `max_bytes`, backing up so the cut never splits a
+/// multi-byte UTF-8 character (String::truncate panics off-boundary).
+fn truncate_to_char_boundary(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str("\n…[truncated]");
 }
 
 /// Crude HTML-to-text: drop script/style blocks, remove tags, collapse blanks.
@@ -123,6 +134,23 @@ fn strip_html(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncation_never_splits_a_multibyte_char() {
+        // 3-byte CJK chars: MAX_BYTES (8192) is not a multiple of 3, so the
+        // naive byte-offset truncate lands mid-codepoint and panics.
+        let mut text = "深".repeat(MAX_BYTES / 3 + 10);
+        truncate_to_char_boundary(&mut text, MAX_BYTES);
+        assert!(text.ends_with("…[truncated]"));
+        assert!(text.is_char_boundary(text.len() - "\n…[truncated]".len()));
+    }
+
+    #[test]
+    fn truncation_leaves_short_text_untouched() {
+        let mut text = "short".to_string();
+        truncate_to_char_boundary(&mut text, MAX_BYTES);
+        assert_eq!(text, "short");
+    }
 
     #[test]
     fn strips_tags_scripts_and_styles() {
