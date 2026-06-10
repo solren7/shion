@@ -62,7 +62,7 @@ pub struct MaintenanceService {
 pub struct Gateway {
     handler: Arc<dyn MessageHandler>,
     channels: Vec<Box<dyn Channel>>,
-    maintenance: Option<MaintenanceService>,
+    services: Vec<MaintenanceService>,
 }
 
 impl Gateway {
@@ -70,7 +70,7 @@ impl Gateway {
         Self {
             handler,
             channels: Vec::new(),
-            maintenance: None,
+            services: Vec::new(),
         }
     }
 
@@ -79,8 +79,11 @@ impl Gateway {
         self
     }
 
+    /// Register a background maintenance service. Can be called multiple times
+    /// to run independent services concurrently (each with its own schedule and
+    /// circuit breaker).
     pub fn with_maintenance(mut self, service: MaintenanceService) -> Self {
-        self.maintenance = Some(service);
+        self.services.push(service);
         self
     }
 
@@ -93,7 +96,7 @@ impl Gateway {
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut handles = Vec::new();
 
-        if let Some(service) = self.maintenance {
+        for service in self.services {
             let mut rx = stop_rx.clone();
             handles.push(tokio::spawn(async move {
                 let stop = async move {
