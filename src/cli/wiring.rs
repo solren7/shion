@@ -16,7 +16,8 @@ use crate::{
         reviewer::Reviewer,
         workspace::Workspace,
     },
-    infra::{config::ModelConfig, db::Db, llm::build_llm},
+    config::ModelConfig,
+    infra::{db::Db, llm::build_llm},
     services::{skill_registry::SkillRegistry, tool_registry::ToolRegistry},
     tools::{
         delegate::DelegateTool, file::FileTool, memory::MemoryTool, shell::ShellTool,

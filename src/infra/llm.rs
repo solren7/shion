@@ -11,16 +11,14 @@ use rig::{
 };
 
 use crate::{
+    config::{ModelConfig, Provider},
     domain::{
         llm::LlmClient,
         message::{Message, Role},
         session::Session,
         tool::Tool,
     },
-    infra::{
-        config::{ModelConfig, Provider},
-        rig_tool::RigTool,
-    },
+    infra::rig_tool::RigTool,
 };
 
 const PREAMBLE: &str = "You are Shion, a concise and helpful personal agent. \
