@@ -13,9 +13,16 @@ cargo run -- gateway               # always-on process: maintenance + unix-socke
 cargo test                         # run all tests
 cargo test tools::time             # run a single test module
 cargo fmt                          # format
+
+shion gateway start                # install + start under launchd (auto-restart, login start)
+shion gateway stop                 # stop and remove from launchd
+shion gateway restart              # regenerate plist + restart (picks up a reinstalled binary)
+shion gateway status               # launchd state (state/pid/last exit code)
 ```
 
 `~/.shion/shion.db` is disposable developer state — delete it freely to reset.
+After a schema change (new toasty model/field), delete `~/.shion/shion.db` —
+`push_schema` only runs for newly created database files.
 
 Runtime settings (provider/model/base_url/aux_model, maintenance `schedule`) live in
 `~/.shion/config.toml`; secrets (API keys) in `~/.shion/.env`. Priority: built-in
@@ -68,15 +75,16 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 `agent/daemon.rs` — background maintenance supervisor, hosted by the gateway (pattern borrowed from gbrain's `autopilot` supervisor)
 - `Schedule` wraps `croner` (5-field Unix cron, e.g. `0 * * * *`); `Maintenance` trait is the scheduled unit of work
 - `ReviewSweep` is the one fixed action: run the reflective reviewer over every stored session with ≥1 user turn
+- `ReminderSweep` delivers due reminders via `Notifier` every minute (10-min grace window; older ones are marked `missed`)
 - `supervise` is the loop: sleep to the next cron fire, run the cycle, isolate per-cycle failures, and trip a circuit breaker after 5 consecutive failures
-- in-process only; the OS-level supervisor install (launchd/systemd/crontab) gbrain also ships is intentionally deferred
+- the OS-level supervisor install is `cli/service.rs` (`shion gateway start/stop/restart/status`, macOS launchd: `KeepAlive` auto-restart + `RunAtLoad`)
 
 `agent/gateway.rs` — always-on gateway (pattern borrowed from hermes-agent's gateway: a persistent process hosting background services + ingress)
 - `MessageHandler` (`domain/gateway.rs`) is the pure seam between a transport and the agent; `AgentRuntime` implements it (an inbound message is one session turn)
-- `Channel` trait = a pluggable ingress; `Gateway` hosts N channels + an optional `MaintenanceService` (the `daemon.rs` supervisor loop), all sharing one `watch` shutdown signal
+- `Channel` trait = a pluggable ingress; `Gateway` hosts N channels + N `MaintenanceService`s (the `daemon.rs` supervisor loop — review sweep on the config schedule, reminder sweep every minute), all sharing one `watch` shutdown signal
 - no channels are wired today — ingress channels will be declared in `~/.shion/config.toml` and constructed in `cli/gateway.rs`
 - non-interactive: the gateway wires `DenyApprover` so side-effecting tools are refused rather than blocking on a stdin prompt (mirrors hermes disabling interactive toolsets in cron/gateway context)
-- in-process only; OS-level supervisor install (launchd/systemd) still deferred
+- background install: `shion gateway start` (see `cli/service.rs`) runs it under launchd; bare `shion gateway` is the foreground process launchd invokes
 
 `cli/gateway.rs` — wires the `gateway` subcommand; `cli/wiring.rs` — shared `AgentRuntime` construction used by both chat and gateway (differ only in the `Approver`)
 
