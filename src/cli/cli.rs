@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 
-use super::{chat, gateway, service};
+use super::{chat, gateway, inspect, service};
 
 #[derive(Parser)]
 #[command(name = "shion", about = "Personal agent framework")]
@@ -21,6 +21,28 @@ enum Commands {
         #[command(subcommand)]
         action: Option<GatewayAction>,
     },
+    /// Inspect scheduled reminders (recurring crons and one-shots)
+    Cron {
+        #[command(subcommand)]
+        action: CronAction,
+    },
+    /// Inspect stored chat sessions
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CronAction {
+    /// List pending reminders with their schedules and next fire times
+    List,
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// List stored sessions with creation time and message counts
+    List,
 }
 
 #[derive(Subcommand)]
@@ -53,6 +75,12 @@ pub async fn run() -> anyhow::Result<()> {
             Some(GatewayAction::Stop) => service::stop(),
             Some(GatewayAction::Restart) => service::restart(),
             Some(GatewayAction::Status) => service::status(),
+        },
+        Commands::Cron { action } => match action {
+            CronAction::List => inspect::cron_list(&db).await,
+        },
+        Commands::Session { action } => match action {
+            SessionAction::List => inspect::session_list(&db).await,
         },
     }
 }
