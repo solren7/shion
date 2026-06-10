@@ -37,13 +37,13 @@ const PREAMBLE: &str = "You are Shion, a concise and helpful personal agent. \
     via the `cron` parameter (e.g. \"0 9 * * *\"); times are the user's local \
     timezone. One-shot reminders use `after` or `at` as before.";
 
-/// Maximum tool-calling round-trips per user turn before the agent must answer.
-const MAX_TURNS: usize = 5;
-
 /// Generic [`LlmClient`] over any `rig` completion model. The concrete provider
 /// type is erased behind `Arc<dyn LlmClient>` by [`build_llm`].
 pub struct RigLlm<M: CompletionModel> {
     agent: Agent<M>,
+    /// Maximum tool-calling round-trips per user turn before the agent must
+    /// answer (config `max_turns`, env `SHION_MAX_TURNS`).
+    max_turns: usize,
 }
 
 #[async_trait]
@@ -69,7 +69,7 @@ where
             .agent
             .prompt(prompt)
             .with_history(history)
-            .max_turns(MAX_TURNS)
+            .max_turns(self.max_turns)
             .await
             .context("LLM completion failed")?;
         Ok(reply)
@@ -106,7 +106,10 @@ pub fn build_llm(
                 .preamble(&preamble)
                 .tools(adapters)
                 .build();
-            Arc::new(RigLlm { agent }) as Arc<dyn LlmClient>
+            Arc::new(RigLlm {
+                agent,
+                max_turns: config.max_turns,
+            }) as Arc<dyn LlmClient>
         }
         Provider::OpenAi => {
             let client = with_base_url(openai::Client::builder().api_key(key), base)
@@ -117,7 +120,10 @@ pub fn build_llm(
                 .preamble(&preamble)
                 .tools(adapters)
                 .build();
-            Arc::new(RigLlm { agent }) as Arc<dyn LlmClient>
+            Arc::new(RigLlm {
+                agent,
+                max_turns: config.max_turns,
+            }) as Arc<dyn LlmClient>
         }
         Provider::Anthropic => {
             let client = with_base_url(anthropic::Client::builder().api_key(key), base)
@@ -128,7 +134,10 @@ pub fn build_llm(
                 .preamble(&preamble)
                 .tools(adapters)
                 .build();
-            Arc::new(RigLlm { agent }) as Arc<dyn LlmClient>
+            Arc::new(RigLlm {
+                agent,
+                max_turns: config.max_turns,
+            }) as Arc<dyn LlmClient>
         }
         Provider::OpenRouter => {
             let client = with_base_url(openrouter::Client::builder().api_key(key), base)
@@ -139,7 +148,10 @@ pub fn build_llm(
                 .preamble(&preamble)
                 .tools(adapters)
                 .build();
-            Arc::new(RigLlm { agent }) as Arc<dyn LlmClient>
+            Arc::new(RigLlm {
+                agent,
+                max_turns: config.max_turns,
+            }) as Arc<dyn LlmClient>
         }
     };
     Ok(llm)

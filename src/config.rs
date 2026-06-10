@@ -126,6 +126,8 @@ pub struct FileConfig {
     pub aux_model: Option<String>,
     /// 5-field Unix cron expression for gateway maintenance (default: hourly).
     pub schedule: Option<String>,
+    /// Maximum tool-calling round-trips per user turn (default: 30).
+    pub max_turns: Option<usize>,
 }
 
 impl FileConfig {
@@ -203,7 +205,13 @@ pub struct ModelConfig {
     pub base_url: Option<String>,
     /// Optional cheaper model for auxiliary sub-tasks.
     pub aux_model: Option<String>,
+    /// Maximum tool-calling round-trips per user turn.
+    pub max_turns: usize,
 }
+
+/// Built-in default for `max_turns` when neither `SHION_MAX_TURNS` nor
+/// config.toml sets one. Multi-file edits easily take 10+ round-trips.
+pub const DEFAULT_MAX_TURNS: usize = 30;
 
 impl fmt::Debug for ModelConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -213,6 +221,7 @@ impl fmt::Debug for ModelConfig {
             .field("api_key", &mask_secret(&self.api_key))
             .field("base_url", &self.base_url)
             .field("aux_model", &self.aux_model)
+            .field("max_turns", &self.max_turns)
             .finish()
     }
 }
@@ -265,12 +274,24 @@ impl ModelConfig {
             .filter(|s| !s.is_empty())
             .or(file.aux_model);
 
+        let max_turns = match std::env::var("SHION_MAX_TURNS")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => s
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("SHION_MAX_TURNS must be a positive integer"))?,
+            None => file.max_turns.unwrap_or(DEFAULT_MAX_TURNS),
+        };
+
         Ok(Self {
             provider,
             model,
             api_key,
             base_url,
             aux_model,
+            max_turns,
         })
     }
 
@@ -287,6 +308,7 @@ impl ModelConfig {
             api_key: self.api_key.clone(),
             base_url: self.base_url.clone(),
             aux_model: self.aux_model.clone(),
+            max_turns: self.max_turns,
         }
     }
 }
@@ -342,6 +364,14 @@ mod tests {
     }
 
     #[test]
+    fn file_config_loads_max_turns() {
+        let dir = tmp("max_turns");
+        fs::write(dir.join("config.toml"), "max_turns = 50\n").unwrap();
+        let cfg = FileConfig::load(&dir);
+        assert_eq!(cfg.max_turns, Some(50));
+    }
+
+    #[test]
     fn file_config_loads_schedule() {
         let dir = tmp("schedule");
         fs::write(dir.join("config.toml"), "schedule = \"*/30 * * * *\"\n").unwrap();
@@ -367,6 +397,7 @@ mod tests {
             api_key: "sk-abcdefghijklmnopqr".into(),
             base_url: None,
             aux_model: None,
+            max_turns: DEFAULT_MAX_TURNS,
         };
         let s = format!("{cfg:?}");
         assert!(
