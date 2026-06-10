@@ -1,7 +1,7 @@
-use std::{
-    io::{self, BufRead, Write},
-    sync::Arc,
-};
+use std::sync::Arc;
+
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 
 use crate::{
     cli::{approver::CliApprover, wiring},
@@ -20,40 +20,43 @@ pub async fn run(db_url: &str) -> anyhow::Result<()> {
 
     ensure_session(&db, &current_session).await?;
     println!(
-        "Shion v0.1 — session `{}`. Type /new (or /clear) to start a fresh session, Ctrl-D to quit.\n",
+        "Shion v0.1 — session `{}`. Type /new (or /clear) to start a fresh session, Ctrl-C or Ctrl-D to quit.\n",
         current_session
     );
 
-    // Read one line at a time without holding the stdin lock across a turn, so
-    // tools (e.g. the shell approval gate) can read stdin while a turn is in
-    // flight.
+    // `rustyline` runs the terminal in raw mode for the duration of each
+    // `readline` call only, decoding UTF-8 and tracking display width itself —
+    // so backspace deletes whole multi-byte (CJK) characters instead of
+    // corrupting them as the kernel's cooked-mode line discipline does. The
+    // editor releases the terminal the moment it returns, so a tool's approval
+    // gate (`CliApprover`) can still read stdin while a turn is in flight.
+    let mut editor = DefaultEditor::new()?;
+
     loop {
-        // Read raw bytes and decode lossily: `read_line` aborts the whole
-        // program on any non-UTF-8 byte ("stream did not contain valid UTF-8"),
-        // which is too brittle for interactive input.
-        let mut buf = Vec::new();
-        let bytes = io::stdin().lock().read_until(b'\n', &mut buf)?;
-        if bytes == 0 {
-            break; // EOF (Ctrl-D)
-        }
-        let input = String::from_utf8_lossy(&buf).trim().to_string();
+        let input = match editor.readline("->") {
+            Ok(line) => line.trim().to_string(),
+            Err(ReadlineError::Eof) => break,         // Ctrl-D
+            Err(ReadlineError::Interrupted) => break, // Ctrl-C
+            Err(e) => return Err(e.into()),
+        };
         if input.is_empty() {
             continue;
         }
+        let _ = editor.add_history_entry(&input);
+
         // `/new` and `/clear` are equivalent: both start a fresh, program-managed
         // session. There are no user-supplied session ids.
         if input == "/new" || input == "/clear" {
             current_session = new_session_id();
             ensure_session(&db, &current_session).await?;
             println!("Started new session `{}`.\n", current_session);
-            io::stdout().flush()?;
             continue;
         }
 
-        println!("You [{}]: {}", current_session, input);
+        // No need to echo the input — `rustyline` already left it on the prompt
+        // line, so re-printing it would double every message.
         let reply = runtime.handle_input(&current_session, input).await?;
         println!("Agent: {}\n", reply);
-        io::stdout().flush()?;
     }
 
     Ok(())
