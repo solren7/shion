@@ -1,23 +1,100 @@
-# Repository Guidelines
+# AGENTS.md
 
-## Project Structure & Module Organization
-This repository is a small Rust CLI crate. Core application code lives in `src/`. The executable entrypoint is `src/main.rs`, and CLI wiring is under `src/cli/` (`cli.rs`, `init.rs`, `mod.rs`). Other directories such as `src/commands/`, `src/services/`, `src/tasks/`, `src/tools/`, `src/types/`, and `src/utils/` are reserved for feature expansion and should keep business logic separated by responsibility. Build artifacts go to `target/` and must not be committed. Local SQLite files such as `test.db` are ignored and should be treated as disposable developer state.
+Guidance for coding agents (Claude Code and others) working in this repository.
+`CLAUDE.md` is a symlink to this file — edit `AGENTS.md` only.
 
-## Build, Test, and Development Commands
-Run commands from the repository root:
+## Commands
 
-- `cargo check` verifies the crate compiles quickly without producing a release binary.
-- `cargo test` runs the test suite. At present, the crate builds and executes `0` tests, so new features should add coverage.
-- `cargo run -- init` runs the sample initialization flow, creates `test.db`, pushes the schema, and seeds one user.
-- `cargo fmt` formats the codebase with standard Rust style before review.
+```bash
+cargo check                        # fast compile check
+cargo build                        # build
+cargo run -- chat                  # start interactive chat (creates shion.db)
+cargo run -- chat --db sqlite:./my.db  # custom db
+cargo run -- gateway               # always-on process: maintenance + unix-socket ingress
+cargo run -- gateway --schedule "*/30 * * * *"  # custom 5-field cron expression
+cargo test                         # run all tests
+cargo test tools::time             # run a single test module
+cargo fmt                          # format
+```
 
-If `cargo run -- init` fails with a table-already-exists error, remove the local database and rerun because the current seed path is not idempotent.
+`shion.db` is disposable developer state — delete it freely to reset.
 
-## Coding Style & Naming Conventions
-Use default Rust formatting with 4-space indentation and `snake_case` for modules, files, functions, and variables. Use `PascalCase` for structs and enums, and keep CLI subcommands short, verb-based, and explicit, for example `init`. Prefer small modules with one responsibility each, and keep async database code close to the CLI or service layer that owns it.
+## Architecture
 
-## Testing Guidelines
-Place unit tests beside the code they cover with `#[cfg(test)] mod tests`, and use `#[tokio::test]` for async paths. Name tests by behavior, for example `init_creates_user_record`. Add at least one success-path and one failure-path test for new CLI or database behavior. Run `cargo test` before opening a PR.
+Personal Agent framework v0.1, implemented in Rust. The codebase follows a DDD-style layered architecture.
 
-## Commit & Pull Request Guidelines
-The current history uses short imperative messages such as `init`. Keep commits focused and use the same style, for example `add user lookup` or `wire init command`. PRs should include a concise description, linked issue if applicable, commands run for verification, and terminal output or screenshots when CLI behavior changes.
+**Request flow:**
+```
+CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Response
+```
+
+**Layers and their responsibilities:**
+
+`domain/` — pure interfaces, no I/O, no external crates
+- `repository.rs` — `SessionRepository` (find/save) and `MessageRepository` (list_by_session/save); the two traits `AgentRuntime` depends on
+- `planner.rs` — `Planner` trait + `Plan` enum (`RespondDirectly`, `CallTool`, `MultiStep`)
+- `tool.rs` — `Tool` trait (name / description / execute)
+- `message.rs`, `session.rs` — core value types
+
+`infra/db.rs` — the only place toasty (SQLite ORM) appears
+- `Db` struct wraps `Arc<Mutex<toasty::Db>>`
+- implements both `SessionRepository` and `MessageRepository`
+- `Db::connect(url)` checks if the db file exists; calls `push_schema()` only for new databases (toasty's `push_schema` is not idempotent)
+- toasty model structs (`SessionRecord`, `MessageRecord`) are private to this file
+- SQLite URL format: `sqlite:./path.db` (single colon, not `sqlite://`)
+
+`agent/runtime.rs` — application logic
+- `AgentRuntime` holds `Arc<dyn SessionRepository>` + `Arc<dyn MessageRepository>` — no knowledge of toasty
+- `handle_input` owns the session lifecycle: load-or-create, append messages, dispatch plan, persist reply
+
+`agent/planner.rs` — `KeywordPlanner`
+- v0.1 rule-based: routes "time" / "now" / "时间" keywords to the `time` tool; everything else → `RespondDirectly` (answered by the LLM)
+
+`domain/llm.rs` — `LlmClient` trait (`complete(&Session) -> String`); the abstraction `AgentRuntime` calls for `RespondDirectly`
+
+`infra/llm.rs` — `DeepSeekClient`: `LlmClient` backed by the `rig` framework (`rig-core`, aliased as `rig`) against DeepSeek
+- `from_env()` reads `DEEPSEEK_API_KEY`; model `deepseek-chat`
+- v0.1 sends only the latest user message (multi-turn history wiring is TODO)
+
+`services/tool_registry.rs` — `HashMap<String, Box<dyn Tool>>` with `register` / `execute`
+
+`tools/time.rs` — first built-in tool; returns RFC 3339 UTC timestamp
+
+`cli/chat.rs` — wires everything together; creates `Arc<Db>` and passes it as both repos
+- Session ids are program-managed (uuid v7); every run starts a fresh session. `/new` and `/clear` are equivalent — both open a new session. There is no user-supplied session id and no `/session` subcommand.
+
+`agent/daemon.rs` — background maintenance supervisor, hosted by the gateway (pattern borrowed from gbrain's `autopilot` supervisor)
+- `Schedule` wraps `croner` (5-field Unix cron, e.g. `0 * * * *`); `Maintenance` trait is the scheduled unit of work
+- `ReviewSweep` is the one fixed action: run the reflective reviewer over every stored session with ≥1 user turn
+- `supervise` is the loop: sleep to the next cron fire, run the cycle, isolate per-cycle failures, and trip a circuit breaker after 5 consecutive failures
+- in-process only; the OS-level supervisor install (launchd/systemd/crontab) gbrain also ships is intentionally deferred
+
+`agent/gateway.rs` — always-on gateway (pattern borrowed from hermes-agent's gateway: a persistent process hosting background services + ingress)
+- `MessageHandler` (`domain/gateway.rs`) is the pure seam between a transport and the agent; `AgentRuntime` implements it (an inbound message is one session turn)
+- `Channel` trait = a pluggable ingress; `Gateway` hosts N channels + an optional `MaintenanceService` (the `daemon.rs` supervisor loop), all sharing one `watch` shutdown signal
+- `infra/unix_channel.rs` — the first `Channel`: newline-delimited JSON over a unix socket (`{"input","session?"}` → `{"reply"}`/`{"error"}`). The socket file doubles as a single-instance guard (live socket → refuse; stale → replace) and is removed on `Drop`
+- non-interactive: the gateway wires `DenyApprover` so side-effecting tools are refused rather than blocking on a stdin prompt (mirrors hermes disabling interactive toolsets in cron/gateway context)
+- in-process only; OS-level supervisor install (launchd/systemd) still deferred
+
+`cli/gateway.rs` — wires the `gateway` subcommand; `cli/wiring.rs` — shared `AgentRuntime` construction used by both chat and gateway (differ only in the `Approver`)
+
+## Key extension points
+
+- **Add a tool**: implement `Tool` in `src/tools/`, register it in `cli/chat.rs`
+- **Swap LLM provider**: implement `LlmClient` (`domain/llm.rs`) for another backend and construct it in `cli/chat.rs`
+- **Swap persistence**: implement `SessionRepository + MessageRepository` for a different backend; no changes needed in `agent/` or `domain/`
+- **Upgrade planner**: replace `KeywordPlanner` with a model-based impl of `Planner`
+- **Change the scheduled action**: implement `Maintenance` (`agent/daemon.rs`) and construct it in `cli/gateway.rs`
+- **Add a gateway ingress**: implement `Channel` (`agent/gateway.rs`) for a new transport (TCP/HTTP/chat platform) and `add_channel` it in `cli/gateway.rs`
+
+## Testing
+
+Tests live beside the code with `#[cfg(test)] mod tests`. Use `#[tokio::test]` for async. Name tests by behavior (`time_tool_returns_non_empty_string`).
+
+## Coding style
+
+Default Rust formatting (`cargo fmt`), `snake_case` for modules/files/functions, `PascalCase` for structs and enums. CLI subcommands stay short and verb-based. Prefer small modules with one responsibility; keep async database code close to the layer that owns it.
+
+## Commit & PR style
+
+Short imperative commit messages: `add file tool`, `wire llm client`. PRs include a concise description, commands run for verification, and terminal output when CLI behavior changes.
