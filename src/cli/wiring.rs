@@ -20,9 +20,9 @@ use crate::{
     infra::{db::Db, llm::build_llm},
     services::{skill_registry::SkillRegistry, tool_registry::ToolRegistry},
     tools::{
-        delegate::DelegateTool, file::FileTool, memory::MemoryTool, session::SessionTool,
-        shell::ShellTool, skill::SkillTool, time::TimeTool, web_fetch::WebFetchTool,
-        web_search::WebSearchTool,
+        delegate::DelegateTool, file::FileTool, memory::MemoryTool, reminder::ReminderTool,
+        session::SessionTool, shell::ShellTool, skill::SkillTool, time::TimeTool,
+        web_fetch::WebFetchTool, web_search::WebSearchTool,
     },
 };
 
@@ -50,6 +50,7 @@ pub async fn build(db: Arc<Db>, approver: Arc<dyn Approver>) -> anyhow::Result<W
     tools.register(Arc::new(WebFetchTool::new()));
     tools.register(Arc::new(WebSearchTool::new()));
     tools.register(Arc::new(SessionTool::new(db.clone())));
+    tools.register(Arc::new(ReminderTool::new(db.clone())));
 
     let memory_path = workspace
         .roots()

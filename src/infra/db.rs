@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use crate::domain::{
     memory::{Memory, MemoryRepository, parse_memory_kind},
     message::{Message, Role},
+    reminder::{Reminder, ReminderRepository, ReminderStatus, parse_reminder_status},
     repository::{MessageRepository, SessionRepository, SkillRepository},
     session::Session,
     skill::Skill,
@@ -58,6 +59,17 @@ struct SkillRecord {
     protected: bool,
 }
 
+#[derive(Debug, toasty::Model)]
+struct ReminderRecord {
+    #[key]
+    id: String,
+    message: String,
+    run_at: i64,
+    status: String,   // "pending" | "fired" | "missed" | "cancelled"
+    schedule: String, // reserved for v2 cron expressions; always "" in v1
+    created_at: i64,
+}
+
 // ── Db ───────────────────────────────────────────────────────────────────────
 
 pub struct Db {
@@ -76,7 +88,8 @@ impl Db {
                 SessionRecord,
                 MessageRecord,
                 MemoryRecord,
-                SkillRecord
+                SkillRecord,
+                ReminderRecord
             ))
             .connect(url)
             .await?;
@@ -247,6 +260,48 @@ impl MessageRepository for Db {
     }
 }
 
+// ── ReminderRepository ────────────────────────────────────────────────────────
+
+#[async_trait]
+impl ReminderRepository for Db {
+    async fn save(&self, reminder: &Reminder) -> anyhow::Result<()> {
+        let mut db = self.inner.lock().await;
+        toasty::create!(ReminderRecord {
+            id: reminder.id.clone(),
+            message: reminder.message.clone(),
+            run_at: reminder.run_at,
+            status: reminder.status.as_str().to_string(),
+            schedule: String::new(),
+            created_at: reminder.created_at,
+        })
+        .exec(&mut *db)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_pending(&self) -> anyhow::Result<Vec<Reminder>> {
+        let mut db = self.inner.lock().await;
+        let rows = toasty::query!(ReminderRecord).exec(&mut *db).await?;
+        let pending = rows
+            .into_iter()
+            .filter(|r| r.status == "pending")
+            .map(reminder_from_record)
+            .collect();
+        Ok(pending)
+    }
+
+    async fn set_status(&self, id: &str, status: ReminderStatus) -> anyhow::Result<()> {
+        let mut db = self.inner.lock().await;
+        let mut record = ReminderRecord::get_by_id(&mut *db, id).await?;
+        record
+            .update()
+            .status(status.as_str().to_string())
+            .exec(&mut *db)
+            .await?;
+        Ok(())
+    }
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn parse_role(s: &str) -> Role {
@@ -299,10 +354,20 @@ fn skill_from_record(record: SkillRecord) -> Skill {
     }
 }
 
+fn reminder_from_record(record: ReminderRecord) -> Reminder {
+    Reminder {
+        id: record.id,
+        message: record.message,
+        run_at: record.run_at,
+        status: parse_reminder_status(&record.status),
+        created_at: record.created_at,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::memory::MemoryKind;
+    use crate::domain::{memory::MemoryKind, reminder::ReminderStatus};
 
     fn sqlite_url(name: &str) -> String {
         let path = std::env::temp_dir().join(name);
@@ -344,6 +409,26 @@ mod tests {
         assert_eq!(rows[0].id, "first");
         assert_eq!(rows[0].user_turns(), 1);
         assert_eq!(rows[1].id, "second");
+    }
+
+    #[tokio::test]
+    async fn db_reminder_roundtrip() {
+        let db = Db::connect(&sqlite_url("shion_reminder_repo_test.db"))
+            .await
+            .unwrap();
+        let reminder = Reminder::new("drink water".to_string(), 9999999999);
+
+        ReminderRepository::save(&db, &reminder).await.unwrap();
+        let pending = ReminderRepository::list_pending(&db).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].message, "drink water");
+        assert_eq!(pending[0].status, ReminderStatus::Pending);
+
+        ReminderRepository::set_status(&db, &reminder.id, ReminderStatus::Fired)
+            .await
+            .unwrap();
+        let pending = ReminderRepository::list_pending(&db).await.unwrap();
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]
