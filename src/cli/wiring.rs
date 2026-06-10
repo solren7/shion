@@ -17,7 +17,7 @@ use crate::{
         reviewer::Reviewer,
         workspace::Workspace,
     },
-    infra::{db::Db, llm::build_llm},
+    infra::{db::Db, llm::build_llm, md_memory::MdMemoryStore},
     services::{skill_registry::SkillRegistry, tool_registry::ToolRegistry},
     tools::{
         delegate::DelegateTool, file::FileTool, memory::MemoryTool, reminder::ReminderTool,
@@ -52,13 +52,12 @@ pub async fn build(db: Arc<Db>, approver: Arc<dyn Approver>) -> anyhow::Result<W
     tools.register(Arc::new(SessionTool::new(db.clone())));
     tools.register(Arc::new(ReminderTool::new(db.clone())));
 
-    let memory_path = workspace
-        .roots()
-        .first()
-        .cloned()
-        .unwrap_or_default()
-        .join(".shion_memory.jsonl");
-    tools.register(Arc::new(MemoryTool::new(memory_path)));
+    // Memories live as markdown files under ~/.shion/memory/, shared by the
+    // `memory` tool and the reflective reviewer.
+    let memory_repo: Arc<dyn MemoryRepository> = Arc::new(MdMemoryStore::new(
+        crate::config::shion_home().join("memory"),
+    ));
+    tools.register(Arc::new(MemoryTool::new(memory_repo.clone())));
 
     // The delegate tool runs a separate, tool-less sub-agent on the (optionally
     // cheaper) aux model.
@@ -101,7 +100,6 @@ pub async fn build(db: Arc<Db>, approver: Arc<dyn Approver>) -> anyhow::Result<W
 
     // Hand the same tool instances to the LLM so the model can call them.
     let llm = build_llm(&model_config, tools.tools(), skills_note)?;
-    let memory_repo: Arc<dyn MemoryRepository> = db.clone();
     let skill_repo: Arc<dyn SkillRepository> = db.clone();
     let reviewer: Arc<dyn Reviewer> =
         Arc::new(ReflectiveReviewer::new(aux_llm, memory_repo, skill_repo));

@@ -1,10 +1,13 @@
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 
-use crate::domain::tool::Tool;
+use crate::domain::{
+    memory::{Memory, MemoryKind, MemoryRepository, parse_memory_kind},
+    tool::Tool,
+};
 
 #[derive(Deserialize)]
 struct MemoryArgs {
@@ -12,35 +15,21 @@ struct MemoryArgs {
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
     query: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct MemoryEntry {
-    id: usize,
-    text: String,
-    ts: i64,
-}
-
-/// Long-term, cross-session memory backed by a JSONL file. The model decides
-/// what to remember (`save`) and recalls it later (`list` / `search`).
+/// Long-term, cross-session memory. The model decides what to remember
+/// (`save`) and recalls it later (`list` / `search`). Storage lives behind
+/// [`MemoryRepository`] — the same store the reflective reviewer writes to.
 pub struct MemoryTool {
-    path: PathBuf,
+    memories: Arc<dyn MemoryRepository>,
 }
 
 impl MemoryTool {
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    async fn load(&self) -> Vec<MemoryEntry> {
-        let Ok(content) = tokio::fs::read_to_string(&self.path).await else {
-            return Vec::new();
-        };
-        content
-            .lines()
-            .filter_map(|line| serde_json::from_str::<MemoryEntry>(line).ok())
-            .collect()
+    pub fn new(memories: Arc<dyn MemoryRepository>) -> Self {
+        Self { memories }
     }
 }
 
@@ -52,7 +41,8 @@ impl Tool for MemoryTool {
 
     fn description(&self) -> &'static str {
         "Persistent long-term memory across sessions. action=\"save\" stores a \
-         fact; action=\"search\" returns stored facts matching a query; \
+         fact (optional kind: user | feedback | project | reference); \
+         action=\"search\" returns stored facts matching a query; \
          action=\"list\" returns all stored facts."
     }
 
@@ -66,6 +56,11 @@ impl Tool for MemoryTool {
                     "description": "The memory operation to perform."
                 },
                 "text": { "type": "string", "description": "Fact to store (action=save)." },
+                "kind": {
+                    "type": "string",
+                    "enum": ["user", "feedback", "project", "reference"],
+                    "description": "Category of the fact (action=save, default: user)."
+                },
                 "query": { "type": "string", "description": "Search term (action=search)." }
             },
             "required": ["action"]
@@ -81,37 +76,30 @@ impl Tool for MemoryTool {
                 let text = args
                     .text
                     .ok_or_else(|| anyhow::anyhow!("`text` is required for action=save"))?;
-                let mut entries = self.load().await;
-                let entry = MemoryEntry {
-                    id: entries.len() + 1,
-                    text,
-                    ts: time::OffsetDateTime::now_utc().unix_timestamp(),
-                };
-                entries.push(entry);
-
-                let mut buf = String::new();
-                for e in &entries {
-                    buf.push_str(&serde_json::to_string(e)?);
-                    buf.push('\n');
-                }
-                tokio::fs::write(&self.path, buf)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to persist memory: {e}"))?;
-                Ok(format!("Saved memory #{}.", entries.len()))
+                let kind = args
+                    .kind
+                    .as_deref()
+                    .map(parse_memory_kind)
+                    .unwrap_or(MemoryKind::User);
+                let memory = Memory::new(kind, text);
+                self.memories.save(&memory).await?;
+                Ok(format!("Saved memory {}.", memory.id))
             }
             "list" => {
-                let entries = self.load().await;
-                Ok(render(&entries))
+                let memories = self.memories.list().await?;
+                Ok(render(&memories))
             }
             "search" => {
                 let query = args
                     .query
                     .ok_or_else(|| anyhow::anyhow!("`query` is required for action=search"))?
                     .to_lowercase();
-                let entries = self.load().await;
-                let hits: Vec<MemoryEntry> = entries
+                let hits: Vec<Memory> = self
+                    .memories
+                    .list()
+                    .await?
                     .into_iter()
-                    .filter(|e| e.text.to_lowercase().contains(&query))
+                    .filter(|m| m.content.to_lowercase().contains(&query))
                     .collect();
                 Ok(render(&hits))
             }
@@ -122,13 +110,13 @@ impl Tool for MemoryTool {
     }
 }
 
-fn render(entries: &[MemoryEntry]) -> String {
-    if entries.is_empty() {
+fn render(memories: &[Memory]) -> String {
+    if memories.is_empty() {
         return "(no memories)".to_string();
     }
-    entries
+    memories
         .iter()
-        .map(|e| format!("#{}: {}", e.id, e.text))
+        .map(|m| format!("[{}] {}: {}", m.kind.as_str(), m.id, m.content))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -136,23 +124,26 @@ fn render(entries: &[MemoryEntry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infra::md_memory::MdMemoryStore;
 
     fn temp_tool(name: &str) -> MemoryTool {
-        let path = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_file(&path);
-        MemoryTool::new(path)
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        MemoryTool::new(Arc::new(MdMemoryStore::new(dir)))
     }
 
     #[tokio::test]
     async fn save_list_search_roundtrip() {
-        let tool = temp_tool("shion_mem_test.jsonl");
+        let tool = temp_tool("shion_mem_tool_test");
 
         tool.execute(json!({ "action": "save", "text": "用户喜欢蓝色" }).to_string())
             .await
             .unwrap();
-        tool.execute(json!({ "action": "save", "text": "项目用 Rust 写" }).to_string())
-            .await
-            .unwrap();
+        tool.execute(
+            json!({ "action": "save", "text": "项目用 Rust 写", "kind": "project" }).to_string(),
+        )
+        .await
+        .unwrap();
 
         let list = tool
             .execute(json!({ "action": "list" }).to_string())
@@ -160,6 +151,7 @@ mod tests {
             .unwrap();
         assert!(list.contains("蓝色"));
         assert!(list.contains("Rust"));
+        assert!(list.contains("[project]"));
 
         let hit = tool
             .execute(json!({ "action": "search", "query": "rust" }).to_string())
