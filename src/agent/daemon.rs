@@ -31,7 +31,6 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 /// cron crate directly and the "when does it next fire" math stays testable.
 pub struct Schedule {
     cron: Cron,
-    expr: String,
 }
 
 impl Schedule {
@@ -40,14 +39,7 @@ impl Schedule {
         let cron = expr
             .parse::<Cron>()
             .map_err(|e| anyhow::anyhow!("invalid cron expression `{expr}`: {e}"))?;
-        Ok(Self {
-            cron,
-            expr: expr.to_string(),
-        })
-    }
-
-    pub fn expr(&self) -> &str {
-        &self.expr
+        Ok(Self { cron })
     }
 
     /// Duration from `now` until the next scheduled fire (strictly after `now`).

@@ -6,7 +6,7 @@
 //! lives there too. shion follows that shape:
 //!
 //!   - **background services** — the maintenance scheduler from `daemon.rs`,
-//!     run as a tokio task instead of a standalone `shion daemon` process.
+//!     run as a tokio task inside the gateway (its only host).
 //!   - **ingress channels** — pluggable `Channel`s (a unix socket today; a TCP
 //!     or HTTP adapter can drop in later) that route inbound messages through a
 //!     `MessageHandler` (the wired `AgentRuntime`).
