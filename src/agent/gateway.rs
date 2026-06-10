@@ -7,9 +7,10 @@
 //!
 //!   - **background services** — the maintenance scheduler from `daemon.rs`,
 //!     run as a tokio task inside the gateway (its only host).
-//!   - **ingress channels** — pluggable `Channel`s (a unix socket today; a TCP
-//!     or HTTP adapter can drop in later) that route inbound messages through a
-//!     `MessageHandler` (the wired `AgentRuntime`).
+//!   - **ingress channels** — pluggable `Channel`s that route inbound messages
+//!     through a `MessageHandler` (the wired `AgentRuntime`). None are wired
+//!     today; they will be declared in ~/.shion/config.toml and constructed
+//!     from there.
 //!
 //! All tasks share one `watch` shutdown signal; on Ctrl-C the gateway flips it
 //! and joins everything. The OS-level supervisor that keeps the *process* alive

@@ -13,15 +13,10 @@ struct Cli {
 enum Commands {
     /// Start an interactive chat session
     Chat,
-    /// Run the always-on gateway: maintenance scheduler + message ingress.
-    /// Maintenance cron comes from `schedule` in ~/.shion/config.toml
-    /// (or SHION_SCHEDULE); default hourly.
-    Gateway {
-        /// Unix socket path for message ingress
-        /// (default: $SHION_GATEWAY_SOCKET or ~/.shion/gateway.sock)
-        #[arg(long)]
-        socket: Option<String>,
-    },
+    /// Run the always-on gateway: maintenance scheduler (and, later,
+    /// config-declared ingress channels). Maintenance cron comes from
+    /// `schedule` in ~/.shion/config.toml (or SHION_SCHEDULE); default hourly.
+    Gateway,
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -31,9 +26,9 @@ pub async fn run() -> anyhow::Result<()> {
     let db = crate::config::default_db_url();
     match cli.command {
         Commands::Chat => chat::run(&db).await,
-        Commands::Gateway { socket } => {
+        Commands::Gateway => {
             let schedule = crate::config::maintenance_schedule();
-            gateway::run(&db, &schedule, socket.as_deref()).await
+            gateway::run(&db, &schedule).await
         }
     }
 }

@@ -74,7 +74,7 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 `agent/gateway.rs` — always-on gateway (pattern borrowed from hermes-agent's gateway: a persistent process hosting background services + ingress)
 - `MessageHandler` (`domain/gateway.rs`) is the pure seam between a transport and the agent; `AgentRuntime` implements it (an inbound message is one session turn)
 - `Channel` trait = a pluggable ingress; `Gateway` hosts N channels + an optional `MaintenanceService` (the `daemon.rs` supervisor loop), all sharing one `watch` shutdown signal
-- `infra/unix_channel.rs` — the first `Channel`: newline-delimited JSON over a unix socket (`{"input","session?"}` → `{"reply"}`/`{"error"}`). The socket file doubles as a single-instance guard (live socket → refuse; stale → replace) and is removed on `Drop`
+- no channels are wired today — ingress channels will be declared in `~/.shion/config.toml` and constructed in `cli/gateway.rs`
 - non-interactive: the gateway wires `DenyApprover` so side-effecting tools are refused rather than blocking on a stdin prompt (mirrors hermes disabling interactive toolsets in cron/gateway context)
 - in-process only; OS-level supervisor install (launchd/systemd) still deferred
 
@@ -87,7 +87,7 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 - **Swap persistence**: implement `SessionRepository + MessageRepository` for a different backend; no changes needed in `agent/` or `domain/`
 - **Upgrade planner**: replace `KeywordPlanner` with a model-based impl of `Planner`
 - **Change the scheduled action**: implement `Maintenance` (`agent/daemon.rs`) and construct it in `cli/gateway.rs`
-- **Add a gateway ingress**: implement `Channel` (`agent/gateway.rs`) for a new transport (TCP/HTTP/chat platform) and `add_channel` it in `cli/gateway.rs`
+- **Add a gateway ingress**: implement `Channel` (`agent/gateway.rs`) for a new transport (TCP/HTTP/chat platform), `add_channel` it in `cli/gateway.rs`, gated by a `~/.shion/config.toml` declaration
 
 ## Testing
 
