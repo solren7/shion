@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use super::{chat, gateway, inspect, model, service};
 
 #[derive(Parser)]
-#[command(name = "shion", about = "Personal agent framework")]
+#[command(name = "shion", version, about = "Personal agent framework")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
