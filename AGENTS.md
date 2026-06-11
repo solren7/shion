@@ -9,7 +9,7 @@ Guidance for coding agents (Claude Code and others) working in this repository.
 cargo check                        # fast compile check
 cargo build                        # build
 cargo run -- chat                  # start interactive chat (db lives at ~/.shion/shion.db)
-cargo run -- gateway               # always-on process: maintenance + unix-socket ingress
+cargo run -- gateway               # always-on process: maintenance sweeps (no ingress channels wired yet)
 cargo test                         # run all tests
 cargo test tools::time             # run a single test module
 cargo fmt                          # format
@@ -63,7 +63,7 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 
 `infra/llm.rs` — `DeepSeekClient`: `LlmClient` backed by the `rig` framework (`rig-core`, aliased as `rig`) against DeepSeek
 - `from_env()` reads `DEEPSEEK_API_KEY`; model `deepseek-chat`
-- v0.1 sends only the latest user message (multi-turn history wiring is TODO)
+- sends the full session history: prior turns go through `with_history`, the latest user message is the prompt
 
 `services/tool_registry.rs` — `HashMap<String, Box<dyn Tool>>` with `register` / `execute`
 
