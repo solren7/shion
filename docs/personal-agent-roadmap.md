@@ -11,41 +11,53 @@
 - 已注册的工具包括 `time`、`file`、`shell`、`web_fetch`、`web_search`、`session`、`reminder`、`memory`、`delegate`、`skill`
 - `reminder` 支持一次性和 cron 周期提醒，由 gateway 每分钟投递（macOS 通知）
 - `gateway` 已经具备常驻进程（launchd 安装）、维护任务调度和非交互审批策略
+- ingress channel 已落地两个：feishu（ws 长连接）和 telegram（长轮询），均带 `allow_from` 准入和 `home_chat` 提醒投递
 - 反思 reviewer、markdown memory、skill registry 已经具备初步自学习闭环
 - 已有基础 inspect：`shion cron list`、`shion session list/clean`
 
 总体判断：**缺的不是再补一个零散工具，而是"主动协作"的闭环**——shion 能在用户发起对话时干活，但还不能在用户不开终端的时候帮上忙。主动性闭环 = 入口（消息能递进来）+ 任务模型（知道该做什么）+ 后台权限（能安全地做事）。
 
-## 1. 真实的 ingress 入口（第一缺口）
+## 1. 真实的 ingress 入口（已基本闭合）
 
-`Channel` trait 已定义在 `agent/gateway.rs`，但目前没有任何实现。这意味着 gateway 虽然 24 小时跑着，却没有任何方式把消息"递"给它——shion 本质上还是一个 REPL。没有入口，后面所有"主动"功能都没有用武之地。
+`Channel` trait（`agent/gateway.rs`）已有两个实现：feishu（`infra/feishu.rs`，ws 长连接）和 telegram（`infra/telegram.rs`，getUpdates 长轮询），消息随时可以递进 gateway，"打开终端聊天"已经变成"随时把一个事件交给 shion"。
 
-优先级建议：
+剩余可选项（按需再做）：
 
-1. 本地 unix socket channel：最简单的第一个实现，方便脚本、快捷指令、Raycast、Automator 调用
-2. Lark channel：用户日常在飞书生态里，这个入口的实际价值远高于 Telegram/Slack；可以和第 5 节的飞书连接器共享一套鉴权基础设施
-3. 剪贴板 / share sheet 风格入口，支持快速丢一段文本给 shion
-
-入口不需要一开始做复杂，核心是把"打开终端聊天"变成"随时把一个事件交给 shion"。
+1. 本地 unix socket channel：方便脚本、快捷指令、Raycast、Automator 调用
+2. 剪贴板 / share sheet 风格入口，支持快速丢一段文本给 shion
 
 ## 2. 任务与承诺模型
 
-当前唯一的事务性模型是 reminder，它只解决"到点通知"，回答不了"我现在该做什么""哪些事情卡住了""我答应过谁什么"。`src/tasks/` 目录已创建但还是空的。
+当前唯一的事务性模型是 reminder，它只解决"到点通知"，回答不了"我现在该做什么""哪些事情卡住了""我答应过谁什么"。
 
-建议新增一组一等领域模型：
+hermes-agent 把"任务"拆成了三层，各管各的：会话内 todo（极简 id/content/status，不落盘，只管 agent 当前焦点）、cron（无状态定时自动化，shion 的 reminder/Maintenance 已对应）、kanban（SQLite 持久任务队列，跨会话）。本节要做的是 kanban 那一层——**跨会话的持久任务存储**；会话内的工作分解焦点列表是 planner 强化（第 8 节）的事，不要混进来。
 
-- `Task`：标题、状态、优先级、截止时间、来源、所属项目、备注
-- `InboxItem`：尚未归类的输入、想法、待处理事项
-- `Commitment`：从对话、会议、邮件中提取出的承诺和待跟进事项
-- `Project`：目标、状态、活跃任务、最近进展（可以最后加，先不引入）
+借鉴 hermes 后对原方案的具体修正：
 
-对应工具先收敛为一个 `task` tool：
+**一张表，不是四个模型。** 原方案的 `Task` / `InboxItem` / `Commitment` / `Project` 收敛为单一 `Task`——hermes kanban 用一个 `triage` 状态就覆盖了 inbox 概念，承诺也只是带"对象"的任务，不值得单独建模：
 
-- `capture`：快速收集任务或 inbox item
-- `list`：查看当前任务
-- `update`：修改状态、截止时间、项目归属
+- `id` / `title` / `note`
+- `status`：`inbox`（未归类，取代 InboxItem）→ `todo` → `done`，外加 `waiting`（卡在别人/外部，对应 hermes 的 `blocked`）和 `cancelled`
+- `waiting_on`：可空，这件事在等谁 / 承诺给了谁——这就是 Commitment
+- `due_at`：可空
+- `source`：来源会话 id（`telegram:{chat_id}` / `feishu:{chat_id}` / cli）——借鉴 hermes cron job 的 `origin` 字段，让到期提醒和 briefing 能投递回任务来源的渠道
+- `source_message_id`：可空，自动提取时的去重键（hermes 的 `idempotency_key` 思路）
+- `created_at` / `completed_at`
+
+刻意不加的字段（hermes 的取舍验证过）：数值优先级（hermes todo 完全靠列表顺序表达优先级，够用）、Project（真有多项目需求时加一个 `board` 字符串字段即可，hermes kanban 就这么做的）。
+
+**工具收敛为 `task`，砍掉 `plan_today`。**
+
+- `capture`：一句话快速收集，默认进 `inbox`
+- `list`：按状态过滤
+- `update`：改状态、截止时间、`waiting_on`
 - `complete`：完成任务
-- `plan_today`：生成今日建议执行列表
+
+`plan_today` 不做成结构化工具——hermes 的 daily briefing 就是一个 cron job 的 prompt（"读任务列表，组织今日建议"），不是接口。shion 的对应物是第 4 节的 briefing sweep：模型在 briefing 里自己读 task list 自己组织，避免提前固化"今日计划"的输出格式。
+
+**承诺提取复用 reflective reviewer。** hermes 没有显式承诺跟踪（todo/cron/kanban 三者都不管"我答应过谁什么"，这是它明确的 gap），但它的 background review 证明了"每轮对话后用副 agent 提取结构化信息"这条路。shion 已有同样的基础设施（reviewer + ReviewSweep），加一个提取方向即可：扫描会话中"我答应 / 需要跟进 / 等对方回复"类内容，capture 成 `inbox` 任务，带 `source_message_id` 去重。自动提取**只进 inbox、不直接进 todo**，由用户确认或丢弃——和第 6 节"防止 reviewer 污染记忆库"是同一个治理原则。
+
+**到期投递走现有基建。** 带 `due_at` 的任务由一个 TaskSweep 投递（照抄 ReminderSweep：每分钟、10 分钟宽限窗口、at-most-once），目标优先任务的 `source` 渠道，回退 `home_chat` / macOS 通知。不引入新的调度机制。
 
 这是最能把 shion 从聊天工具推进到个人 agent 的能力。
 
@@ -181,14 +193,14 @@ maintenance 框架（`Schedule` + `Maintenance` trait）是现成的，加一个
 
 ## 推荐实现顺序
 
-如果只选一条最有价值的路线，建议按下面顺序：
+如果只选一条最有价值的路线，建议按下面顺序（ingress 入口已落地，第 1 节不再占位）：
 
-1. unix socket ingress channel（第 1 节）——让 gateway 真正可达
-2. `Task` / `InboxItem` 领域模型 + `task` tool + 基础 inspect（第 2 节）
-3. 后台权限策略，替换 gateway 的一刀切 DenyApprover（第 3 节）
-4. gateway maintenance 中加入 daily briefing（第 4 节）
-5. Lark channel + 飞书日历只读连接器，共享鉴权（第 1、5 节）
+1. `Task` 单表领域模型（含 `inbox` 状态与 `waiting_on`）+ `task` tool + 基础 inspect（第 2 节）
+2. 后台权限策略，替换 gateway 的一刀切 DenyApprover（第 3 节）
+3. gateway maintenance 中加入 daily briefing，投递走 channel `home_chat`（第 4 节）
+4. reviewer 增加承诺提取方向，capture 进 task inbox（第 2 节）
+5. 飞书日历只读连接器，与 feishu channel 共享鉴权（第 5 节）
 6. 强化 memory 分类、来源和过期机制（第 6 节）
 7. 为长任务加入 `Run` / `RunStep` 记录（第 7 节）
 
-前三步合起来才构成从"聊天工具"到"个人 agent"的那次跨越；其余都可以在这个闭环跑起来之后逐步加。
+前两步加上已有的 ingress 合起来才构成从"聊天工具"到"个人 agent"的那次跨越；其余都可以在这个闭环跑起来之后逐步加。
