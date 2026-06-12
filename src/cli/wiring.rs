@@ -68,9 +68,10 @@ pub async fn build(db: Arc<Db>, approver: Arc<dyn Approver>) -> anyhow::Result<W
     //   SHION_SKILLS_PATH (colon-separated), <workspace>/skills,
     //   <workspace>/.claude/skills, and the user-global ~/.claude/skills shared
     //   by general agents (Claude Agent Skills `SKILL.md` format).
+    let env = crate::config::ShionEnv::load()?;
     let root = workspace.roots().first().cloned().unwrap_or_default();
     let mut skill_dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(extra) = std::env::var("SHION_SKILLS_PATH") {
+    if let Some(extra) = &env.skills_path {
         skill_dirs.extend(
             extra
                 .split(':')
@@ -80,8 +81,8 @@ pub async fn build(db: Arc<Db>, approver: Arc<dyn Approver>) -> anyhow::Result<W
     }
     skill_dirs.push(root.join("skills"));
     skill_dirs.push(root.join(".claude/skills"));
-    if let Ok(home) = std::env::var("HOME") {
-        skill_dirs.push(PathBuf::from(home).join(".claude/skills"));
+    if let Some(home) = dirs::home_dir() {
+        skill_dirs.push(home.join(".claude/skills"));
     }
     let skills = Arc::new(SkillRegistry::load_from_dirs(&skill_dirs));
 
@@ -111,7 +112,7 @@ pub async fn build(db: Arc<Db>, approver: Arc<dyn Approver>) -> anyhow::Result<W
         sessions: db.clone(),
         messages: db.clone(),
         reviewer: Some(reviewer.clone()),
-        review_interval: review_interval_from_env(),
+        review_interval: env.review_interval.filter(|v| *v > 0).unwrap_or(10),
     };
 
     Ok(Wiring {
@@ -119,12 +120,4 @@ pub async fn build(db: Arc<Db>, approver: Arc<dyn Approver>) -> anyhow::Result<W
         sessions: db.clone(),
         reviewer,
     })
-}
-
-pub fn review_interval_from_env() -> usize {
-    std::env::var("SHION_REVIEW_INTERVAL")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(10)
 }

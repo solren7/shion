@@ -6,8 +6,12 @@ use crate::{
         gateway::{Gateway, MaintenanceService},
     },
     cli::{approver::DenyApprover, wiring},
-    domain::{approval::Approver, reminder::ReminderRepository},
-    infra::{db::Db, macos_notifier::MacosNotifier},
+    domain::{approval::Approver, notify::Notifier, reminder::ReminderRepository},
+    infra::{
+        db::Db,
+        feishu::{FeishuChannel, FeishuNotifier, FeishuSender},
+        macos_notifier::MacosNotifier,
+    },
 };
 
 /// Run the always-on gateway: a persistent process hosting the maintenance
@@ -30,14 +34,33 @@ pub async fn run(db_url: &str, schedule_expr: &str) -> anyhow::Result<()> {
         reviewer: wired.reviewer.clone(),
     });
 
+    // Ingress channels, declared in ~/.shion/config.toml. Resolved before
+    // the reminder sweep because a feishu `home_chat` takes over reminder
+    // delivery from the local macOS notifier.
+    let feishu = crate::config::feishu_config()?;
+    let feishu_sender = feishu.as_ref().map(|cfg| {
+        Arc::new(FeishuSender::new(
+            cfg.app_id.clone(),
+            cfg.app_secret.clone(),
+        ))
+    });
+
+    let notifier: Arc<dyn Notifier> = match (&feishu, &feishu_sender) {
+        (Some(cfg), Some(sender)) if cfg.home_chat.is_some() => Arc::new(FeishuNotifier::new(
+            sender.clone(),
+            cfg.home_chat.clone().unwrap(),
+        )),
+        _ => Arc::new(MacosNotifier),
+    };
+
     let reminder_repo: Arc<dyn ReminderRepository> = db.clone();
     let reminder_sweep: Arc<dyn Maintenance> = Arc::new(ReminderSweep {
         reminders: reminder_repo,
-        notifier: Arc::new(MacosNotifier),
+        notifier,
     });
 
     let handler: Arc<dyn crate::domain::gateway::MessageHandler> = Arc::new(wired.runtime);
-    let gateway = Gateway::new(handler)
+    let mut gateway = Gateway::new(handler)
         .with_maintenance(MaintenanceService {
             schedule: review_schedule,
             maintenance: review_sweep,
@@ -47,9 +70,20 @@ pub async fn run(db_url: &str, schedule_expr: &str) -> anyhow::Result<()> {
             maintenance: reminder_sweep,
         });
 
+    let mut channels = Vec::new();
+    if let (Some(cfg), Some(sender)) = (&feishu, &feishu_sender) {
+        gateway = gateway.add_channel(Box::new(FeishuChannel::new(sender.clone(), cfg)));
+        channels.push("feishu");
+    }
+
     println!(
-        "Shion gateway — maintenance `{}`, reminders every minute. Ctrl-C to stop.\n",
-        schedule_expr
+        "Shion gateway — maintenance `{}`, reminders every minute, channels: {}. Ctrl-C to stop.\n",
+        schedule_expr,
+        if channels.is_empty() {
+            "none".to_string()
+        } else {
+            channels.join(", ")
+        }
     );
 
     gateway

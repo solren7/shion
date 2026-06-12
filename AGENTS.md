@@ -9,7 +9,7 @@ Guidance for coding agents (Claude Code and others) working in this repository.
 cargo check                        # fast compile check
 cargo build                        # build
 cargo run -- chat                  # start interactive chat (db lives at ~/.shion/shion.db)
-cargo run -- gateway               # always-on process: maintenance sweeps (no ingress channels wired yet)
+cargo run -- gateway               # always-on process: maintenance sweeps + ingress channels (feishu)
 cargo test                         # run all tests
 cargo test tools::time             # run a single test module
 cargo fmt                          # format
@@ -24,9 +24,31 @@ shion gateway status               # launchd state (state/pid/last exit code)
 After a schema change (new toasty model/field), delete `~/.shion/shion.db` —
 `push_schema` only runs for newly created database files.
 
-Runtime settings (provider/model/base_url/aux_model, maintenance `schedule`) live in
-`~/.shion/config.toml`; secrets (API keys) in `~/.shion/.env`. Priority: built-in
-defaults < config.toml < `SHION_*` env vars. `SHION_HOME` relocates the whole directory.
+Building requires `protoc` (`brew install protobuf`): the feishu channel's websocket
+frames are protobuf, and `lark-websocket-protobuf` compiles its `.proto` at build time.
+
+Runtime settings (provider/model/base_url/aux_model, maintenance `schedule`, the
+`[channels.*]` tables) live in `~/.shion/config.toml`; credentials (API keys,
+`FEISHU_APP_ID` / `FEISHU_APP_SECRET`) only in `~/.shion/.env`. Priority: built-in
+defaults < config.toml < `SHION_*` env vars. `SHION_HOME` relocates the whole
+directory.
+
+Env management: dotenvy loads `.env` files into the process env (`main.rs`); envy
+deserializes them into typed structs in `config.rs` (`ShionEnv` for `SHION_*`,
+`ApiKeys` for provider keys, `FeishuEnv` for `FEISHU_*`). Read env vars through
+those structs, not `std::env::var` — the only exception is `SHION_HOME`, the
+bootstrap variable that locates `.env` itself.
+
+Channel declarations follow hermes-agent's per-platform block shape — behavior
+keys in the table, credentials in env:
+
+```toml
+[channels.feishu]
+enabled = true
+allow_from = ["ou_xxx"]   # sender open_id allowlist; empty = anyone
+require_mention = true     # group messages must carry an @mention (DMs bypass)
+home_chat = "oc_xxx"      # optional: reminders go here instead of macOS notifications
+```
 
 ## Architecture
 
@@ -82,9 +104,15 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 `agent/gateway.rs` — always-on gateway (pattern borrowed from hermes-agent's gateway: a persistent process hosting background services + ingress)
 - `MessageHandler` (`domain/gateway.rs`) is the pure seam between a transport and the agent; `AgentRuntime` implements it (an inbound message is one session turn)
 - `Channel` trait = a pluggable ingress; `Gateway` hosts N channels + N `MaintenanceService`s (the `daemon.rs` supervisor loop — review sweep on the config schedule, reminder sweep every minute), all sharing one `watch` shutdown signal
-- no channels are wired today — ingress channels will be declared in `~/.shion/config.toml` and constructed in `cli/gateway.rs`
+- channels are declared in `~/.shion/config.toml` and constructed in `cli/gateway.rs`; `feishu` is the first wired channel
 - non-interactive: the gateway wires `DenyApprover` so side-effecting tools are refused rather than blocking on a stdin prompt (mirrors hermes disabling interactive toolsets in cron/gateway context)
 - background install: `shion gateway start` (see `cli/service.rs`) runs it under launchd; bare `shion gateway` is the foreground process launchd invokes
+
+`infra/feishu.rs` — the feishu integration: `FeishuChannel` (ingress), `FeishuSender` (outbound: cached tenant token + send), `FeishuNotifier` (reminders → `home_chat`)
+- receives `im.message.receive_v1` over Feishu's WebSocket long connection (open-lark, no public callback URL needed); replies via the IM REST API with plain reqwest
+- the ws connection runs on a dedicated thread with a current-thread runtime because open-lark's event dispatcher is not `Send`; events cross back over an mpsc channel
+- `admit` applies the access policy (borrowed from hermes-agent): `allow_from` open_id allowlist, `require_mention` for group chats; non-text and bot-sent messages are dropped
+- session id is `feishu:{chat_id}`, so each chat is one continuous session; group @mention placeholders are stripped
 
 `cli/gateway.rs` — wires the `gateway` subcommand; `cli/wiring.rs` — shared `AgentRuntime` construction used by both chat and gateway (differ only in the `Approver`)
 
@@ -95,7 +123,7 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 - **Swap persistence**: implement `SessionRepository + MessageRepository` for a different backend; no changes needed in `agent/` or `domain/`
 - **Upgrade planner**: replace `KeywordPlanner` with a model-based impl of `Planner`
 - **Change the scheduled action**: implement `Maintenance` (`agent/daemon.rs`) and construct it in `cli/gateway.rs`
-- **Add a gateway ingress**: implement `Channel` (`agent/gateway.rs`) for a new transport (TCP/HTTP/chat platform), `add_channel` it in `cli/gateway.rs`, gated by a `~/.shion/config.toml` declaration
+- **Add a gateway ingress**: implement `Channel` (`agent/gateway.rs`) for a new transport (TCP/HTTP/chat platform), `add_channel` it in `cli/gateway.rs`, gated by a `~/.shion/config.toml` declaration — `infra/feishu.rs` is the reference implementation
 
 ## Testing
 
