@@ -9,7 +9,7 @@ Guidance for coding agents (Claude Code and others) working in this repository.
 cargo check                        # fast compile check
 cargo build                        # build
 cargo run -- chat                  # start interactive chat (db lives at ~/.shion/shion.db)
-cargo run -- gateway               # always-on process: maintenance sweeps + ingress channels (feishu)
+cargo run -- gateway               # always-on process: maintenance sweeps + ingress channels (feishu, telegram)
 cargo test                         # run all tests
 cargo test tools::time             # run a single test module
 cargo fmt                          # format
@@ -29,15 +29,15 @@ frames are protobuf, and `lark-websocket-protobuf` compiles its `.proto` at buil
 
 Runtime settings (provider/model/base_url/aux_model, maintenance `schedule`, the
 `[channels.*]` tables) live in `~/.shion/config.toml`; credentials (API keys,
-`FEISHU_APP_ID` / `FEISHU_APP_SECRET`) only in `~/.shion/.env`. Priority: built-in
-defaults < config.toml < `SHION_*` env vars. `SHION_HOME` relocates the whole
-directory.
+`FEISHU_APP_ID` / `FEISHU_APP_SECRET`, `TELEGRAM_BOT_TOKEN`) only in
+`~/.shion/.env`. Priority: built-in defaults < config.toml < `SHION_*` env vars.
+`SHION_HOME` relocates the whole directory.
 
 Env management: dotenvy loads `.env` files into the process env (`main.rs`); envy
 deserializes them into typed structs in `config.rs` (`ShionEnv` for `SHION_*`,
-`ApiKeys` for provider keys, `FeishuEnv` for `FEISHU_*`). Read env vars through
-those structs, not `std::env::var` — the only exception is `SHION_HOME`, the
-bootstrap variable that locates `.env` itself.
+`ApiKeys` for provider keys, `FeishuEnv` for `FEISHU_*`, `TelegramEnv` for
+`TELEGRAM_*`). Read env vars through those structs, not `std::env::var` — the
+only exception is `SHION_HOME`, the bootstrap variable that locates `.env` itself.
 
 Channel declarations follow hermes-agent's per-platform block shape — behavior
 keys in the table, credentials in env:
@@ -48,7 +48,15 @@ enabled = true
 allow_from = ["ou_xxx"]   # sender open_id allowlist; empty = anyone
 require_mention = true     # group messages must carry an @mention (DMs bypass)
 home_chat = "oc_xxx"      # optional: reminders go here instead of macOS notifications
+
+[channels.telegram]
+enabled = true
+allow_from = ["123456789"]  # sender user-id allowlist; empty = anyone
+require_mention = true       # group messages must @mention the bot (DMs bypass)
+home_chat = "123456789"     # optional: reminders go here instead of macOS notifications
 ```
+
+When multiple channels set `home_chat`, feishu takes reminder delivery.
 
 ## Architecture
 
@@ -104,7 +112,7 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 `agent/gateway.rs` — always-on gateway (pattern borrowed from hermes-agent's gateway: a persistent process hosting background services + ingress)
 - `MessageHandler` (`domain/gateway.rs`) is the pure seam between a transport and the agent; `AgentRuntime` implements it (an inbound message is one session turn)
 - `Channel` trait = a pluggable ingress; `Gateway` hosts N channels + N `MaintenanceService`s (the `daemon.rs` supervisor loop — review sweep on the config schedule, reminder sweep every minute), all sharing one `watch` shutdown signal
-- channels are declared in `~/.shion/config.toml` and constructed in `cli/gateway.rs`; `feishu` is the first wired channel
+- channels are declared in `~/.shion/config.toml` and constructed in `cli/gateway.rs`; `feishu` and `telegram` are the wired channels
 - non-interactive: the gateway wires `DenyApprover` so side-effecting tools are refused rather than blocking on a stdin prompt (mirrors hermes disabling interactive toolsets in cron/gateway context)
 - background install: `shion gateway start` (see `cli/service.rs`) runs it under launchd; bare `shion gateway` is the foreground process launchd invokes
 
@@ -113,6 +121,11 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 - the ws connection runs on a dedicated thread with a current-thread runtime because open-lark's event dispatcher is not `Send`; events cross back over an mpsc channel
 - `admit` applies the access policy (borrowed from hermes-agent): `allow_from` open_id allowlist, `require_mention` for group chats; non-text and bot-sent messages are dropped
 - session id is `feishu:{chat_id}`, so each chat is one continuous session; group @mention placeholders are stripped
+
+`infra/telegram.rs` — the telegram integration: `TelegramChannel` (ingress), `TelegramSender` (outbound send), `TelegramNotifier` (reminders → `home_chat`)
+- receives messages via `getUpdates` long polling (no public callback URL needed); plain reqwest against the Bot API, no SDK dependency
+- `admit` mirrors the feishu policy: `allow_from` user-id allowlist, `require_mention` (group text must contain `@bot_username`, resolved via `getMe` at startup); non-text and bot-sent messages are dropped
+- session id is `telegram:{chat_id}`; replies over 4096 UTF-16 units are split into consecutive messages
 
 `cli/gateway.rs` — wires the `gateway` subcommand; `cli/wiring.rs` — shared `AgentRuntime` construction used by both chat and gateway (differ only in the `Approver`)
 

@@ -220,6 +220,7 @@ pub struct FileConfig {
 #[serde(default)]
 pub struct ChannelsFileConfig {
     pub feishu: Option<FeishuFileConfig>,
+    pub telegram: Option<TelegramFileConfig>,
 }
 
 /// `[channels.feishu]` table. App credentials never live here — they are
@@ -252,6 +253,61 @@ pub struct FeishuConfig {
     pub allow_from: Vec<String>,
     pub require_mention: bool,
     pub home_chat: Option<String>,
+}
+
+/// `[channels.telegram]` table. The bot token never lives here — it is read
+/// from `TELEGRAM_BOT_TOKEN` (in `~/.shion/.env`).
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct TelegramFileConfig {
+    pub enabled: bool,
+    /// Sender user-id allowlist. Empty = anyone who can reach the bot.
+    pub allow_from: Vec<String>,
+    /// Whether group messages must @mention the bot (default true; DMs
+    /// always bypass this gate).
+    pub require_mention: Option<bool>,
+    /// Chat id that receives proactive output (reminders). Unset = keep
+    /// the local macOS notifier.
+    pub home_chat: Option<String>,
+}
+
+/// `TELEGRAM_*` bot credentials from the environment (`~/.shion/.env`).
+#[derive(Debug, Deserialize, Default)]
+struct TelegramEnv {
+    bot_token: Option<String>,
+}
+
+/// Resolved Telegram channel settings.
+pub struct TelegramConfig {
+    pub bot_token: String,
+    pub allow_from: Vec<String>,
+    pub require_mention: bool,
+    pub home_chat: Option<String>,
+}
+
+/// Resolve the Telegram channel config. `None` means the channel is not
+/// enabled; an error means it is enabled but misconfigured (fail fast at
+/// startup).
+pub fn telegram_config() -> anyhow::Result<Option<TelegramConfig>> {
+    let file = FileConfig::load(&shion_home());
+    let Some(telegram) = file.channels.and_then(|c| c.telegram) else {
+        return Ok(None);
+    };
+    if !telegram.enabled {
+        return Ok(None);
+    }
+    let env: TelegramEnv = envy::prefixed("TELEGRAM_").from_env().unwrap_or_default();
+    let bot_token = env.bot_token.filter(|s| !s.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "[channels.telegram] is enabled but TELEGRAM_BOT_TOKEN is not set (put it in ~/.shion/.env)"
+        )
+    })?;
+    Ok(Some(TelegramConfig {
+        bot_token,
+        allow_from: telegram.allow_from,
+        require_mention: telegram.require_mention.unwrap_or(true),
+        home_chat: telegram.home_chat,
+    }))
 }
 
 /// Resolve the Feishu channel config. `None` means the channel is not enabled;

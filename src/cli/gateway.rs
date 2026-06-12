@@ -11,6 +11,7 @@ use crate::{
         db::Db,
         feishu::{FeishuChannel, FeishuNotifier, FeishuSender},
         macos_notifier::MacosNotifier,
+        telegram::{TelegramChannel, TelegramNotifier, TelegramSender},
     },
 };
 
@@ -35,8 +36,8 @@ pub async fn run(db_url: &str, schedule_expr: &str) -> anyhow::Result<()> {
     });
 
     // Ingress channels, declared in ~/.shion/config.toml. Resolved before
-    // the reminder sweep because a feishu `home_chat` takes over reminder
-    // delivery from the local macOS notifier.
+    // the reminder sweep because a channel `home_chat` takes over reminder
+    // delivery from the local macOS notifier (feishu wins if both set one).
     let feishu = crate::config::feishu_config()?;
     let feishu_sender = feishu.as_ref().map(|cfg| {
         Arc::new(FeishuSender::new(
@@ -44,13 +45,21 @@ pub async fn run(db_url: &str, schedule_expr: &str) -> anyhow::Result<()> {
             cfg.app_secret.clone(),
         ))
     });
+    let telegram = crate::config::telegram_config()?;
+    let telegram_sender = telegram
+        .as_ref()
+        .map(|cfg| Arc::new(TelegramSender::new(cfg.bot_token.clone())));
 
-    let notifier: Arc<dyn Notifier> = match (&feishu, &feishu_sender) {
-        (Some(cfg), Some(sender)) if cfg.home_chat.is_some() => Arc::new(FeishuNotifier::new(
-            sender.clone(),
-            cfg.home_chat.clone().unwrap(),
-        )),
-        _ => Arc::new(MacosNotifier),
+    let notifier: Arc<dyn Notifier> = if let (Some(cfg), Some(sender)) = (&feishu, &feishu_sender)
+        && let Some(home) = &cfg.home_chat
+    {
+        Arc::new(FeishuNotifier::new(sender.clone(), home.clone()))
+    } else if let (Some(cfg), Some(sender)) = (&telegram, &telegram_sender)
+        && let Some(home) = &cfg.home_chat
+    {
+        Arc::new(TelegramNotifier::new(sender.clone(), home.clone()))
+    } else {
+        Arc::new(MacosNotifier)
     };
 
     let reminder_repo: Arc<dyn ReminderRepository> = db.clone();
@@ -74,6 +83,10 @@ pub async fn run(db_url: &str, schedule_expr: &str) -> anyhow::Result<()> {
     if let (Some(cfg), Some(sender)) = (&feishu, &feishu_sender) {
         gateway = gateway.add_channel(Box::new(FeishuChannel::new(sender.clone(), cfg)));
         channels.push("feishu");
+    }
+    if let (Some(cfg), Some(sender)) = (&telegram, &telegram_sender) {
+        gateway = gateway.add_channel(Box::new(TelegramChannel::new(sender.clone(), cfg)));
+        channels.push("telegram");
     }
 
     println!(
