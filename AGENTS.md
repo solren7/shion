@@ -99,6 +99,11 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 
 `tools/time.rs` — first built-in tool; returns RFC 3339 UTC timestamp
 
+`domain/task.rs` + `tools/task.rs` — durable cross-session tasks (roadmap §2's "kanban layer", shaped after hermes-agent)
+- single `Task` model: `status` (`inbox`→`todo`→`done`, plus `waiting`/`cancelled`), `waiting_on` (set = a commitment), optional `due_at`, `source`/`source_message_id` (origin session + dedup key for future reviewer extraction)
+- `task` tool actions: `capture` (defaults to inbox) / `list` / `update` / `complete`; no `plan_today` — daily planning belongs to a future briefing sweep
+- operator view: `shion task list` (open tasks grouped by status)
+
 `cli/chat.rs` — wires everything together; creates `Arc<Db>` and passes it as both repos
 - Session ids are program-managed (uuid v7); every run starts a fresh session. `/new` and `/clear` are equivalent — both open a new session. There is no user-supplied session id and no `/session` subcommand.
 
@@ -106,6 +111,7 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 - `Schedule` wraps `croner` (5-field Unix cron, e.g. `0 * * * *`); `Maintenance` trait is the scheduled unit of work
 - `ReviewSweep` is the one fixed action: run the reflective reviewer over every stored session with ≥1 user turn
 - `ReminderSweep` delivers due reminders via `Notifier` every minute (10-min grace window; older ones are marked `missed`)
+- `TaskSweep` notifies once when an open task comes due (the task stays open; `due_notified_at` is the at-most-once guard)
 - `supervise` is the loop: sleep to the next cron fire, run the cycle, isolate per-cycle failures, and trip a circuit breaker after 5 consecutive failures
 - the OS-level supervisor install is `cli/service.rs` (`shion gateway start/stop/restart/status`, macOS launchd: `KeepAlive` auto-restart + `RunAtLoad`)
 

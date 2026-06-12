@@ -2,11 +2,13 @@ use std::sync::Arc;
 
 use crate::{
     agent::{
-        daemon::{Maintenance, ReminderSweep, ReviewSweep, Schedule},
+        daemon::{Maintenance, ReminderSweep, ReviewSweep, Schedule, TaskSweep},
         gateway::{Gateway, MaintenanceService},
     },
     cli::{approver::DenyApprover, wiring},
-    domain::{approval::Approver, notify::Notifier, reminder::ReminderRepository},
+    domain::{
+        approval::Approver, notify::Notifier, reminder::ReminderRepository, task::TaskRepository,
+    },
     infra::{
         db::Db,
         feishu::{FeishuChannel, FeishuNotifier, FeishuSender},
@@ -65,6 +67,11 @@ pub async fn run(db_url: &str, schedule_expr: &str) -> anyhow::Result<()> {
     let reminder_repo: Arc<dyn ReminderRepository> = db.clone();
     let reminder_sweep: Arc<dyn Maintenance> = Arc::new(ReminderSweep {
         reminders: reminder_repo,
+        notifier: notifier.clone(),
+    });
+    let task_repo: Arc<dyn TaskRepository> = db.clone();
+    let task_sweep: Arc<dyn Maintenance> = Arc::new(TaskSweep {
+        tasks: task_repo,
         notifier,
     });
 
@@ -77,6 +84,10 @@ pub async fn run(db_url: &str, schedule_expr: &str) -> anyhow::Result<()> {
         .with_maintenance(MaintenanceService {
             schedule: reminder_schedule,
             maintenance: reminder_sweep,
+        })
+        .with_maintenance(MaintenanceService {
+            schedule: Schedule::parse("* * * * *")?,
+            maintenance: task_sweep,
         });
 
     let mut channels = Vec::new();

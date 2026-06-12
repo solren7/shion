@@ -4,7 +4,11 @@
 //! runtime. They are the operator's view into what the gateway will act on.
 
 use crate::{
-    domain::{reminder::ReminderRepository, repository::SessionRepository},
+    domain::{
+        reminder::ReminderRepository,
+        repository::SessionRepository,
+        task::{TaskRepository, TaskStatus},
+    },
     infra::db::Db,
 };
 
@@ -41,6 +45,35 @@ pub async fn cron_list(db_url: &str) -> anyhow::Result<()> {
                 local_time(r.run_at),
                 r.message
             );
+        }
+    }
+    Ok(())
+}
+
+/// List open tasks grouped by status (inbox first — it needs triage).
+pub async fn task_list(db_url: &str) -> anyhow::Result<()> {
+    let db = Db::connect(db_url).await?;
+    let open = TaskRepository::list_open(&db).await?;
+
+    if open.is_empty() {
+        println!("No open tasks.");
+        return Ok(());
+    }
+    for status in [TaskStatus::Inbox, TaskStatus::Todo, TaskStatus::Waiting] {
+        let group: Vec<_> = open.iter().filter(|t| t.status == status).collect();
+        if group.is_empty() {
+            continue;
+        }
+        println!("{}:", status.as_str());
+        for t in group {
+            let mut line = format!("  {}  {}", t.id, t.title);
+            if !t.waiting_on.is_empty() {
+                line.push_str(&format!("  (waiting on: {})", t.waiting_on));
+            }
+            if let Some(due) = t.due_at {
+                line.push_str(&format!("  due {}", local_time(due)));
+            }
+            println!("{line}");
         }
     }
     Ok(())

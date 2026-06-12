@@ -31,6 +31,11 @@ enum Commands {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Inspect the durable task list
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
     /// Show or switch the active LLM provider and model
     Model {
         #[command(subcommand)]
@@ -54,6 +59,12 @@ enum ModelAction {
 #[derive(Subcommand)]
 enum CronAction {
     /// List pending reminders with their schedules and next fire times
+    List,
+}
+
+#[derive(Subcommand)]
+enum TaskAction {
+    /// List open tasks (inbox / todo / waiting), grouped by status
     List,
 }
 
@@ -102,6 +113,9 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Session { action } => match action {
             SessionAction::List => inspect::session_list(&db).await,
             SessionAction::Clean => inspect::session_clean(&db).await,
+        },
+        Commands::Task { action } => match action {
+            TaskAction::List => inspect::task_list(&db).await,
         },
         Commands::Model { action } => match action {
             ModelAction::List => model::list(),

@@ -27,6 +27,7 @@ use crate::domain::{
     reminder::{ReminderRepository, ReminderStatus},
     repository::SessionRepository,
     reviewer::Reviewer,
+    task::TaskRepository,
 };
 
 /// Stop the daemon once this many maintenance cycles fail back-to-back.
@@ -67,6 +68,7 @@ pub struct MaintenanceSummary {
     pub memories_written: usize,
     pub skills_written: usize,
     pub reminders_fired: usize,
+    pub tasks_notified: usize,
 }
 
 /// The fixed maintenance action: review every stored session that has at least
@@ -217,6 +219,52 @@ impl Maintenance for ReminderSweep {
     }
 }
 
+/// Sweep open tasks every minute and notify once when one comes due. Unlike a
+/// reminder, the task itself stays open — only `due_notified_at` flips, which
+/// is the at-most-once guard.
+pub struct TaskSweep {
+    pub tasks: Arc<dyn TaskRepository>,
+    pub notifier: Arc<dyn Notifier>,
+}
+
+#[async_trait]
+impl Maintenance for TaskSweep {
+    async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut summary = MaintenanceSummary::default();
+
+        for task in self.tasks.list_open().await? {
+            let Some(due_at) = task.due_at else {
+                continue;
+            };
+            if due_at > now || task.due_notified_at.is_some() {
+                continue;
+            }
+            let title = if now - due_at > REMINDER_GRACE_SECS {
+                "Shion (overdue task)"
+            } else {
+                "Shion task due"
+            };
+            let body = if task.waiting_on.is_empty() {
+                task.title.clone()
+            } else {
+                format!("{} (waiting on: {})", task.title, task.waiting_on)
+            };
+            // Notify first, then mark — prefer duplicate over silent loss
+            // (same ordering as recurring reminders).
+            self.notifier.notify(title, &body).await.ok();
+            let mut notified = task.clone();
+            notified.due_notified_at = Some(now);
+            if let Err(e) = self.tasks.update(&notified).await {
+                warn!(error = %e, id = %task.id, "failed to mark task notified");
+            } else {
+                summary.tasks_notified += 1;
+            }
+        }
+        Ok(summary)
+    }
+}
+
 /// Update the consecutive-failure counter and report whether the circuit breaker
 /// has tripped. Pulled out as a pure function so the breaker is unit-testable
 /// without driving the real clock.
@@ -287,6 +335,7 @@ where
 mod tests {
     use super::*;
     use crate::domain::reminder::{Reminder, ReminderStatus};
+    use crate::domain::task::{Task, TaskStatus};
     use chrono::{Datelike, TimeZone, Timelike};
     use std::sync::Mutex;
 
@@ -577,5 +626,119 @@ mod tests {
         assert_eq!(failures, 0);
         assert!(!breaker_tripped(&mut failures, false));
         assert_eq!(failures, 1);
+    }
+
+    // ── TaskSweep ─────────────────────────────────────────────────────────────
+
+    #[derive(Default)]
+    struct FakeTasks {
+        tasks: Mutex<Vec<Task>>,
+    }
+
+    #[async_trait]
+    impl crate::domain::task::TaskRepository for FakeTasks {
+        async fn save(&self, task: &Task) -> anyhow::Result<()> {
+            self.tasks.lock().unwrap().push(task.clone());
+            Ok(())
+        }
+        async fn find(&self, id: &str) -> anyhow::Result<Option<Task>> {
+            Ok(self
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.id == id)
+                .cloned())
+        }
+        async fn list_open(&self) -> anyhow::Result<Vec<Task>> {
+            Ok(self
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|t| t.status.is_open())
+                .cloned()
+                .collect())
+        }
+        async fn update(&self, task: &Task) -> anyhow::Result<()> {
+            let mut tasks = self.tasks.lock().unwrap();
+            let slot = tasks
+                .iter_mut()
+                .find(|t| t.id == task.id)
+                .ok_or_else(|| anyhow::anyhow!("not found"))?;
+            *slot = task.clone();
+            Ok(())
+        }
+    }
+
+    fn task_sweep_with(tasks: Vec<Task>) -> (TaskSweep, Arc<FakeTasks>, Arc<FakeNotifier>) {
+        let repo = Arc::new(FakeTasks {
+            tasks: Mutex::new(tasks),
+        });
+        let notifier = Arc::new(FakeNotifier::default());
+        let sweep = TaskSweep {
+            tasks: repo.clone() as Arc<dyn crate::domain::task::TaskRepository>,
+            notifier: notifier.clone() as Arc<dyn Notifier>,
+        };
+        (sweep, repo, notifier)
+    }
+
+    fn due_task(offset_secs: i64) -> Task {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut task = Task::new("send report".to_string());
+        task.status = TaskStatus::Todo;
+        task.due_at = Some(now + offset_secs);
+        task
+    }
+
+    #[tokio::test]
+    async fn task_sweep_notifies_due_task_once() {
+        let (sweep, repo, notifier) = task_sweep_with(vec![due_task(-30)]);
+
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.tasks_notified, 1);
+        assert_eq!(notifier.calls.lock().unwrap().len(), 1);
+        assert_eq!(notifier.calls.lock().unwrap()[0].0, "Shion task due");
+        // Task stays open; only the guard flips.
+        let tasks = repo.tasks.lock().unwrap();
+        assert_eq!(tasks[0].status, TaskStatus::Todo);
+        assert!(tasks[0].due_notified_at.is_some());
+        drop(tasks);
+
+        // Second sweep: nothing new.
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.tasks_notified, 0);
+        assert_eq!(notifier.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn task_sweep_skips_future_and_undated_tasks() {
+        let mut undated = Task::new("someday".to_string());
+        undated.status = TaskStatus::Todo;
+        let (sweep, _repo, notifier) = task_sweep_with(vec![due_task(3600), undated]);
+
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.tasks_notified, 0);
+        assert!(notifier.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_sweep_marks_overdue_past_grace() {
+        let (sweep, _repo, notifier) = task_sweep_with(vec![due_task(-(REMINDER_GRACE_SECS + 60))]);
+
+        sweep.run().await.unwrap();
+        let calls = notifier.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "Shion (overdue task)");
+    }
+
+    #[tokio::test]
+    async fn task_sweep_includes_waiting_on_in_body() {
+        let mut task = due_task(-30);
+        task.waiting_on = "alice".to_string();
+        let (sweep, _repo, notifier) = task_sweep_with(vec![task]);
+
+        sweep.run().await.unwrap();
+        let calls = notifier.calls.lock().unwrap();
+        assert!(calls[0].1.contains("waiting on: alice"), "{}", calls[0].1);
     }
 }

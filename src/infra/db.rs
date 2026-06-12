@@ -10,6 +10,7 @@ use crate::domain::{
     repository::{MessageRepository, SessionRepository, SkillRepository},
     session::Session,
     skill::Skill,
+    task::{Task, TaskRepository, parse_task_status},
 };
 
 // ── toasty models (infra-internal) ───────────────────────────────────────────
@@ -61,6 +62,24 @@ struct ReminderRecord {
     created_at: i64,
 }
 
+// Optional i64 fields use 0 as the "unset" sentinel (same convention as
+// ReminderRecord's empty-string schedule).
+#[derive(Debug, toasty::Model)]
+struct TaskRecord {
+    #[key]
+    id: String,
+    title: String,
+    note: String,
+    status: String, // "inbox" | "todo" | "waiting" | "done" | "cancelled"
+    waiting_on: String,
+    due_at: i64,
+    source: String,
+    source_message_id: String,
+    due_notified_at: i64,
+    created_at: i64,
+    completed_at: i64,
+}
+
 // ── Db ───────────────────────────────────────────────────────────────────────
 
 pub struct Db {
@@ -79,7 +98,8 @@ impl Db {
                 SessionRecord,
                 MessageRecord,
                 SkillRecord,
-                ReminderRecord
+                ReminderRecord,
+                TaskRecord
             ))
             .connect(url)
             .await?;
@@ -280,6 +300,70 @@ impl ReminderRepository for Db {
     }
 }
 
+// ── TaskRepository ────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl TaskRepository for Db {
+    async fn save(&self, task: &Task) -> anyhow::Result<()> {
+        let mut db = self.inner.lock().await;
+        toasty::create!(TaskRecord {
+            id: task.id.clone(),
+            title: task.title.clone(),
+            note: task.note.clone(),
+            status: task.status.as_str().to_string(),
+            waiting_on: task.waiting_on.clone(),
+            due_at: task.due_at.unwrap_or(0),
+            source: task.source.clone(),
+            source_message_id: task.source_message_id.clone(),
+            due_notified_at: task.due_notified_at.unwrap_or(0),
+            created_at: task.created_at,
+            completed_at: task.completed_at.unwrap_or(0),
+        })
+        .exec(&mut *db)
+        .await?;
+        Ok(())
+    }
+
+    async fn find(&self, id: &str) -> anyhow::Result<Option<Task>> {
+        let mut db = self.inner.lock().await;
+        match TaskRecord::get_by_id(&mut *db, id).await {
+            Ok(record) => Ok(Some(task_from_record(record)?)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn list_open(&self) -> anyhow::Result<Vec<Task>> {
+        let mut db = self.inner.lock().await;
+        let rows = toasty::query!(TaskRecord).exec(&mut *db).await?;
+        let mut open: Vec<Task> = rows
+            .into_iter()
+            .map(task_from_record)
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|t| t.status.is_open())
+            .collect();
+        open.sort_by_key(|t| t.created_at);
+        Ok(open)
+    }
+
+    async fn update(&self, task: &Task) -> anyhow::Result<()> {
+        let mut db = self.inner.lock().await;
+        let mut record = TaskRecord::get_by_id(&mut *db, &task.id).await?;
+        record
+            .update()
+            .title(task.title.clone())
+            .note(task.note.clone())
+            .status(task.status.as_str().to_string())
+            .waiting_on(task.waiting_on.clone())
+            .due_at(task.due_at.unwrap_or(0))
+            .due_notified_at(task.due_notified_at.unwrap_or(0))
+            .completed_at(task.completed_at.unwrap_or(0))
+            .exec(&mut *db)
+            .await?;
+        Ok(())
+    }
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn parse_role(s: &str) -> Role {
@@ -323,6 +407,23 @@ fn skill_from_record(record: SkillRecord) -> Skill {
     }
 }
 
+fn task_from_record(record: TaskRecord) -> anyhow::Result<Task> {
+    let nonzero = |v: i64| (v != 0).then_some(v);
+    Ok(Task {
+        id: record.id,
+        title: record.title,
+        note: record.note,
+        status: parse_task_status(&record.status)?,
+        waiting_on: record.waiting_on,
+        due_at: nonzero(record.due_at),
+        source: record.source,
+        source_message_id: record.source_message_id,
+        due_notified_at: nonzero(record.due_notified_at),
+        created_at: record.created_at,
+        completed_at: nonzero(record.completed_at),
+    })
+}
+
 fn reminder_from_record(record: ReminderRecord) -> Reminder {
     Reminder {
         id: record.id,
@@ -338,6 +439,7 @@ fn reminder_from_record(record: ReminderRecord) -> Reminder {
 mod tests {
     use super::*;
     use crate::domain::reminder::ReminderStatus;
+    use crate::domain::task::TaskStatus;
 
     fn sqlite_url(name: &str) -> String {
         let path = std::env::temp_dir().join(name);
@@ -459,6 +561,48 @@ mod tests {
             .unwrap();
         let pending = ReminderRepository::list_pending(&db).await.unwrap();
         assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn db_task_roundtrip_and_update() {
+        let db = Db::connect(&sqlite_url("shion_task_repo_test.db"))
+            .await
+            .unwrap();
+        let mut task = Task::new("send weekly report".to_string());
+        task.due_at = Some(9999999999);
+        task.waiting_on = "boss".to_string();
+
+        TaskRepository::save(&db, &task).await.unwrap();
+        let open = TaskRepository::list_open(&db).await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].title, "send weekly report");
+        assert_eq!(open[0].status, TaskStatus::Inbox);
+        assert_eq!(open[0].due_at, Some(9999999999));
+        assert_eq!(open[0].waiting_on, "boss");
+        assert_eq!(open[0].due_notified_at, None);
+
+        let mut updated = open[0].clone();
+        updated.status = TaskStatus::Done;
+        updated.completed_at = Some(123);
+        TaskRepository::update(&db, &updated).await.unwrap();
+
+        assert!(TaskRepository::list_open(&db).await.unwrap().is_empty());
+        let found = TaskRepository::find(&db, &task.id).await.unwrap().unwrap();
+        assert_eq!(found.status, TaskStatus::Done);
+        assert_eq!(found.completed_at, Some(123));
+    }
+
+    #[tokio::test]
+    async fn db_task_find_returns_none_for_unknown_id() {
+        let db = Db::connect(&sqlite_url("shion_task_find_test.db"))
+            .await
+            .unwrap();
+        assert!(
+            TaskRepository::find(&db, "task-nope")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

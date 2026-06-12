@@ -11,5 +11,6 @@ pub mod repository;
 pub mod reviewer;
 pub mod session;
 pub mod skill;
+pub mod task;
 pub mod tool;
 pub mod workspace;

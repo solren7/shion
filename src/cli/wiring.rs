@@ -21,7 +21,7 @@ use crate::{
     services::{skill_registry::SkillRegistry, tool_registry::ToolRegistry},
     tools::{
         delegate::DelegateTool, file::FileTool, memory::MemoryTool, reminder::ReminderTool,
-        session::SessionTool, shell::ShellTool, skill::SkillTool, time::TimeTool,
+        session::SessionTool, shell::ShellTool, skill::SkillTool, task::TaskTool, time::TimeTool,
         web_fetch::WebFetchTool, web_search::WebSearchTool,
     },
 };
@@ -51,6 +51,7 @@ pub async fn build(db: Arc<Db>, approver: Arc<dyn Approver>) -> anyhow::Result<W
     tools.register(Arc::new(WebSearchTool::new()));
     tools.register(Arc::new(SessionTool::new(db.clone())));
     tools.register(Arc::new(ReminderTool::new(db.clone())));
+    tools.register(Arc::new(TaskTool::new(db.clone())));
 
     // Memories live as markdown files under ~/.shion/memory/, shared by the
     // `memory` tool and the reflective reviewer.
