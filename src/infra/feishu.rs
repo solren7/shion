@@ -31,8 +31,12 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{error, info, warn};
 
 use crate::{
-    agent::gateway::Channel, config::FeishuConfig, domain::gateway::MessageHandler,
-    domain::notify::Notifier,
+    agent::{
+        gateway::Channel,
+        pairing::{Gate, PairingGuard},
+    },
+    config::FeishuConfig,
+    domain::{gateway::MessageHandler, notify::Notifier, pairing::PairingRepository},
 };
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn";
@@ -176,11 +180,10 @@ impl Notifier for FeishuNotifier {
     }
 }
 
-/// Which inbound messages the agent handles.
+/// Which inbound messages the agent handles. Sender identity (allowlist /
+/// pairing) is the `PairingGuard`'s job, checked in the async consumer.
 #[derive(Clone, Default)]
 struct AdmitPolicy {
-    /// Sender open_id allowlist; empty = anyone.
-    allow_from: Vec<String>,
     /// Group messages must carry an @mention (DMs always pass).
     require_mention: bool,
 }
@@ -188,23 +191,29 @@ struct AdmitPolicy {
 pub struct FeishuChannel {
     sender: Arc<FeishuSender>,
     policy: AdmitPolicy,
+    guard: PairingGuard,
 }
 
 /// One inbound text message, reduced to what the agent needs.
 struct Inbound {
     message_id: String,
+    sender_id: String,
     chat_id: String,
     text: String,
 }
 
 impl FeishuChannel {
-    pub fn new(sender: Arc<FeishuSender>, config: &FeishuConfig) -> Self {
+    pub fn new(
+        sender: Arc<FeishuSender>,
+        config: &FeishuConfig,
+        pairings: Arc<dyn PairingRepository>,
+    ) -> Self {
         Self {
             sender,
             policy: AdmitPolicy {
-                allow_from: config.allow_from.clone(),
                 require_mention: config.require_mention,
             },
+            guard: PairingGuard::new("feishu", config.allow_from.clone(), pairings),
         }
     }
 }
@@ -248,6 +257,23 @@ impl Channel for FeishuChannel {
                     && let Some(oldest) = order.pop_front()
                 {
                     seen.remove(&oldest);
+                }
+
+                // Pairing gate: unknown senders get a pairing code instead of
+                // the agent until `shion pair approve` runs on the host.
+                match self.guard.check(&msg.sender_id, &msg.chat_id).await {
+                    Ok(Gate::Allowed) => {}
+                    Ok(Gate::Denied { reply }) => {
+                        info!(sender = %msg.sender_id, "feishu sender unpaired; sent pairing code");
+                        if let Err(error) = self.sender.send_text(&msg.chat_id, &reply).await {
+                            error!(%error, chat = %msg.chat_id, "failed to send pairing prompt");
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(%error, "pairing check failed; dropping message");
+                        continue;
+                    }
                 }
 
                 let session_id = format!("feishu:{}", msg.chat_id);
@@ -345,9 +371,6 @@ fn admit(event: P2ImMessageReceiveV1, policy: &AdmitPolicy) -> Option<Inbound> {
     if sender.sender_type != "user" {
         return None;
     }
-    if !policy.allow_from.is_empty() && !policy.allow_from.contains(&sender.sender_id.open_id) {
-        return None;
-    }
     let message = event.event.message;
     if message.message_type != "text" {
         return None;
@@ -368,6 +391,7 @@ fn admit(event: P2ImMessageReceiveV1, policy: &AdmitPolicy) -> Option<Inbound> {
     }
     Some(Inbound {
         message_id: message.message_id,
+        sender_id: sender.sender_id.open_id,
         chat_id: message.chat_id,
         text,
     })
@@ -466,30 +490,16 @@ mod tests {
     }
 
     #[test]
-    fn admit_accepts_dm_text_from_anyone_when_allowlist_empty() {
+    fn admit_extracts_sender_id_for_the_pairing_gate() {
         let msg = admit(event(json!({})), &AdmitPolicy::default()).expect("admitted");
         assert_eq!(msg.chat_id, "oc_1");
+        assert_eq!(msg.sender_id, "ou_1");
         assert_eq!(msg.text, "hello");
-    }
-
-    #[test]
-    fn admit_enforces_allow_from() {
-        let policy = AdmitPolicy {
-            allow_from: vec!["ou_owner".into()],
-            require_mention: true,
-        };
-        assert!(admit(event(json!({})), &policy).is_none());
-
-        let allowed = event(json!({
-            "event": { "sender": { "sender_id": { "open_id": "ou_owner" } } }
-        }));
-        assert!(admit(allowed, &policy).is_some());
     }
 
     #[test]
     fn admit_requires_mention_in_groups_only() {
         let policy = AdmitPolicy {
-            allow_from: Vec::new(),
             require_mention: true,
         };
         let unmentioned_group = event(json!({

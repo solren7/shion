@@ -45,18 +45,25 @@ keys in the table, credentials in env:
 ```toml
 [channels.feishu]
 enabled = true
-allow_from = ["ou_xxx"]   # sender open_id allowlist; empty = anyone
+allow_from = ["ou_xxx"]   # pre-trusted sender open_ids (skip pairing)
 require_mention = true     # group messages must carry an @mention (DMs bypass)
 home_chat = "oc_xxx"      # optional: reminders go here instead of macOS notifications
 
 [channels.telegram]
 enabled = true
-allow_from = ["123456789"]  # sender user-id allowlist; empty = anyone
+allow_from = ["123456789"]  # pre-trusted sender user-ids (skip pairing)
 require_mention = true       # group messages must @mention the bot (DMs bypass)
 home_chat = "123456789"     # optional: reminders go here instead of macOS notifications
 ```
 
 When multiple channels set `home_chat`, feishu takes reminder delivery.
+
+Senders outside `allow_from` must pair before the agent talks to them: their
+first message gets a pairing code as the only reply, and someone with shell
+access to the host runs `shion pair approve <code>` (codes expire after 1h;
+`shion pair list` shows pending/approved, `shion pair revoke <id>` un-pairs).
+Approval is written to the shared db, so it takes effect on the sender's next
+message without a gateway restart.
 
 ## Architecture
 
@@ -119,18 +126,19 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 - `MessageHandler` (`domain/gateway.rs`) is the pure seam between a transport and the agent; `AgentRuntime` implements it (an inbound message is one session turn)
 - `Channel` trait = a pluggable ingress; `Gateway` hosts N channels + N `MaintenanceService`s (the `daemon.rs` supervisor loop — review sweep on the config schedule, reminder sweep every minute), all sharing one `watch` shutdown signal
 - channels are declared in `~/.shion/config.toml` and constructed in `cli/gateway.rs`; `feishu` and `telegram` are the wired channels
+- sender admission is two-layered: each channel's `admit` filters message shape (non-text, bot senders, group mention gate), then the shared `PairingGuard` (`agent/pairing.rs`, store in `domain/pairing.rs`) decides identity — config `allow_from` is pre-trusted, approved pairings pass, anyone else gets a pairing code (`shion pair approve <code>` on the host admits them; `cli/pair.rs`)
 - non-interactive: the gateway wires `DenyApprover` so side-effecting tools are refused rather than blocking on a stdin prompt (mirrors hermes disabling interactive toolsets in cron/gateway context)
 - background install: `shion gateway start` (see `cli/service.rs`) runs it under launchd; bare `shion gateway` is the foreground process launchd invokes
 
 `infra/feishu.rs` — the feishu integration: `FeishuChannel` (ingress), `FeishuSender` (outbound: cached tenant token + send), `FeishuNotifier` (reminders → `home_chat`)
 - receives `im.message.receive_v1` over Feishu's WebSocket long connection (open-lark, no public callback URL needed); replies via the IM REST API with plain reqwest
 - the ws connection runs on a dedicated thread with a current-thread runtime because open-lark's event dispatcher is not `Send`; events cross back over an mpsc channel
-- `admit` applies the access policy (borrowed from hermes-agent): `allow_from` open_id allowlist, `require_mention` for group chats; non-text and bot-sent messages are dropped
+- `admit` filters message shape: `require_mention` for group chats, non-text and bot-sent messages dropped; sender identity goes through the shared `PairingGuard`
 - session id is `feishu:{chat_id}`, so each chat is one continuous session; group @mention placeholders are stripped
 
 `infra/telegram.rs` — the telegram integration: `TelegramChannel` (ingress), `TelegramSender` (outbound send), `TelegramNotifier` (reminders → `home_chat`)
 - receives messages via `getUpdates` long polling (no public callback URL needed); plain reqwest against the Bot API, no SDK dependency
-- `admit` mirrors the feishu policy: `allow_from` user-id allowlist, `require_mention` (group text must contain `@bot_username`, resolved via `getMe` at startup); non-text and bot-sent messages are dropped
+- `admit` mirrors the feishu policy: `require_mention` (group text must contain `@bot_username`, resolved via `getMe` at startup), non-text and bot-sent messages dropped; sender identity goes through the shared `PairingGuard`
 - session id is `telegram:{chat_id}`; replies over 4096 UTF-16 units are split into consecutive messages
 
 `cli/gateway.rs` — wires the `gateway` subcommand; `cli/wiring.rs` — shared `AgentRuntime` construction used by both chat and gateway (differ only in the `Approver`)

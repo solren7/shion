@@ -5,6 +5,7 @@ pub mod llm;
 pub mod memory;
 pub mod message;
 pub mod notify;
+pub mod pairing;
 pub mod planner;
 pub mod reminder;
 pub mod repository;

@@ -7,7 +7,8 @@ use crate::{
     },
     cli::{approver::DenyApprover, wiring},
     domain::{
-        approval::Approver, notify::Notifier, reminder::ReminderRepository, task::TaskRepository,
+        approval::Approver, notify::Notifier, pairing::PairingRepository,
+        reminder::ReminderRepository, task::TaskRepository,
     },
     infra::{
         db::Db,
@@ -90,13 +91,24 @@ pub async fn run(db_url: &str, schedule_expr: &str) -> anyhow::Result<()> {
             maintenance: task_sweep,
         });
 
+    // Senders outside `allow_from` go through the pairing handshake; the
+    // pairing store is shared with the `shion pair` CLI via the same db.
+    let pairings: Arc<dyn PairingRepository> = db.clone();
     let mut channels = Vec::new();
     if let (Some(cfg), Some(sender)) = (&feishu, &feishu_sender) {
-        gateway = gateway.add_channel(Box::new(FeishuChannel::new(sender.clone(), cfg)));
+        gateway = gateway.add_channel(Box::new(FeishuChannel::new(
+            sender.clone(),
+            cfg,
+            pairings.clone(),
+        )));
         channels.push("feishu");
     }
     if let (Some(cfg), Some(sender)) = (&telegram, &telegram_sender) {
-        gateway = gateway.add_channel(Box::new(TelegramChannel::new(sender.clone(), cfg)));
+        gateway = gateway.add_channel(Box::new(TelegramChannel::new(
+            sender.clone(),
+            cfg,
+            pairings.clone(),
+        )));
         channels.push("telegram");
     }
 

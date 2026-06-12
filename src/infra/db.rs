@@ -6,6 +6,7 @@ use tracing::info;
 
 use crate::domain::{
     message::{Message, Role},
+    pairing::{PairingRepository, PairingRequest, PairingStatus, parse_pairing_status},
     reminder::{Reminder, ReminderRepository, ReminderStatus, parse_reminder_status},
     repository::{MessageRepository, SessionRepository, SkillRepository},
     session::Session,
@@ -80,6 +81,19 @@ struct TaskRecord {
     completed_at: i64,
 }
 
+#[derive(Debug, toasty::Model)]
+struct PairingRecord {
+    /// One row per sender: `{platform}:{sender_id}`.
+    #[key]
+    id: String,
+    platform: String,
+    sender_id: String,
+    chat_id: String,
+    code: String,
+    status: String, // "pending" | "approved"
+    created_at: i64,
+}
+
 // ── Db ───────────────────────────────────────────────────────────────────────
 
 pub struct Db {
@@ -99,7 +113,8 @@ impl Db {
                 MessageRecord,
                 SkillRecord,
                 ReminderRecord,
-                TaskRecord
+                TaskRecord,
+                PairingRecord
             ))
             .connect(url)
             .await?;
@@ -364,6 +379,80 @@ impl TaskRepository for Db {
     }
 }
 
+// ── PairingRepository ─────────────────────────────────────────────────────────
+
+#[async_trait]
+impl PairingRepository for Db {
+    async fn upsert(&self, request: &PairingRequest) -> anyhow::Result<()> {
+        let mut db = self.inner.lock().await;
+        if let Ok(record) = PairingRecord::get_by_id(&mut *db, &request.id).await {
+            record.delete().exec(&mut *db).await?;
+        }
+        toasty::create!(PairingRecord {
+            id: request.id.clone(),
+            platform: request.platform.clone(),
+            sender_id: request.sender_id.clone(),
+            chat_id: request.chat_id.clone(),
+            code: request.code.clone(),
+            status: request.status.as_str().to_string(),
+            created_at: request.created_at,
+        })
+        .exec(&mut *db)
+        .await?;
+        Ok(())
+    }
+
+    async fn find(
+        &self,
+        platform: &str,
+        sender_id: &str,
+    ) -> anyhow::Result<Option<PairingRequest>> {
+        let mut db = self.inner.lock().await;
+        let id = format!("{platform}:{sender_id}");
+        match PairingRecord::get_by_id(&mut *db, &id).await {
+            Ok(record) => Ok(Some(pairing_from_record(record))),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn approve_code(&self, code: &str) -> anyhow::Result<Option<PairingRequest>> {
+        let mut db = self.inner.lock().await;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let rows = toasty::query!(PairingRecord).exec(&mut *db).await?;
+        let Some(mut record) = rows.into_iter().find(|r| {
+            r.code == code
+                && r.status == "pending"
+                && now - r.created_at <= crate::domain::pairing::PAIRING_CODE_TTL_SECS
+        }) else {
+            return Ok(None);
+        };
+        record
+            .update()
+            .status(PairingStatus::Approved.as_str().to_string())
+            .exec(&mut *db)
+            .await?;
+        Ok(Some(pairing_from_record(record)))
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<PairingRequest>> {
+        let mut db = self.inner.lock().await;
+        let mut rows = toasty::query!(PairingRecord).exec(&mut *db).await?;
+        rows.sort_by_key(|r| r.created_at);
+        Ok(rows.into_iter().map(pairing_from_record).collect())
+    }
+
+    async fn revoke(&self, id: &str) -> anyhow::Result<bool> {
+        let mut db = self.inner.lock().await;
+        match PairingRecord::get_by_id(&mut *db, id).await {
+            Ok(record) => {
+                record.delete().exec(&mut *db).await?;
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn parse_role(s: &str) -> Role {
@@ -404,6 +493,18 @@ fn skill_from_record(record: SkillRecord) -> Skill {
         description: record.description,
         instructions: record.instructions,
         protected: record.protected,
+    }
+}
+
+fn pairing_from_record(record: PairingRecord) -> PairingRequest {
+    PairingRequest {
+        id: record.id,
+        platform: record.platform,
+        sender_id: record.sender_id,
+        chat_id: record.chat_id,
+        code: record.code,
+        status: parse_pairing_status(&record.status),
+        created_at: record.created_at,
     }
 }
 
@@ -599,6 +700,64 @@ mod tests {
             .unwrap();
         assert!(
             TaskRepository::find(&db, "task-nope")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn db_pairing_upsert_approve_revoke_roundtrip() {
+        let db = Db::connect(&sqlite_url("shion_pairing_repo_test.db"))
+            .await
+            .unwrap();
+        let request = PairingRequest::new("telegram", "777", "777");
+
+        PairingRepository::upsert(&db, &request).await.unwrap();
+        let found = PairingRepository::find(&db, "telegram", "777")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.code, request.code);
+        assert_eq!(found.status, crate::domain::pairing::PairingStatus::Pending);
+
+        // Upsert with a fresh code replaces the row (one row per sender).
+        let refreshed = PairingRequest::new("telegram", "777", "777");
+        PairingRepository::upsert(&db, &refreshed).await.unwrap();
+        assert_eq!(PairingRepository::list(&db).await.unwrap().len(), 1);
+
+        assert!(
+            PairingRepository::approve_code(&db, "NO-SUCH")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let approved = PairingRepository::approve_code(&db, &refreshed.code)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(approved.sender_id, "777");
+        let found = PairingRepository::find(&db, "telegram", "777")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found.status,
+            crate::domain::pairing::PairingStatus::Approved
+        );
+
+        assert!(
+            PairingRepository::revoke(&db, "telegram:777")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !PairingRepository::revoke(&db, "telegram:777")
+                .await
+                .unwrap()
+        );
+        assert!(
+            PairingRepository::find(&db, "telegram", "777")
                 .await
                 .unwrap()
                 .is_none()

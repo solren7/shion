@@ -20,8 +20,12 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use crate::{
-    agent::gateway::Channel, config::TelegramConfig, domain::gateway::MessageHandler,
-    domain::notify::Notifier,
+    agent::{
+        gateway::Channel,
+        pairing::{Gate, PairingGuard},
+    },
+    config::TelegramConfig,
+    domain::{gateway::MessageHandler, notify::Notifier, pairing::PairingRepository},
 };
 
 const TELEGRAM_BASE_URL: &str = "https://api.telegram.org";
@@ -176,11 +180,10 @@ impl Notifier for TelegramNotifier {
     }
 }
 
-/// Which inbound messages the agent handles.
+/// Which inbound messages the agent handles. Sender identity (allowlist /
+/// pairing) is the `PairingGuard`'s job, not this struct's.
 #[derive(Clone, Default)]
 struct AdmitPolicy {
-    /// Sender user-id allowlist; empty = anyone.
-    allow_from: Vec<String>,
     /// Group messages must @mention the bot (DMs always pass).
     require_mention: bool,
 }
@@ -188,22 +191,28 @@ struct AdmitPolicy {
 pub struct TelegramChannel {
     sender: Arc<TelegramSender>,
     policy: AdmitPolicy,
+    guard: PairingGuard,
 }
 
 /// One inbound text message, reduced to what the agent needs.
 struct Inbound {
+    sender_id: String,
     chat_id: String,
     text: String,
 }
 
 impl TelegramChannel {
-    pub fn new(sender: Arc<TelegramSender>, config: &TelegramConfig) -> Self {
+    pub fn new(
+        sender: Arc<TelegramSender>,
+        config: &TelegramConfig,
+        pairings: Arc<dyn PairingRepository>,
+    ) -> Self {
         Self {
             sender,
             policy: AdmitPolicy {
-                allow_from: config.allow_from.clone(),
                 require_mention: config.require_mention,
             },
+            guard: PairingGuard::new("telegram", config.allow_from.clone(), pairings),
         }
     }
 }
@@ -266,6 +275,22 @@ impl Channel for TelegramChannel {
                 let Some(msg) = admit(message, &self.policy, &username) else {
                     continue;
                 };
+                // Pairing gate: unknown senders get a pairing code instead of
+                // the agent until `shion pair approve` runs on the host.
+                match self.guard.check(&msg.sender_id, &msg.chat_id).await {
+                    Ok(Gate::Allowed) => {}
+                    Ok(Gate::Denied { reply }) => {
+                        info!(sender = %msg.sender_id, "telegram sender unpaired; sent pairing code");
+                        if let Err(error) = self.sender.send_text(&msg.chat_id, &reply).await {
+                            error!(%error, chat = %msg.chat_id, "failed to send pairing prompt");
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(%error, "pairing check failed; dropping message");
+                        continue;
+                    }
+                }
                 let session_id = format!("telegram:{}", msg.chat_id);
                 info!(chat = %msg.chat_id, "telegram message received");
                 let reply = match handler.handle(&session_id, msg.text).await {
@@ -293,9 +318,6 @@ fn admit(message: Message, policy: &AdmitPolicy, bot_username: &str) -> Option<I
     if from.is_bot {
         return None;
     }
-    if !policy.allow_from.is_empty() && !policy.allow_from.contains(&from.id.to_string()) {
-        return None;
-    }
     let text = message.text?;
     let mention = format!("@{bot_username}");
     let is_group = matches!(message.chat.kind.as_str(), "group" | "supergroup");
@@ -311,6 +333,7 @@ fn admit(message: Message, policy: &AdmitPolicy, bot_username: &str) -> Option<I
         return None;
     }
     Some(Inbound {
+        sender_id: from.id.to_string(),
         chat_id: message.chat.id.to_string(),
         text,
     })
@@ -356,31 +379,20 @@ mod tests {
     }
 
     #[test]
-    fn admit_passes_private_text_message() {
+    fn admit_passes_private_text_message_with_sender_id() {
         let policy = AdmitPolicy {
             require_mention: true,
-            ..Default::default()
         };
         let inbound = admit(message("hello", "private", 1), &policy, "shion_bot").unwrap();
         assert_eq!(inbound.chat_id, "100");
+        assert_eq!(inbound.sender_id, "1");
         assert_eq!(inbound.text, "hello");
-    }
-
-    #[test]
-    fn admit_rejects_sender_not_in_allowlist() {
-        let policy = AdmitPolicy {
-            allow_from: vec!["42".to_string()],
-            ..Default::default()
-        };
-        assert!(admit(message("hello", "private", 1), &policy, "shion_bot").is_none());
-        assert!(admit(message("hello", "private", 42), &policy, "shion_bot").is_some());
     }
 
     #[test]
     fn admit_requires_mention_in_groups_and_strips_it() {
         let policy = AdmitPolicy {
             require_mention: true,
-            ..Default::default()
         };
         assert!(admit(message("hello", "supergroup", 1), &policy, "shion_bot").is_none());
         let inbound = admit(

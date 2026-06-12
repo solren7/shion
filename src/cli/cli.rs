@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 
-use super::{chat, gateway, inspect, model, service};
+use super::{chat, gateway, inspect, model, pair, service};
 
 #[derive(Parser)]
 #[command(name = "shion", version, about = "Personal agent framework")]
@@ -36,11 +36,19 @@ enum Commands {
         #[command(subcommand)]
         action: TaskAction,
     },
+    /// Manage channel pairing: unknown senders must be approved from this
+    /// host before the agent talks to them
+    Pair {
+        #[command(subcommand)]
+        action: PairAction,
+    },
     /// Show or switch the active LLM provider and model
     Model {
         #[command(subcommand)]
         action: ModelAction,
     },
+    /// Print the shion version
+    Version,
 }
 
 #[derive(Subcommand)]
@@ -66,6 +74,22 @@ enum CronAction {
 enum TaskAction {
     /// List open tasks (inbox / todo / waiting), grouped by status
     List,
+}
+
+#[derive(Subcommand)]
+enum PairAction {
+    /// List pending pairing requests (with codes) and approved senders
+    List,
+    /// Approve a pending request by its pairing code
+    Approve {
+        /// The code the bot sent to the unpaired chat
+        code: String,
+    },
+    /// Remove a pairing by id (`platform:sender_id`, as shown by `pair list`)
+    Revoke {
+        /// Pairing id to remove
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -117,9 +141,18 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Task { action } => match action {
             TaskAction::List => inspect::task_list(&db).await,
         },
+        Commands::Pair { action } => match action {
+            PairAction::List => pair::list(&db).await,
+            PairAction::Approve { code } => pair::approve(&db, &code).await,
+            PairAction::Revoke { id } => pair::revoke(&db, &id).await,
+        },
         Commands::Model { action } => match action {
             ModelAction::List => model::list(),
             ModelAction::Set { provider, model } => model::set(&provider, model),
         },
+        Commands::Version => {
+            println!("shion {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
     }
 }
