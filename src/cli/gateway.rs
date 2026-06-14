@@ -4,11 +4,12 @@ use crate::{
     agent::{
         daemon::{Maintenance, ReminderSweep, ReviewSweep, Schedule, TaskSweep},
         gateway::{Gateway, MaintenanceService},
+        interaction::{ApprovalState, ChatApprover, GatewayDispatcher},
     },
-    cli::{approver::DenyApprover, wiring},
+    cli::wiring,
     domain::{
-        approval::Approver, notify::Notifier, pairing::PairingRepository,
-        reminder::ReminderRepository, task::TaskRepository,
+        approval::Approver, gateway::MessageHandler, notify::Notifier, pairing::PairingRepository,
+        reminder::ReminderRepository, repository::MessageRepository, task::TaskRepository,
     },
     infra::{
         db::Db,
@@ -28,9 +29,11 @@ pub async fn run(db_url: &str, schedule_expr: &str) -> anyhow::Result<()> {
 
     let db = Arc::new(Db::connect(db_url).await?);
 
-    // The gateway is unattended: deny approval-gated tool actions rather than
-    // block on a stdin prompt no one will answer.
-    let approver: Arc<dyn Approver> = Arc::new(DenyApprover);
+    // Tool actions that need approval are gated over the chat channel: the
+    // agent sends an approval prompt and waits for the user's `/approve` (or
+    // `/deny`) reply. Shared with the dispatcher so the reply resolves the wait.
+    let approvals = Arc::new(ApprovalState::new());
+    let approver: Arc<dyn Approver> = Arc::new(ChatApprover::new(approvals.clone()));
     let wired = wiring::build(db.clone(), approver).await?;
 
     let review_sweep: Arc<dyn Maintenance> = Arc::new(ReviewSweep {
@@ -76,8 +79,10 @@ pub async fn run(db_url: &str, schedule_expr: &str) -> anyhow::Result<()> {
         notifier,
     });
 
-    let handler: Arc<dyn crate::domain::gateway::MessageHandler> = Arc::new(wired.runtime);
-    let mut gateway = Gateway::new(handler)
+    let handler: Arc<dyn MessageHandler> = Arc::new(wired.runtime);
+    let messages: Arc<dyn MessageRepository> = db.clone();
+    let dispatcher = Arc::new(GatewayDispatcher::new(handler, approvals, messages));
+    let mut gateway = Gateway::new(dispatcher)
         .with_maintenance(MaintenanceService {
             schedule: review_schedule,
             maintenance: review_sweep,

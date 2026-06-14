@@ -7,7 +7,7 @@
 //! sender's next message — no restart.
 
 use crate::{
-    domain::pairing::{PairingRepository, PairingStatus},
+    domain::pairing::{ApproveOutcome, PairingRepository, PairingStatus},
     infra::db::Db,
 };
 
@@ -35,11 +35,12 @@ pub async fn list(db_url: &str) -> anyhow::Result<()> {
                 } else {
                     "pending"
                 };
+                // The code is stored only as a salted hash; the sender has it —
+                // get it from them and approve with `shion pair approve <code>`.
                 println!(
-                    "{}  [{}]  code {}  requested {}",
+                    "{}  [{}]  requested {}",
                     p.id,
                     state,
-                    p.code,
                     local_time(p.created_at)
                 );
             }
@@ -55,13 +56,19 @@ pub async fn list(db_url: &str) -> anyhow::Result<()> {
 pub async fn approve(db_url: &str, code: &str) -> anyhow::Result<()> {
     let db = Db::connect(db_url).await?;
     let code = code.trim().to_uppercase();
-    let Some(request) = PairingRepository::approve_code(&db, &code).await? else {
-        anyhow::bail!(
+    match PairingRepository::approve_code(&db, &code).await? {
+        ApproveOutcome::Approved(request) => {
+            println!("Paired {} — they can chat now.", request.id);
+            Ok(())
+        }
+        ApproveOutcome::NotFound => anyhow::bail!(
             "no approvable pairing with code {code} — unknown or expired (see `shion pair list`)"
-        );
-    };
-    println!("Paired {} — they can chat now.", request.id);
-    Ok(())
+        ),
+        ApproveOutcome::Locked { retry_after_secs } => anyhow::bail!(
+            "too many failed attempts — approve is locked for {} more minutes",
+            (retry_after_secs + 59) / 60
+        ),
+    }
 }
 
 /// Remove a pairing (`{platform}:{sender_id}`, as printed by `pair list`).

@@ -8,7 +8,10 @@
 use std::{path::PathBuf, sync::Arc};
 
 use crate::{
-    agent::{planner::KeywordPlanner, reviewer::ReflectiveReviewer, runtime::AgentRuntime},
+    agent::{
+        planner::KeywordPlanner, reviewer::ReflectiveReviewer, runtime::AgentRuntime,
+        system_prompt::SystemPromptBuilder,
+    },
     config::ModelConfig,
     domain::{
         approval::Approver,
@@ -17,7 +20,11 @@ use crate::{
         reviewer::Reviewer,
         workspace::Workspace,
     },
-    infra::{db::Db, llm::build_llm, md_memory::MdMemoryStore},
+    infra::{
+        db::Db,
+        llm::{PreambleFn, build_llm},
+        md_memory::MdMemoryStore,
+    },
     services::{skill_registry::SkillRegistry, tool_registry::ToolRegistry},
     tools::{
         delegate::DelegateTool, file::FileTool, memory::MemoryTool, reminder::ReminderTool,
@@ -61,8 +68,12 @@ pub async fn build(db: Arc<Db>, approver: Arc<dyn Approver>) -> anyhow::Result<W
     tools.register(Arc::new(MemoryTool::new(memory_repo.clone())));
 
     // The delegate tool runs a separate, tool-less sub-agent on the (optionally
-    // cheaper) aux model.
-    let aux_llm = build_llm(&model_config.aux_variant(), Vec::new(), None)?;
+    // cheaper) aux model. It gets a minimal identity-only preamble — no tools,
+    // skills, or project context — rebuilt per turn like the main agent.
+    let aux_config = model_config.aux_variant();
+    let aux_builder = Arc::new(SystemPromptBuilder::new(&aux_config));
+    let aux_preamble: PreambleFn = Arc::new(move || aux_builder.build());
+    let aux_llm = build_llm(&aux_config, Vec::new(), aux_preamble)?;
     tools.register(Arc::new(DelegateTool::new(aux_llm.clone())));
 
     // Skills load from, in priority order (first to define a name wins):
@@ -100,8 +111,22 @@ pub async fn build(db: Arc<Db>, approver: Arc<dyn Approver>) -> anyhow::Result<W
     });
     tools.register(Arc::new(SkillTool::new(skills.clone())));
 
+    // Assemble the tiered system prompt: stable identity + tool-aware guidance
+    // (gated on the tools actually loaded) + skills catalog, then the workspace
+    // project-instruction file, then the day-precision volatile footer. Wrapped
+    // in a factory so `complete` rebuilds it per turn (per session) rather than
+    // freezing the date at process start — important for the long-lived gateway.
+    let tool_names = tools.tools().iter().map(|t| t.name().to_string()).collect();
+    let prompt_builder = Arc::new(
+        SystemPromptBuilder::new(&model_config)
+            .tools(tool_names)
+            .skills_note(skills_note)
+            .workspace_root(Some(root.clone())),
+    );
+    let preamble: PreambleFn = Arc::new(move || prompt_builder.build());
+
     // Hand the same tool instances to the LLM so the model can call them.
-    let llm = build_llm(&model_config, tools.tools(), skills_note)?;
+    let llm = build_llm(&model_config, tools.tools(), preamble)?;
     let skill_repo: Arc<dyn SkillRepository> = db.clone();
     let reviewer: Arc<dyn Reviewer> =
         Arc::new(ReflectiveReviewer::new(aux_llm, memory_repo, skill_repo));

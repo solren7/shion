@@ -108,7 +108,7 @@ impl Tool for FileTool {
                     args.path
                 ))
                 .with_scope_key("file:write");
-                if !self.approver.approve(&request) {
+                if !self.approver.approve(&request).await {
                     return Ok("Write rejected by user; nothing was changed.".to_string());
                 }
 
@@ -131,8 +131,9 @@ mod tests {
     use std::path::PathBuf;
 
     struct AlwaysApprove;
+    #[async_trait::async_trait]
     impl Approver for AlwaysApprove {
-        fn approve(&self, _request: &ApprovalRequest) -> bool {
+        async fn approve(&self, _request: &ApprovalRequest) -> bool {
             true
         }
     }

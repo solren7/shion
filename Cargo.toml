@@ -21,7 +21,8 @@ open-lark = { version = "0.14", default-features = false, features = ["websocket
 rig = { package = "rig-core", version = "0.38" }
 tracing = "0.1"
 time = { version = "0.3", features = ["formatting", "macros"] }
-uuid = { version = "1.23.3", features = ["v7"] }
+uuid = { version = "1.23.3", features = ["v4", "v7"] }
+sha2 = "0.10"
 croner = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rustyline = "15"

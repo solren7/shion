@@ -22,10 +22,11 @@ use tracing::{error, info, warn};
 use crate::{
     agent::{
         gateway::Channel,
+        interaction::GatewayDispatcher,
         pairing::{Gate, PairingGuard},
     },
     config::TelegramConfig,
-    domain::{gateway::MessageHandler, notify::Notifier, pairing::PairingRepository},
+    domain::{gateway::ReplySink, notify::Notifier, pairing::PairingRepository},
 };
 
 const TELEGRAM_BASE_URL: &str = "https://api.telegram.org";
@@ -156,6 +157,19 @@ impl TelegramSender {
     }
 }
 
+/// Sends a turn's output (and any mid-turn approval prompts) back to one chat.
+struct TelegramReplySink {
+    sender: Arc<TelegramSender>,
+    chat_id: String,
+}
+
+#[async_trait]
+impl ReplySink for TelegramReplySink {
+    async fn send(&self, text: &str) -> anyhow::Result<()> {
+        self.sender.send_text(&self.chat_id, text).await
+    }
+}
+
 /// Delivers proactive output (reminders) to the configured home chat.
 pub struct TelegramNotifier {
     sender: Arc<TelegramSender>,
@@ -186,6 +200,9 @@ impl Notifier for TelegramNotifier {
 struct AdmitPolicy {
     /// Group messages must @mention the bot (DMs always pass).
     require_mention: bool,
+    /// When non-empty, only handle group messages from these chat ids (DMs
+    /// always pass). Mirrors hermes' `allowed_chats`.
+    allowed_chats: Vec<String>,
 }
 
 pub struct TelegramChannel {
@@ -211,6 +228,7 @@ impl TelegramChannel {
             sender,
             policy: AdmitPolicy {
                 require_mention: config.require_mention,
+                allowed_chats: config.allowed_chats.clone(),
             },
             guard: PairingGuard::new("telegram", config.allow_from.clone(), pairings),
         }
@@ -225,7 +243,7 @@ impl Channel for TelegramChannel {
 
     async fn serve(
         &self,
-        handler: Arc<dyn MessageHandler>,
+        dispatcher: Arc<GatewayDispatcher>,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         // The group mention gate needs the bot's username; keep retrying so a
@@ -293,16 +311,13 @@ impl Channel for TelegramChannel {
                 }
                 let session_id = format!("telegram:{}", msg.chat_id);
                 info!(chat = %msg.chat_id, "telegram message received");
-                let reply = match handler.handle(&session_id, msg.text).await {
-                    Ok(reply) => reply,
-                    Err(error) => {
-                        warn!(%error, "telegram message handling failed");
-                        format!("处理消息时出错了: {error}")
-                    }
-                };
-                if let Err(error) = self.sender.send_text(&msg.chat_id, &reply).await {
-                    error!(%error, chat = %msg.chat_id, "failed to send telegram reply");
-                }
+                let sink: Arc<dyn ReplySink> = Arc::new(TelegramReplySink {
+                    sender: self.sender.clone(),
+                    chat_id: msg.chat_id.clone(),
+                });
+                // Returns promptly: a turn runs on its own task so this loop can
+                // keep polling and deliver the user's `/approve` reply.
+                dispatcher.handle(&session_id, msg.text, sink).await;
             }
         }
         info!("telegram channel stopped");
@@ -321,8 +336,19 @@ fn admit(message: Message, policy: &AdmitPolicy, bot_username: &str) -> Option<I
     let text = message.text?;
     let mention = format!("@{bot_username}");
     let is_group = matches!(message.chat.kind.as_str(), "group" | "supergroup");
-    if is_group && policy.require_mention && !text.contains(&mention) {
-        return None;
+    if is_group {
+        // Group chat-id allowlist (when set): only handle whitelisted chats.
+        if !policy.allowed_chats.is_empty()
+            && !policy
+                .allowed_chats
+                .iter()
+                .any(|c| c == &message.chat.id.to_string())
+        {
+            return None;
+        }
+        if policy.require_mention && !text.contains(&mention) {
+            return None;
+        }
     }
     let text = text
         .replace(&mention, " ")
@@ -382,6 +408,7 @@ mod tests {
     fn admit_passes_private_text_message_with_sender_id() {
         let policy = AdmitPolicy {
             require_mention: true,
+            ..Default::default()
         };
         let inbound = admit(message("hello", "private", 1), &policy, "shion_bot").unwrap();
         assert_eq!(inbound.chat_id, "100");
@@ -393,6 +420,7 @@ mod tests {
     fn admit_requires_mention_in_groups_and_strips_it() {
         let policy = AdmitPolicy {
             require_mention: true,
+            ..Default::default()
         };
         assert!(admit(message("hello", "supergroup", 1), &policy, "shion_bot").is_none());
         let inbound = admit(
@@ -402,6 +430,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(inbound.text, "what time is it");
+    }
+
+    #[test]
+    fn admit_enforces_group_chat_allowlist() {
+        // chat id 100 is not in the allowlist → group message dropped.
+        let policy = AdmitPolicy {
+            require_mention: false,
+            allowed_chats: vec!["999".to_string()],
+        };
+        assert!(admit(message("hi", "supergroup", 1), &policy, "shion_bot").is_none());
+
+        // Same message in an allowlisted chat is admitted; DMs always pass.
+        let policy = AdmitPolicy {
+            require_mention: false,
+            allowed_chats: vec!["100".to_string()],
+        };
+        assert!(admit(message("hi", "supergroup", 1), &policy, "shion_bot").is_some());
+        assert!(admit(message("hi", "private", 1), &policy, "shion_bot").is_some());
     }
 
     #[test]

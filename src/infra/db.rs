@@ -6,7 +6,10 @@ use tracing::info;
 
 use crate::domain::{
     message::{Message, Role},
-    pairing::{PairingRepository, PairingRequest, PairingStatus, parse_pairing_status},
+    pairing::{
+        APPROVE_LOCKOUT_SECS, APPROVE_MAX_FAILURES, ApproveOutcome, PAIRING_CODE_TTL_SECS,
+        PairingRepository, PairingRequest, PairingStatus, parse_pairing_status, verify_code,
+    },
     reminder::{Reminder, ReminderRepository, ReminderStatus, parse_reminder_status},
     repository::{MessageRepository, SessionRepository, SkillRepository},
     session::Session,
@@ -89,9 +92,20 @@ struct PairingRecord {
     platform: String,
     sender_id: String,
     chat_id: String,
-    code: String,
+    code_hash: String, // salted SHA-256 of the code; plaintext never stored
+    salt: String,
     status: String, // "pending" | "approved"
     created_at: i64,
+}
+
+/// Failure-lockout counter for the `shion pair approve` path. A singleton row
+/// (`id = "approve"`); mirrors hermes' per-platform approve lockout.
+#[derive(Debug, toasty::Model)]
+struct LockoutRecord {
+    #[key]
+    id: String,
+    failed_count: i64,
+    locked_until: i64,
 }
 
 // ── Db ───────────────────────────────────────────────────────────────────────
@@ -114,7 +128,8 @@ impl Db {
                 SkillRecord,
                 ReminderRecord,
                 TaskRecord,
-                PairingRecord
+                PairingRecord,
+                LockoutRecord
             ))
             .connect(url)
             .await?;
@@ -264,6 +279,20 @@ impl MessageRepository for Db {
         .await?;
         Ok(())
     }
+
+    async fn clear_session(&self, session_id: &str) -> anyhow::Result<usize> {
+        let mut db = self.inner.lock().await;
+        let Ok(record) = SessionRecord::get_by_id(&mut *db, session_id).await else {
+            return Ok(0);
+        };
+        let msgs = record.messages().exec(&mut *db).await?;
+        let mut removed = 0usize;
+        for msg in msgs {
+            msg.delete().exec(&mut *db).await?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
 }
 
 // ── ReminderRepository ────────────────────────────────────────────────────────
@@ -393,7 +422,8 @@ impl PairingRepository for Db {
             platform: request.platform.clone(),
             sender_id: request.sender_id.clone(),
             chat_id: request.chat_id.clone(),
-            code: request.code.clone(),
+            code_hash: request.code_hash.clone(),
+            salt: request.salt.clone(),
             status: request.status.as_str().to_string(),
             created_at: request.created_at,
         })
@@ -415,23 +445,93 @@ impl PairingRepository for Db {
         }
     }
 
-    async fn approve_code(&self, code: &str) -> anyhow::Result<Option<PairingRequest>> {
+    async fn count_active_pending(&self, platform: &str) -> anyhow::Result<usize> {
         let mut db = self.inner.lock().await;
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let rows = toasty::query!(PairingRecord).exec(&mut *db).await?;
-        let Some(mut record) = rows.into_iter().find(|r| {
-            r.code == code
-                && r.status == "pending"
-                && now - r.created_at <= crate::domain::pairing::PAIRING_CODE_TTL_SECS
-        }) else {
-            return Ok(None);
-        };
-        record
-            .update()
-            .status(PairingStatus::Approved.as_str().to_string())
-            .exec(&mut *db)
-            .await?;
-        Ok(Some(pairing_from_record(record)))
+        Ok(rows
+            .iter()
+            .filter(|r| {
+                r.platform == platform
+                    && r.status == "pending"
+                    && now - r.created_at <= PAIRING_CODE_TTL_SECS
+            })
+            .count())
+    }
+
+    async fn approve_code(&self, code: &str) -> anyhow::Result<ApproveOutcome> {
+        const LOCK_ID: &str = "approve";
+        let mut db = self.inner.lock().await;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+        // Honor an active lockout before testing the code.
+        let lock = LockoutRecord::get_by_id(&mut *db, LOCK_ID).await.ok();
+        if let Some(l) = &lock
+            && l.locked_until > now
+        {
+            return Ok(ApproveOutcome::Locked {
+                retry_after_secs: l.locked_until - now,
+            });
+        }
+
+        let rows = toasty::query!(PairingRecord).exec(&mut *db).await?;
+        let matched = rows.into_iter().find(|r| {
+            r.status == "pending"
+                && now - r.created_at <= PAIRING_CODE_TTL_SECS
+                && verify_code(&r.salt, &r.code_hash, code)
+        });
+
+        match matched {
+            Some(mut record) => {
+                record
+                    .update()
+                    .status(PairingStatus::Approved.as_str().to_string())
+                    .exec(&mut *db)
+                    .await?;
+                // Success clears the failure counter.
+                if let Some(mut l) = lock {
+                    l.update()
+                        .failed_count(0)
+                        .locked_until(0)
+                        .exec(&mut *db)
+                        .await?;
+                }
+                Ok(ApproveOutcome::Approved(pairing_from_record(record)))
+            }
+            None => {
+                let mut count = lock.as_ref().map(|l| l.failed_count).unwrap_or(0) + 1;
+                let mut locked_until = 0;
+                if count >= APPROVE_MAX_FAILURES {
+                    locked_until = now + APPROVE_LOCKOUT_SECS;
+                    count = 0; // reset the counter once locked
+                }
+                match lock {
+                    Some(mut l) => {
+                        l.update()
+                            .failed_count(count)
+                            .locked_until(locked_until)
+                            .exec(&mut *db)
+                            .await?;
+                    }
+                    None => {
+                        toasty::create!(LockoutRecord {
+                            id: LOCK_ID.to_string(),
+                            failed_count: count,
+                            locked_until,
+                        })
+                        .exec(&mut *db)
+                        .await?;
+                    }
+                }
+                if locked_until > now {
+                    Ok(ApproveOutcome::Locked {
+                        retry_after_secs: locked_until - now,
+                    })
+                } else {
+                    Ok(ApproveOutcome::NotFound)
+                }
+            }
+        }
     }
 
     async fn list(&self) -> anyhow::Result<Vec<PairingRequest>> {
@@ -502,7 +602,8 @@ fn pairing_from_record(record: PairingRecord) -> PairingRequest {
         platform: record.platform,
         sender_id: record.sender_id,
         chat_id: record.chat_id,
-        code: record.code,
+        code_hash: record.code_hash,
+        salt: record.salt,
         status: parse_pairing_status(&record.status),
         created_at: record.created_at,
     }
@@ -708,34 +809,47 @@ mod tests {
 
     #[tokio::test]
     async fn db_pairing_upsert_approve_revoke_roundtrip() {
+        use crate::domain::pairing::ApproveOutcome;
+
         let db = Db::connect(&sqlite_url("shion_pairing_repo_test.db"))
             .await
             .unwrap();
-        let request = PairingRequest::new("telegram", "777", "777");
+        let (request, code) = PairingRequest::mint("telegram", "777", "777");
 
         PairingRepository::upsert(&db, &request).await.unwrap();
         let found = PairingRepository::find(&db, "telegram", "777")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(found.code, request.code);
+        // The plaintext code is never persisted — only the salted hash.
+        assert_eq!(found.code_hash, request.code_hash);
+        assert_ne!(found.code_hash, code);
         assert_eq!(found.status, crate::domain::pairing::PairingStatus::Pending);
+        assert_eq!(
+            PairingRepository::count_active_pending(&db, "telegram")
+                .await
+                .unwrap(),
+            1
+        );
 
         // Upsert with a fresh code replaces the row (one row per sender).
-        let refreshed = PairingRequest::new("telegram", "777", "777");
+        let (refreshed, refreshed_code) = PairingRequest::mint("telegram", "777", "777");
         PairingRepository::upsert(&db, &refreshed).await.unwrap();
         assert_eq!(PairingRepository::list(&db).await.unwrap().len(), 1);
 
-        assert!(
-            PairingRepository::approve_code(&db, "NO-SUCH")
+        assert!(matches!(
+            PairingRepository::approve_code(&db, "NOSUCHCD")
+                .await
+                .unwrap(),
+            ApproveOutcome::NotFound
+        ));
+        let ApproveOutcome::Approved(approved) =
+            PairingRepository::approve_code(&db, &refreshed_code)
                 .await
                 .unwrap()
-                .is_none()
-        );
-        let approved = PairingRepository::approve_code(&db, &refreshed.code)
-            .await
-            .unwrap()
-            .unwrap();
+        else {
+            panic!("expected approval");
+        };
         assert_eq!(approved.sender_id, "777");
         let found = PairingRepository::find(&db, "telegram", "777")
             .await
@@ -762,6 +876,32 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn db_pairing_locks_out_after_repeated_bad_codes() {
+        use crate::domain::pairing::{APPROVE_MAX_FAILURES, ApproveOutcome};
+
+        let db = Db::connect(&sqlite_url("shion_pairing_lockout_test.db"))
+            .await
+            .unwrap();
+
+        // The first APPROVE_MAX_FAILURES - 1 wrong codes are NotFound; the
+        // attempt that reaches the limit locks out.
+        for _ in 0..APPROVE_MAX_FAILURES - 1 {
+            assert!(matches!(
+                PairingRepository::approve_code(&db, "BADCODE1")
+                    .await
+                    .unwrap(),
+                ApproveOutcome::NotFound
+            ));
+        }
+        assert!(matches!(
+            PairingRepository::approve_code(&db, "BADCODE1")
+                .await
+                .unwrap(),
+            ApproveOutcome::Locked { .. }
+        ));
     }
 
     #[tokio::test]

@@ -26,6 +26,7 @@ use tracing::{error, info};
 use crate::{
     agent::{
         daemon::{Maintenance, Schedule, supervise},
+        interaction::GatewayDispatcher,
         runtime::AgentRuntime,
     },
     domain::gateway::MessageHandler,
@@ -41,13 +42,14 @@ impl MessageHandler for AgentRuntime {
 }
 
 /// A long-lived ingress: accepts inbound messages over some transport and routes
-/// them through `handler`, until `shutdown` flips to `true`.
+/// them through `dispatcher` (which classifies control commands and runs agent
+/// turns), until `shutdown` flips to `true`.
 #[async_trait]
 pub trait Channel: Send + Sync {
     fn name(&self) -> &str;
     async fn serve(
         &self,
-        handler: Arc<dyn MessageHandler>,
+        dispatcher: Arc<GatewayDispatcher>,
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()>;
 }
@@ -60,15 +62,15 @@ pub struct MaintenanceService {
 }
 
 pub struct Gateway {
-    handler: Arc<dyn MessageHandler>,
+    dispatcher: Arc<GatewayDispatcher>,
     channels: Vec<Box<dyn Channel>>,
     services: Vec<MaintenanceService>,
 }
 
 impl Gateway {
-    pub fn new(handler: Arc<dyn MessageHandler>) -> Self {
+    pub fn new(dispatcher: Arc<GatewayDispatcher>) -> Self {
         Self {
-            handler,
+            dispatcher,
             channels: Vec::new(),
             services: Vec::new(),
         }
@@ -109,11 +111,11 @@ impl Gateway {
         }
 
         for channel in self.channels {
-            let handler = self.handler.clone();
+            let dispatcher = self.dispatcher.clone();
             let rx = stop_rx.clone();
             let name = channel.name().to_string();
             handles.push(tokio::spawn(async move {
-                if let Err(error) = channel.serve(handler, rx).await {
+                if let Err(error) = channel.serve(dispatcher, rx).await {
                     error!(%error, channel = %name, "channel stopped");
                 }
             }));

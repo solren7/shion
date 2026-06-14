@@ -52,6 +52,7 @@ home_chat = "oc_xxx"      # optional: reminders go here instead of macOS notific
 [channels.telegram]
 enabled = true
 allow_from = ["123456789"]  # pre-trusted sender user-ids (skip pairing)
+allowed_chats = ["-100123"]  # group chat-id allowlist (empty = any group; DMs always pass)
 require_mention = true       # group messages must @mention the bot (DMs bypass)
 home_chat = "123456789"     # optional: reminders go here instead of macOS notifications
 ```
@@ -60,10 +61,15 @@ When multiple channels set `home_chat`, feishu takes reminder delivery.
 
 Senders outside `allow_from` must pair before the agent talks to them: their
 first message gets a pairing code as the only reply, and someone with shell
-access to the host runs `shion pair approve <code>` (codes expire after 1h;
-`shion pair list` shows pending/approved, `shion pair revoke <id>` un-pairs).
-Approval is written to the shared db, so it takes effect on the sender's next
-message without a gateway restart.
+access to the host runs `shion pair approve <code>`. Pairing is hardened after
+hermes' `pairing.py` (`domain/pairing.rs`): the code is stored only as a salted
+SHA-256 hash (never plaintext, so `shion pair list` shows pending/approved but
+not the code — get it from the sender), a sender is issued at most one fresh
+code per 10 min (`PAIRING_RATE_LIMIT_SECS`; codes still expire after 1h), at
+most 3 senders may await approval per platform (`MAX_PENDING_PER_PLATFORM`), and
+the approve path locks for 1h after 5 wrong codes (`APPROVE_MAX_FAILURES`).
+`shion pair revoke <id>` un-pairs. Approval is written to the shared db, so it
+takes effect on the sender's next message without a gateway restart.
 
 ## Architecture
 
@@ -127,7 +133,9 @@ CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Resp
 - `Channel` trait = a pluggable ingress; `Gateway` hosts N channels + N `MaintenanceService`s (the `daemon.rs` supervisor loop — review sweep on the config schedule, reminder sweep every minute), all sharing one `watch` shutdown signal
 - channels are declared in `~/.shion/config.toml` and constructed in `cli/gateway.rs`; `feishu` and `telegram` are the wired channels
 - sender admission is two-layered: each channel's `admit` filters message shape (non-text, bot senders, group mention gate), then the shared `PairingGuard` (`agent/pairing.rs`, store in `domain/pairing.rs`) decides identity — config `allow_from` is pre-trusted, approved pairings pass, anyone else gets a pairing code (`shion pair approve <code>` on the host admits them; `cli/pair.rs`)
-- non-interactive: the gateway wires `DenyApprover` so side-effecting tools are refused rather than blocking on a stdin prompt (mirrors hermes disabling interactive toolsets in cron/gateway context)
+- `GatewayDispatcher` (`agent/interaction.rs`) is the front door between a channel and the agent: a channel builds a `ReplySink` (`domain/gateway.rs`) for the chat and hands it each inbound message; the dispatcher classifies chat control commands and otherwise runs a turn. Channels no longer await turns or send agent replies themselves — the dispatcher owns that, and runs each turn on a spawned task so the receive loop keeps polling (which is what lets an `/approve` reply arrive mid-turn). One turn at a time per session.
+- chat control commands (any channel): `/new` (also `/clear`, `/reset`) wipes the session's context (`MessageRepository::clear_session`) and approval state; `/approve` (+ `/approve session`) and `/deny` resolve a pending approval
+- interactive tool approval over chat (ported from hermes' gateway approval): the gateway wires `ChatApprover` (`agent/interaction.rs`), not a deny-everything approver. When a side-effecting tool requests approval (`Risk::Normal`/`Dangerous`), the agent sends a prompt to the chat and the turn suspends on a `oneshot` registered in the shared `ApprovalState` (keyed by session, 5-min timeout); the user's `/approve`/`/deny` resolves it. `Risk::Safe` actions run without asking. With no chat session in context (maintenance sweeps, aux sub-agents) approval is denied. The turn's session context (id + `ReplySink`) reaches the approver via a task-local in `services::tool_registry` that `execute_isolated` re-establishes across its `tokio::spawn`.
 - background install: `shion gateway start` (see `cli/service.rs`) runs it under launchd; bare `shion gateway` is the foreground process launchd invokes
 
 `infra/feishu.rs` — the feishu integration: `FeishuChannel` (ingress), `FeishuSender` (outbound: cached tenant token + send), `FeishuNotifier` (reminders → `home_chat`)

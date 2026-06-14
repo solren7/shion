@@ -1,14 +1,23 @@
 //! The pairing gate channels consult before handing a message to the agent.
 //!
 //! Ordering of checks: config `allow_from` (pre-trusted, no db hit) → an
-//! approved pairing row → otherwise mint/reuse a pending code and tell the
-//! sender how to pair. Approval happens out-of-band via `shion pair approve`,
-//! which writes the shared SQLite db — the gateway picks it up on the
-//! sender's next message, no restart needed.
+//! approved pairing row → a recently-issued pending code (rate-limited, no new
+//! code) → otherwise mint a fresh code (subject to the per-platform pending
+//! cap) and tell the sender how to pair. Approval happens out-of-band via
+//! `shion pair approve`, which writes the shared SQLite db — the gateway picks
+//! it up on the sender's next message, no restart needed.
+//!
+//! Hardening (after hermes-agent's `pairing.py`): codes are stored only as
+//! salted hashes, a sender gets at most one fresh code per
+//! [`PAIRING_RATE_LIMIT_SECS`], and at most [`MAX_PENDING_PER_PLATFORM`] senders
+//! may await approval per platform.
 
 use std::sync::Arc;
 
-use crate::domain::pairing::{PairingRepository, PairingRequest, PairingStatus};
+use crate::domain::pairing::{
+    MAX_PENDING_PER_PLATFORM, PAIRING_RATE_LIMIT_SECS, PairingRepository, PairingRequest,
+    PairingStatus,
+};
 
 /// Outcome of the gate for one inbound message.
 pub enum Gate {
@@ -46,18 +55,45 @@ impl PairingGuard {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         match self.pairings.find(self.platform, sender_id).await? {
             Some(p) if p.status == PairingStatus::Approved => Ok(Gate::Allowed),
-            Some(p) if !p.is_expired(now) => Ok(Gate::Denied {
-                reply: prompt(&p.code),
-            }),
-            // First contact, or the previous code expired: mint a fresh one.
-            _ => {
-                let request = PairingRequest::new(self.platform, sender_id, chat_id);
-                self.pairings.upsert(&request).await?;
-                Ok(Gate::Denied {
-                    reply: prompt(&request.code),
-                })
+            Some(p) if !p.is_expired(now) => {
+                if now - p.created_at < PAIRING_RATE_LIMIT_SECS {
+                    // A code was issued recently; don't mint another (and we
+                    // can't re-send it — only the salted hash is stored).
+                    Ok(Gate::Denied {
+                        reply: pending_prompt(),
+                    })
+                } else {
+                    // Past the rate-limit window: reissue a fresh code so a
+                    // sender who lost theirs can recover (replaces their row).
+                    self.mint(sender_id, chat_id, true).await
+                }
             }
+            // First contact, or the previous code expired: mint a fresh one.
+            _ => self.mint(sender_id, chat_id, false).await,
         }
+    }
+
+    /// Mint and persist a fresh code, then return the pairing prompt. When not
+    /// replacing the sender's own active row, the per-platform pending cap
+    /// applies (anti-abuse).
+    async fn mint(
+        &self,
+        sender_id: &str,
+        chat_id: &str,
+        replacing_active: bool,
+    ) -> anyhow::Result<Gate> {
+        if !replacing_active
+            && self.pairings.count_active_pending(self.platform).await? >= MAX_PENDING_PER_PLATFORM
+        {
+            return Ok(Gate::Denied {
+                reply: cap_prompt(),
+            });
+        }
+        let (request, code) = PairingRequest::mint(self.platform, sender_id, chat_id);
+        self.pairings.upsert(&request).await?;
+        Ok(Gate::Denied {
+            reply: prompt(&code),
+        })
     }
 }
 
@@ -69,10 +105,18 @@ fn prompt(code: &str) -> String {
     )
 }
 
+fn pending_prompt() -> String {
+    "你的配对请求正在等待管理员批准，请稍候。".to_string()
+}
+
+fn cap_prompt() -> String {
+    "当前待配对请求过多，请稍后再试。".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::pairing::PAIRING_CODE_TTL_SECS;
+    use crate::domain::pairing::{ApproveOutcome, PAIRING_CODE_TTL_SECS, verify_code};
     use async_trait::async_trait;
     use std::sync::Mutex;
 
@@ -103,15 +147,29 @@ mod tests {
                 .find(|r| r.id == id)
                 .cloned())
         }
-        async fn approve_code(&self, code: &str) -> anyhow::Result<Option<PairingRequest>> {
+        async fn count_active_pending(&self, platform: &str) -> anyhow::Result<usize> {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| {
+                    r.platform == platform
+                        && r.status == PairingStatus::Pending
+                        && !r.is_expired(now)
+                })
+                .count())
+        }
+        async fn approve_code(&self, code: &str) -> anyhow::Result<ApproveOutcome> {
             let mut rows = self.rows.lock().unwrap();
             for r in rows.iter_mut() {
-                if r.code == code && r.status == PairingStatus::Pending {
+                if r.status == PairingStatus::Pending && verify_code(&r.salt, &r.code_hash, code) {
                     r.status = PairingStatus::Approved;
-                    return Ok(Some(r.clone()));
+                    return Ok(ApproveOutcome::Approved(r.clone()));
                 }
             }
-            Ok(None)
+            Ok(ApproveOutcome::NotFound)
         }
         async fn list(&self) -> anyhow::Result<Vec<PairingRequest>> {
             Ok(self.rows.lock().unwrap().clone())
@@ -132,6 +190,16 @@ mod tests {
         )
     }
 
+    /// Pull the 8-char pairing code out of a prompt reply.
+    fn code_in(reply: &str) -> String {
+        reply
+            .split("shion pair approve ")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .expect("reply carries a code")
+            .to_string()
+    }
+
     #[tokio::test]
     async fn allow_from_sender_skips_pairing() {
         let (guard, repo) = guard(vec!["42".to_string()]);
@@ -148,29 +216,36 @@ mod tests {
         let Gate::Denied { reply } = guard.check("7", "7").await.unwrap() else {
             panic!("unknown sender must be denied");
         };
-        let code = repo.rows.lock().unwrap()[0].code.clone();
-        assert!(reply.contains(&code), "{reply}");
         assert!(reply.contains("shion pair approve"), "{reply}");
+        // The minted code verifies against the stored (hashed) row.
+        let code = code_in(&reply);
+        let row = &repo.rows.lock().unwrap()[0];
+        assert!(verify_code(&row.salt, &row.code_hash, &code));
     }
 
     #[tokio::test]
-    async fn repeated_messages_reuse_the_same_pending_code() {
+    async fn repeated_messages_within_rate_limit_keep_the_pending_code() {
         let (guard, repo) = guard(vec![]);
         guard.check("7", "7").await.unwrap();
-        let first = repo.rows.lock().unwrap()[0].code.clone();
+        let first_hash = repo.rows.lock().unwrap()[0].code_hash.clone();
         let Gate::Denied { reply } = guard.check("7", "7").await.unwrap() else {
             panic!("still unpaired");
         };
-        assert!(reply.contains(&first), "{reply}");
+        // No fresh code minted; the pending row is untouched.
+        assert!(!reply.contains("shion pair approve"), "{reply}");
         assert_eq!(repo.rows.lock().unwrap().len(), 1);
+        assert_eq!(repo.rows.lock().unwrap()[0].code_hash, first_hash);
     }
 
     #[tokio::test]
     async fn approved_sender_is_allowed() {
         let (guard, repo) = guard(vec![]);
-        guard.check("7", "7").await.unwrap();
-        let code = repo.rows.lock().unwrap()[0].code.clone();
-        repo.approve_code(&code).await.unwrap().expect("approves");
+        let (request, code) = PairingRequest::mint("telegram", "7", "7");
+        repo.upsert(&request).await.unwrap();
+        assert!(matches!(
+            repo.approve_code(&code).await.unwrap(),
+            ApproveOutcome::Approved(_)
+        ));
         assert!(matches!(
             guard.check("7", "7").await.unwrap(),
             Gate::Allowed
@@ -181,14 +256,33 @@ mod tests {
     async fn expired_pending_code_is_replaced() {
         let (guard, repo) = guard(vec![]);
         guard.check("7", "7").await.unwrap();
-        let first = {
+        let first_hash = {
             let mut rows = repo.rows.lock().unwrap();
             rows[0].created_at -= PAIRING_CODE_TTL_SECS + 60;
-            rows[0].code.clone()
+            rows[0].code_hash.clone()
         };
         guard.check("7", "7").await.unwrap();
         let rows = repo.rows.lock().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_ne!(rows[0].code, first, "expired code must be reissued");
+        assert_ne!(
+            rows[0].code_hash, first_hash,
+            "expired code must be reissued"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_cap_blocks_an_extra_sender() {
+        let (guard, _repo) = guard(vec![]);
+        for i in 0..MAX_PENDING_PER_PLATFORM {
+            let Gate::Denied { reply } = guard.check(&i.to_string(), "c").await.unwrap() else {
+                panic!("unpaired sender denied");
+            };
+            assert!(reply.contains("shion pair approve"), "{reply}");
+        }
+        // One past the cap: no code, told to try later.
+        let Gate::Denied { reply } = guard.check("99", "c").await.unwrap() else {
+            panic!("denied");
+        };
+        assert!(!reply.contains("shion pair approve"), "{reply}");
     }
 }

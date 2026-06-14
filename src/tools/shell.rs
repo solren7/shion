@@ -135,7 +135,7 @@ impl Tool for ShellTool {
             .with_scope_key(format!("shell:{pattern}")),
             None => ApprovalRequest::safe(summary),
         };
-        if !self.approver.approve(&request) {
+        if !self.approver.approve(&request).await {
             return Ok("Command rejected by user; nothing was run.".to_string());
         }
 
@@ -175,15 +175,17 @@ mod tests {
     use std::sync::Mutex;
 
     struct AlwaysApprove;
+    #[async_trait::async_trait]
     impl Approver for AlwaysApprove {
-        fn approve(&self, _request: &ApprovalRequest) -> bool {
+        async fn approve(&self, _request: &ApprovalRequest) -> bool {
             true
         }
     }
 
     struct AlwaysReject;
+    #[async_trait::async_trait]
     impl Approver for AlwaysReject {
-        fn approve(&self, _request: &ApprovalRequest) -> bool {
+        async fn approve(&self, _request: &ApprovalRequest) -> bool {
             false
         }
     }
@@ -194,8 +196,9 @@ mod tests {
         approve: bool,
     }
 
+    #[async_trait::async_trait]
     impl Approver for Recording {
-        fn approve(&self, request: &ApprovalRequest) -> bool {
+        async fn approve(&self, request: &ApprovalRequest) -> bool {
             *self.risk.lock().unwrap() = Some(request.risk);
             self.approve
         }

@@ -33,10 +33,11 @@ use tracing::{error, info, warn};
 use crate::{
     agent::{
         gateway::Channel,
+        interaction::GatewayDispatcher,
         pairing::{Gate, PairingGuard},
     },
     config::FeishuConfig,
-    domain::{gateway::MessageHandler, notify::Notifier, pairing::PairingRepository},
+    domain::{gateway::ReplySink, notify::Notifier, pairing::PairingRepository},
 };
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn";
@@ -155,6 +156,19 @@ impl FeishuSender {
     }
 }
 
+/// Sends a turn's output (and any mid-turn approval prompts) back to one chat.
+struct FeishuReplySink {
+    sender: Arc<FeishuSender>,
+    chat_id: String,
+}
+
+#[async_trait]
+impl ReplySink for FeishuReplySink {
+    async fn send(&self, text: &str) -> anyhow::Result<()> {
+        self.sender.send_text(&self.chat_id, text).await
+    }
+}
+
 /// Delivers proactive output (reminders) to the configured home chat,
 /// mirroring hermes-agent's home-channel concept.
 pub struct FeishuNotifier {
@@ -226,7 +240,7 @@ impl Channel for FeishuChannel {
 
     async fn serve(
         &self,
-        handler: Arc<dyn MessageHandler>,
+        dispatcher: Arc<GatewayDispatcher>,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let (tx, mut rx) = mpsc::unbounded_channel::<Inbound>();
@@ -278,16 +292,13 @@ impl Channel for FeishuChannel {
 
                 let session_id = format!("feishu:{}", msg.chat_id);
                 info!(chat = %msg.chat_id, "feishu message received");
-                let reply = match handler.handle(&session_id, msg.text).await {
-                    Ok(reply) => reply,
-                    Err(error) => {
-                        warn!(%error, "feishu message handling failed");
-                        format!("处理消息时出错了: {error}")
-                    }
-                };
-                if let Err(error) = self.sender.send_text(&msg.chat_id, &reply).await {
-                    error!(%error, chat = %msg.chat_id, "failed to send feishu reply");
-                }
+                let sink: Arc<dyn ReplySink> = Arc::new(FeishuReplySink {
+                    sender: self.sender.clone(),
+                    chat_id: msg.chat_id.clone(),
+                });
+                // Returns promptly: a turn runs on its own task so this loop can
+                // keep consuming and deliver the user's `/approve` reply.
+                dispatcher.handle(&session_id, msg.text, sink).await;
             }
         };
 

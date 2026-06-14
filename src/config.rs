@@ -263,6 +263,9 @@ pub struct TelegramFileConfig {
     pub enabled: bool,
     /// Sender user-id allowlist. Empty = anyone who can reach the bot.
     pub allow_from: Vec<String>,
+    /// Group chat-id allowlist: when non-empty, group messages are only handled
+    /// in these chats (DMs always pass). Mirrors hermes' `allowed_chats`.
+    pub allowed_chats: Vec<String>,
     /// Whether group messages must @mention the bot (default true; DMs
     /// always bypass this gate).
     pub require_mention: Option<bool>,
@@ -281,6 +284,7 @@ struct TelegramEnv {
 pub struct TelegramConfig {
     pub bot_token: String,
     pub allow_from: Vec<String>,
+    pub allowed_chats: Vec<String>,
     pub require_mention: bool,
     pub home_chat: Option<String>,
 }
@@ -305,6 +309,7 @@ pub fn telegram_config() -> anyhow::Result<Option<TelegramConfig>> {
     Ok(Some(TelegramConfig {
         bot_token,
         allow_from: telegram.allow_from,
+        allowed_chats: telegram.allowed_chats,
         require_mention: telegram.require_mention.unwrap_or(true),
         home_chat: telegram.home_chat,
     }))
