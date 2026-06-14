@@ -7,6 +7,12 @@
 //!
 //! Everything is plain reqwest against the Bot API — no SDK dependency.
 //!
+//! Outbound replies are sent with `parse_mode=Markdown` so the agent's
+//! Markdown (bold, links, code blocks) renders formatted instead of as raw
+//! `*asterisks*` and backticks. Markdown the API rejects (unbalanced markers),
+//! or output too long to split safely, falls back to plain chunked text so a
+//! reply is never lost.
+//!
 //! Access control mirrors the feishu adapter: an `allow_from` user-id
 //! allowlist (empty = open), a `require_mention` gate for group chats
 //! (DMs always bypass), and an optional `home_chat` that receives
@@ -92,21 +98,54 @@ impl TelegramSender {
         format!("{TELEGRAM_BASE_URL}/bot{}/{method}", self.bot_token)
     }
 
-    /// Send a plain text message into a chat (works for both private and
-    /// group chats). Over-long texts are split at the API limit.
+    /// Send a message into a chat (works for both private and group chats),
+    /// formatted as Markdown for rich display.
+    ///
+    /// Markdown entities can't be split across messages, so output that fits
+    /// is sent whole; anything the API rejects (unbalanced markers) or too
+    /// long to send in one message falls back to plain, chunked text — a
+    /// reply is never lost.
     pub async fn send_text(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
-        for chunk in chunk_text(text, MAX_MESSAGE_UTF16) {
-            let response: ApiResponse<serde_json::Value> = self
-                .http
-                .post(self.url("sendMessage"))
-                .json(&serde_json::json!({ "chat_id": chat_id, "text": chunk }))
-                .send()
-                .await?
-                .json()
-                .await?;
-            if !response.ok {
-                anyhow::bail!("telegram send failed: {}", response.description);
+        if text.is_empty() {
+            return Ok(());
+        }
+        if text.encode_utf16().count() <= MAX_MESSAGE_UTF16 {
+            match self.send_once(chat_id, text, Some("Markdown")).await {
+                Ok(()) => return Ok(()),
+                Err(error) => warn!(
+                    %error,
+                    chat = %chat_id,
+                    "telegram Markdown send rejected; retrying as plain text"
+                ),
             }
+        }
+        for chunk in chunk_text(text, MAX_MESSAGE_UTF16) {
+            self.send_once(chat_id, &chunk, None).await?;
+        }
+        Ok(())
+    }
+
+    /// One `sendMessage` call, optionally with a `parse_mode`.
+    async fn send_once(
+        &self,
+        chat_id: &str,
+        text: &str,
+        parse_mode: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut body = serde_json::json!({ "chat_id": chat_id, "text": text });
+        if let Some(mode) = parse_mode {
+            body["parse_mode"] = serde_json::Value::String(mode.to_string());
+        }
+        let response: ApiResponse<serde_json::Value> = self
+            .http
+            .post(self.url("sendMessage"))
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if !response.ok {
+            anyhow::bail!("telegram send failed: {}", response.description);
         }
         Ok(())
     }
