@@ -244,6 +244,41 @@ impl SessionRepository for Db {
         }
         Ok(removed)
     }
+
+    async fn rotate(&self, session_id: &str) -> anyhow::Result<Option<String>> {
+        let mut db = self.inner.lock().await;
+        // Nothing to archive if the session is absent or already empty.
+        let Ok(live) = SessionRecord::get_by_id(&mut *db, session_id).await else {
+            return Ok(None);
+        };
+        let msgs = live.messages().exec(&mut *db).await?;
+        if msgs.is_empty() {
+            return Ok(None);
+        }
+
+        // Move the transcript to a fresh archive session, preserving its start
+        // time; the live row stays and is now empty for the next conversation.
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let archived_id = format!("{session_id}#{now}");
+        toasty::create!(SessionRecord {
+            id: archived_id.clone(),
+            created_at: live.created_at,
+        })
+        .exec(&mut *db)
+        .await?;
+        let archive = SessionRecord::get_by_id(&mut *db, &archived_id).await?;
+        for msg in msgs {
+            toasty::create!(in archive.messages() {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+                timestamp: msg.timestamp,
+            })
+            .exec(&mut *db)
+            .await?;
+            msg.delete().exec(&mut *db).await?;
+        }
+        Ok(Some(archived_id))
+    }
 }
 
 // ── MessageRepository ─────────────────────────────────────────────────────────
@@ -278,20 +313,6 @@ impl MessageRepository for Db {
         .exec(&mut *db)
         .await?;
         Ok(())
-    }
-
-    async fn clear_session(&self, session_id: &str) -> anyhow::Result<usize> {
-        let mut db = self.inner.lock().await;
-        let Ok(record) = SessionRecord::get_by_id(&mut *db, session_id).await else {
-            return Ok(0);
-        };
-        let msgs = record.messages().exec(&mut *db).await?;
-        let mut removed = 0usize;
-        for msg in msgs {
-            msg.delete().exec(&mut *db).await?;
-            removed += 1;
-        }
-        Ok(removed)
     }
 }
 
@@ -902,6 +923,45 @@ mod tests {
                 .unwrap(),
             ApproveOutcome::Locked { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn rotate_archives_transcript_and_empties_live_session() {
+        let db = Db::connect(&sqlite_url("shion_rotate_test.db"))
+            .await
+            .unwrap();
+        let sid = "telegram:rot";
+        SessionRepository::save(&db, &Session::new(sid))
+            .await
+            .unwrap();
+        MessageRepository::save(&db, sid, &Message::user("hi"))
+            .await
+            .unwrap();
+        MessageRepository::save(&db, sid, &Message::assistant("hello"))
+            .await
+            .unwrap();
+
+        let archived = SessionRepository::rotate(&db, sid)
+            .await
+            .unwrap()
+            .expect("a non-empty session rotates");
+        assert_ne!(archived, sid);
+
+        // Live session is now empty; the archive holds the transcript.
+        assert!(
+            MessageRepository::list_by_session(&db, sid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let archived_msgs = MessageRepository::list_by_session(&db, &archived)
+            .await
+            .unwrap();
+        assert_eq!(archived_msgs.len(), 2);
+        assert_eq!(archived_msgs[0].content, "hi");
+
+        // Rotating an empty session is a no-op.
+        assert!(SessionRepository::rotate(&db, sid).await.unwrap().is_none());
     }
 
     #[tokio::test]

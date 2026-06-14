@@ -31,7 +31,7 @@ use crate::{
     domain::{
         approval::{ApprovalRequest, Approver, Risk},
         gateway::{MessageHandler, ReplySink},
-        repository::MessageRepository,
+        repository::SessionRepository,
     },
     services::tool_registry::{SessionContext, current_session, with_session},
 };
@@ -230,7 +230,7 @@ pub fn classify(text: &str) -> Command {
 pub struct GatewayDispatcher {
     handler: Arc<dyn MessageHandler>,
     approvals: Arc<ApprovalState>,
-    messages: Arc<dyn MessageRepository>,
+    sessions: Arc<dyn SessionRepository>,
     inflight: Mutex<HashSet<String>>,
 }
 
@@ -238,12 +238,12 @@ impl GatewayDispatcher {
     pub fn new(
         handler: Arc<dyn MessageHandler>,
         approvals: Arc<ApprovalState>,
-        messages: Arc<dyn MessageRepository>,
+        sessions: Arc<dyn SessionRepository>,
     ) -> Self {
         Self {
             handler,
             approvals,
-            messages,
+            sessions,
             inflight: Mutex::new(HashSet::new()),
         }
     }
@@ -276,9 +276,15 @@ impl GatewayDispatcher {
             }
             Command::New => {
                 self.approvals.clear(session_id);
-                let removed = self.messages.clear_session(session_id).await.unwrap_or(0);
-                info!(session = %session_id, removed, "session reset via /new");
-                let _ = sink.send("已开始新会话，上下文已清空。").await;
+                // Rotate (hermes-style): archive the old transcript, leave the
+                // chat's session empty for a fresh conversation.
+                match self.sessions.rotate(session_id).await {
+                    Ok(archived) => {
+                        info!(session = %session_id, ?archived, "session rotated via /new")
+                    }
+                    Err(error) => warn!(%error, "session rotate failed (non-fatal)"),
+                }
+                let _ = sink.send("已开始新会话，之前的上下文已归档。").await;
             }
             Command::Plain(input) => self.spawn_turn(session_id, input, sink),
         }

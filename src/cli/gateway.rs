@@ -9,7 +9,7 @@ use crate::{
     cli::wiring,
     domain::{
         approval::Approver, gateway::MessageHandler, notify::Notifier, pairing::PairingRepository,
-        reminder::ReminderRepository, repository::MessageRepository, task::TaskRepository,
+        reminder::ReminderRepository, repository::SessionRepository, task::TaskRepository,
     },
     infra::{
         db::Db,
@@ -80,8 +80,8 @@ pub async fn run(db_url: &str, schedule_expr: &str) -> anyhow::Result<()> {
     });
 
     let handler: Arc<dyn MessageHandler> = Arc::new(wired.runtime);
-    let messages: Arc<dyn MessageRepository> = db.clone();
-    let dispatcher = Arc::new(GatewayDispatcher::new(handler, approvals, messages));
+    let sessions: Arc<dyn SessionRepository> = db.clone();
+    let dispatcher = Arc::new(GatewayDispatcher::new(handler, approvals, sessions));
     let mut gateway = Gateway::new(dispatcher)
         .with_maintenance(MaintenanceService {
             schedule: review_schedule,
