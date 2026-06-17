@@ -66,6 +66,10 @@ impl Provider {
 }
 
 /// Returns the `~/.shion` config directory. Overridable via `SHION_HOME`.
+///
+/// Read directly (not via `ShionEnv`): this is the bootstrap variable that
+/// decides where `~/.shion/.env` lives, so it must work before dotenvy has
+/// loaded that file.
 pub fn shion_home() -> PathBuf {
     std::env::var("SHION_HOME")
         .ok()
@@ -76,6 +80,87 @@ pub fn shion_home() -> PathBuf {
                 .expect("cannot determine home directory")
                 .join(".shion")
         })
+}
+
+/// `SHION_*` environment overrides, deserialized in one place via envy.
+/// dotenvy (`main.rs`) populates the process env from `.env` files first,
+/// so these see both real env vars and `.env` entries.
+#[derive(Debug, Deserialize, Default)]
+pub struct ShionEnv {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub aux_model: Option<String>,
+    pub schedule: Option<String>,
+    pub briefing_schedule: Option<String>,
+    pub max_turns: Option<usize>,
+    pub review_interval: Option<usize>,
+    pub skills_path: Option<String>,
+}
+
+impl ShionEnv {
+    /// Strict load: a malformed value (e.g. non-numeric `SHION_MAX_TURNS`)
+    /// is an error. Use on paths that should fail fast at startup.
+    pub fn load() -> anyhow::Result<Self> {
+        let env: ShionEnv = envy::prefixed("SHION_")
+            .from_env()
+            .map_err(|e| anyhow::anyhow!("invalid SHION_* environment variable: {e}"))?;
+        Ok(env.normalized())
+    }
+
+    /// Lenient load for paths that must not abort: warns on stderr and
+    /// drops all `SHION_*` overrides when any value is malformed.
+    pub fn load_lenient() -> Self {
+        Self::load().unwrap_or_else(|e| {
+            eprintln!("shion: {e} (ignoring SHION_* overrides)");
+            Self::default()
+        })
+    }
+
+    /// Treat empty strings as unset, so `SHION_MODEL=` behaves like an
+    /// absent variable.
+    fn normalized(mut self) -> Self {
+        for slot in [
+            &mut self.provider,
+            &mut self.model,
+            &mut self.base_url,
+            &mut self.aux_model,
+            &mut self.schedule,
+            &mut self.briefing_schedule,
+            &mut self.skills_path,
+        ] {
+            if slot.as_deref().is_some_and(|s| s.is_empty()) {
+                *slot = None;
+            }
+        }
+        self
+    }
+}
+
+/// Provider API keys, read from the (unprefixed) environment via envy.
+#[derive(Debug, Deserialize, Default)]
+pub struct ApiKeys {
+    deepseek_api_key: Option<String>,
+    openai_api_key: Option<String>,
+    anthropic_api_key: Option<String>,
+    openrouter_api_key: Option<String>,
+}
+
+impl ApiKeys {
+    pub fn load() -> Self {
+        envy::from_env().unwrap_or_default()
+    }
+
+    /// The key for `provider`, treating empty strings as unset.
+    pub fn key(&self, provider: Provider) -> Option<&str> {
+        let slot = match provider {
+            Provider::DeepSeek => &self.deepseek_api_key,
+            Provider::OpenAi => &self.openai_api_key,
+            Provider::Anthropic => &self.anthropic_api_key,
+            Provider::OpenRouter => &self.openrouter_api_key,
+        };
+        slot.as_deref().filter(|s| !s.is_empty())
+    }
 }
 
 /// Ensure `~/.shion/` exists (0700) and return its path.
@@ -100,18 +185,43 @@ pub fn ensure_shion_home() -> PathBuf {
 
 /// Default database URL: `sqlite:<shion_home>/shion.db`.
 /// Creates the config directory on first use so SQLite can create the file.
+/// Holds disposable state (sessions, messages, session todos, pairings,
+/// reminders, skills, settings) — deletable to reset.
 pub fn default_db_url() -> String {
     format!("sqlite:{}", ensure_shion_home().join("shion.db").display())
+}
+
+/// Kanban database URL: `sqlite:<shion_home>/kanban.db`. Durable cross-session
+/// tasks live here, separate from `shion.db` so resetting the latter never
+/// wipes real task data.
+pub fn default_kanban_db_url() -> String {
+    format!("sqlite:{}", ensure_shion_home().join("kanban.db").display())
+}
+
+/// Memory database URL: `sqlite:<shion_home>/memory.db`. Durable long-term
+/// memories live here, separate from `shion.db` (like `kanban.db`) so resetting
+/// the session db never wipes real personal data.
+pub fn default_memory_db_url() -> String {
+    format!("sqlite:{}", ensure_shion_home().join("memory.db").display())
 }
 
 /// Maintenance cron schedule: `SHION_SCHEDULE` env > config.toml `schedule`
 /// > hourly default.
 pub fn maintenance_schedule() -> String {
-    std::env::var("SHION_SCHEDULE")
-        .ok()
-        .filter(|s| !s.is_empty())
+    ShionEnv::load_lenient()
+        .schedule
         .or_else(|| FileConfig::load(&shion_home()).schedule)
         .unwrap_or_else(|| "0 * * * *".to_string())
+}
+
+/// Daily-briefing cron schedule: `SHION_BRIEFING_SCHEDULE` env >
+/// config.toml `briefing_schedule`. Opt-in (no default): the proactive
+/// briefing only runs when the user picks a time, so shion never starts
+/// pushing notifications uninvited.
+pub fn briefing_schedule() -> Option<String> {
+    ShionEnv::load_lenient()
+        .briefing_schedule
+        .or_else(|| FileConfig::load(&shion_home()).briefing_schedule)
 }
 
 /// Settings read from `~/.shion/config.toml`. All fields are optional;
@@ -126,8 +236,147 @@ pub struct FileConfig {
     pub aux_model: Option<String>,
     /// 5-field Unix cron expression for gateway maintenance (default: hourly).
     pub schedule: Option<String>,
+    /// 5-field Unix cron expression for the daily briefing. Unset = disabled
+    /// (the briefing is opt-in; e.g. `0 8 * * *` for 8am daily).
+    pub briefing_schedule: Option<String>,
     /// Maximum tool-calling round-trips per user turn (default: 30).
     pub max_turns: Option<usize>,
+    /// Ingress channel declarations (`[channels.*]` tables), shaped after
+    /// hermes-agent's per-platform config blocks.
+    pub channels: Option<ChannelsFileConfig>,
+}
+
+/// `[channels]` namespace in config.toml: one optional table per transport.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct ChannelsFileConfig {
+    pub feishu: Option<FeishuFileConfig>,
+    pub telegram: Option<TelegramFileConfig>,
+}
+
+/// `[channels.feishu]` table. App credentials never live here — they are
+/// read from `FEISHU_APP_ID` / `FEISHU_APP_SECRET` (in `~/.shion/.env`).
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct FeishuFileConfig {
+    pub enabled: bool,
+    /// Sender open_id allowlist. Empty = anyone who can reach the bot.
+    pub allow_from: Vec<String>,
+    /// Whether group messages must @mention someone to be handled
+    /// (default true; DMs always bypass this gate).
+    pub require_mention: Option<bool>,
+    /// Chat id that receives proactive output (reminders). Unset = keep
+    /// the local macOS notifier.
+    pub home_chat: Option<String>,
+}
+
+/// `FEISHU_*` app credentials from the environment (`~/.shion/.env`).
+#[derive(Debug, Deserialize, Default)]
+struct FeishuEnv {
+    app_id: Option<String>,
+    app_secret: Option<String>,
+}
+
+/// Resolved Feishu channel settings.
+pub struct FeishuConfig {
+    pub app_id: String,
+    pub app_secret: String,
+    pub allow_from: Vec<String>,
+    pub require_mention: bool,
+    pub home_chat: Option<String>,
+}
+
+/// `[channels.telegram]` table. The bot token never lives here — it is read
+/// from `TELEGRAM_BOT_TOKEN` (in `~/.shion/.env`).
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct TelegramFileConfig {
+    pub enabled: bool,
+    /// Sender user-id allowlist. Empty = anyone who can reach the bot.
+    pub allow_from: Vec<String>,
+    /// Group chat-id allowlist: when non-empty, group messages are only handled
+    /// in these chats (DMs always pass). Mirrors hermes' `allowed_chats`.
+    pub allowed_chats: Vec<String>,
+    /// Whether group messages must @mention the bot (default true; DMs
+    /// always bypass this gate).
+    pub require_mention: Option<bool>,
+    /// Chat id that receives proactive output (reminders). Unset = keep
+    /// the local macOS notifier.
+    pub home_chat: Option<String>,
+}
+
+/// `TELEGRAM_*` bot credentials from the environment (`~/.shion/.env`).
+#[derive(Debug, Deserialize, Default)]
+struct TelegramEnv {
+    bot_token: Option<String>,
+}
+
+/// Resolved Telegram channel settings.
+pub struct TelegramConfig {
+    pub bot_token: String,
+    pub allow_from: Vec<String>,
+    pub allowed_chats: Vec<String>,
+    pub require_mention: bool,
+    pub home_chat: Option<String>,
+}
+
+/// Resolve the Telegram channel config. `None` means the channel is not
+/// enabled; an error means it is enabled but misconfigured (fail fast at
+/// startup).
+pub fn telegram_config() -> anyhow::Result<Option<TelegramConfig>> {
+    let file = FileConfig::load(&shion_home());
+    let Some(telegram) = file.channels.and_then(|c| c.telegram) else {
+        return Ok(None);
+    };
+    if !telegram.enabled {
+        return Ok(None);
+    }
+    let env: TelegramEnv = envy::prefixed("TELEGRAM_").from_env().unwrap_or_default();
+    let bot_token = env.bot_token.filter(|s| !s.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "[channels.telegram] is enabled but TELEGRAM_BOT_TOKEN is not set (put it in ~/.shion/.env)"
+        )
+    })?;
+    Ok(Some(TelegramConfig {
+        bot_token,
+        allow_from: telegram.allow_from,
+        allowed_chats: telegram.allowed_chats,
+        require_mention: telegram.require_mention.unwrap_or(true),
+        home_chat: telegram.home_chat,
+    }))
+}
+
+/// Resolve the Feishu channel config. `None` means the channel is not enabled;
+/// an error means it is enabled but misconfigured (fail fast at startup).
+pub fn feishu_config() -> anyhow::Result<Option<FeishuConfig>> {
+    let file = FileConfig::load(&shion_home());
+    let Some(feishu) = file.channels.and_then(|c| c.feishu) else {
+        return Ok(None);
+    };
+    if !feishu.enabled {
+        return Ok(None);
+    }
+    let env: FeishuEnv = envy::prefixed("FEISHU_").from_env().unwrap_or_default();
+    let missing = |var: &'static str| {
+        anyhow::anyhow!(
+            "[channels.feishu] is enabled but {var} is not set (put it in ~/.shion/.env)"
+        )
+    };
+    let app_id = env
+        .app_id
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| missing("FEISHU_APP_ID"))?;
+    let app_secret = env
+        .app_secret
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| missing("FEISHU_APP_SECRET"))?;
+    Ok(Some(FeishuConfig {
+        app_id,
+        app_secret,
+        allow_from: feishu.allow_from,
+        require_mention: feishu.require_mention.unwrap_or(true),
+        home_chat: feishu.home_chat,
+    }))
 }
 
 impl FileConfig {
@@ -246,52 +495,35 @@ impl ModelConfig {
     pub fn resolve() -> anyhow::Result<Self> {
         let home = ensure_shion_home();
         let file = FileConfig::load(&home);
+        let env = ShionEnv::load()?;
 
-        let provider_str = std::env::var("SHION_PROVIDER")
-            .ok()
-            .filter(|s| !s.is_empty())
+        let provider_str = env
+            .provider
             .or(file.provider)
             .unwrap_or_else(|| "deepseek".to_string());
         let provider = Provider::parse(&provider_str)?;
 
-        let model = std::env::var("SHION_MODEL")
-            .ok()
-            .filter(|s| !s.is_empty())
+        let model = env
+            .model
             .or(file.model)
             .unwrap_or_else(|| provider.default_model().to_string());
 
         let key_var = provider.api_key_var();
-        let api_key = std::env::var(key_var)
-            .map_err(|_| anyhow::anyhow!("{key_var} is not set (required for {provider:?})"))?;
-
-        let base_url = std::env::var("SHION_BASE_URL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or(file.base_url);
-
-        let aux_model = std::env::var("SHION_AUX_MODEL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or(file.aux_model);
-
-        let max_turns = match std::env::var("SHION_MAX_TURNS")
-            .ok()
-            .filter(|s| !s.is_empty())
-        {
-            Some(s) => s
-                .trim()
-                .parse()
-                .map_err(|_| anyhow::anyhow!("SHION_MAX_TURNS must be a positive integer"))?,
-            None => file.max_turns.unwrap_or(DEFAULT_MAX_TURNS),
-        };
+        let api_key = ApiKeys::load()
+            .key(provider)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("{key_var} is not set (required for {provider:?})"))?;
 
         Ok(Self {
             provider,
             model,
             api_key,
-            base_url,
-            aux_model,
-            max_turns,
+            base_url: env.base_url.or(file.base_url),
+            aux_model: env.aux_model.or(file.aux_model),
+            max_turns: env
+                .max_turns
+                .or(file.max_turns)
+                .unwrap_or(DEFAULT_MAX_TURNS),
         })
     }
 
@@ -377,6 +609,82 @@ mod tests {
         fs::write(dir.join("config.toml"), "schedule = \"*/30 * * * *\"\n").unwrap();
         let cfg = FileConfig::load(&dir);
         assert_eq!(cfg.schedule.as_deref(), Some("*/30 * * * *"));
+    }
+
+    #[test]
+    fn file_config_loads_briefing_schedule() {
+        let dir = tmp("briefing");
+        fs::write(
+            dir.join("config.toml"),
+            "briefing_schedule = \"0 8 * * *\"\n",
+        )
+        .unwrap();
+        let cfg = FileConfig::load(&dir);
+        assert_eq!(cfg.briefing_schedule.as_deref(), Some("0 8 * * *"));
+    }
+
+    #[test]
+    fn file_config_loads_feishu_channel_table() {
+        let dir = tmp("feishu");
+        fs::write(
+            dir.join("config.toml"),
+            concat!(
+                "[channels.feishu]\n",
+                "enabled = true\n",
+                "allow_from = [\"ou_a\", \"ou_b\"]\n",
+                "require_mention = false\n",
+                "home_chat = \"oc_home\"\n",
+            ),
+        )
+        .unwrap();
+        let cfg = FileConfig::load(&dir);
+        let feishu = cfg
+            .channels
+            .and_then(|c| c.feishu)
+            .expect("feishu table should parse");
+        assert!(feishu.enabled);
+        assert_eq!(feishu.allow_from, vec!["ou_a", "ou_b"]);
+        assert_eq!(feishu.require_mention, Some(false));
+        assert_eq!(feishu.home_chat.as_deref(), Some("oc_home"));
+    }
+
+    #[test]
+    fn file_config_feishu_defaults_are_lenient() {
+        let dir = tmp("feishu_defaults");
+        fs::write(
+            dir.join("config.toml"),
+            "[channels.feishu]\nenabled = true\n",
+        )
+        .unwrap();
+        let cfg = FileConfig::load(&dir);
+        let feishu = cfg.channels.and_then(|c| c.feishu).expect("table parses");
+        assert!(feishu.allow_from.is_empty());
+        assert_eq!(feishu.require_mention, None);
+        assert_eq!(feishu.home_chat, None);
+    }
+
+    #[test]
+    fn api_keys_maps_provider_and_filters_empty() {
+        let keys = ApiKeys {
+            deepseek_api_key: Some("sk-x".into()),
+            openai_api_key: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(keys.key(Provider::DeepSeek), Some("sk-x"));
+        assert_eq!(keys.key(Provider::OpenAi), None, "empty string = unset");
+        assert_eq!(keys.key(Provider::Anthropic), None);
+    }
+
+    #[test]
+    fn shion_env_normalizes_empty_strings_to_unset() {
+        let env = ShionEnv {
+            provider: Some("openai".into()),
+            model: Some(String::new()),
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(env.provider.as_deref(), Some("openai"));
+        assert_eq!(env.model, None);
     }
 
     #[test]

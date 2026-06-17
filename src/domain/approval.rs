@@ -59,10 +59,15 @@ impl ApprovalRequest {
 /// Gate for sensitive, side-effecting actions (e.g. running a shell command or
 /// writing a file).
 ///
-/// The domain layer only knows this trait; the interface layer (CLI) provides a
+/// The domain layer only knows this trait; the interface layer provides a
 /// concrete implementation that prompts the user. Tools that perform risky
 /// actions depend on an `Arc<dyn Approver>` rather than on any I/O directly.
+///
+/// `approve` is async: an interactive approver reads a TTY, but a chat-channel
+/// approver sends an approval prompt to the conversation and awaits the user's
+/// reply on a later turn (see `agent::interaction::ChatApprover`).
+#[async_trait::async_trait]
 pub trait Approver: Send + Sync {
     /// Ask the user to approve `request`. Returns `true` if it may proceed.
-    fn approve(&self, request: &ApprovalRequest) -> bool;
+    async fn approve(&self, request: &ApprovalRequest) -> bool;
 }

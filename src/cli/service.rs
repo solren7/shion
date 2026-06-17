@@ -86,6 +86,21 @@ fn is_loaded(domain: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Poll until launchd has fully unloaded the service, returning whether it did
+/// within the timeout. `bootout` returns before launchd reaps the job, so a
+/// follow-up `start` (which guards on `is_loaded`) would otherwise see it still
+/// present and skip bootstrapping — the restart race.
+fn wait_until_unloaded(domain: &str) -> bool {
+    // ~5s budget: launchd usually unloads within a few hundred ms.
+    for _ in 0..50 {
+        if !is_loaded(domain) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    !is_loaded(domain)
+}
+
 fn ensure_macos() -> anyhow::Result<()> {
     if !cfg!(target_os = "macos") {
         anyhow::bail!("gateway start/stop/restart/status uses launchd and is macOS-only for now");
@@ -153,6 +168,9 @@ pub fn stop() -> anyhow::Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
+    // Wait for the job to actually unload so the "stopped" report is truthful
+    // and an immediate `start` afterwards isn't blocked by the stale job.
+    wait_until_unloaded(&domain);
     println!("shion gateway stopped.");
     Ok(())
 }
@@ -168,6 +186,13 @@ pub fn restart() -> anyhow::Result<()> {
             anyhow::bail!(
                 "launchctl bootout failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        // bootout is async; wait for the unload to land before `start`, whose
+        // `is_loaded` guard would otherwise see the stale job and no-op.
+        if !wait_until_unloaded(&domain) {
+            anyhow::bail!(
+                "gateway did not unload after bootout; wait a moment and run `shion gateway start`"
             );
         }
     }

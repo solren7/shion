@@ -5,28 +5,26 @@
 //! `set` persists a new selection into `~/.shion/config.toml`. Neither touches
 //! the database or requires the API key to be present.
 
-use crate::config::{self, FileConfig, Provider};
+use crate::config::{self, ApiKeys, FileConfig, Provider, ShionEnv};
 
-fn env_nonempty(var: &str) -> Option<String> {
-    std::env::var(var).ok().filter(|s| !s.is_empty())
-}
-
-fn key_present(provider: Provider) -> bool {
-    env_nonempty(provider.api_key_var()).is_some()
+fn key_present(keys: &ApiKeys, provider: Provider) -> bool {
+    keys.key(provider).is_some()
 }
 
 /// Show the current provider/model (with its source) and list all providers.
 pub fn list() -> anyhow::Result<()> {
     let home = config::ensure_shion_home();
     let file = FileConfig::load(&home);
+    let env = ShionEnv::load_lenient();
+    let keys = ApiKeys::load();
 
-    let env_provider = env_nonempty("SHION_PROVIDER");
-    let provider_str = env_provider
+    let provider_str = env
+        .provider
         .clone()
         .or_else(|| file.provider.clone())
         .unwrap_or_else(|| "deepseek".to_string());
     let provider = Provider::parse(&provider_str)?;
-    let provider_source = if env_provider.is_some() {
+    let provider_source = if env.provider.is_some() {
         "env SHION_PROVIDER"
     } else if file.provider.is_some() {
         "config.toml"
@@ -34,12 +32,12 @@ pub fn list() -> anyhow::Result<()> {
         "default"
     };
 
-    let env_model = env_nonempty("SHION_MODEL");
-    let model = env_model
+    let model = env
+        .model
         .clone()
         .or_else(|| file.model.clone())
         .unwrap_or_else(|| provider.default_model().to_string());
-    let model_source = if env_model.is_some() {
+    let model_source = if env.model.is_some() {
         "env SHION_MODEL"
     } else if file.model.is_some() {
         "config.toml"
@@ -53,7 +51,7 @@ pub fn list() -> anyhow::Result<()> {
     println!(
         "  api key   {}  {}",
         provider.api_key_var(),
-        if key_present(provider) {
+        if key_present(&keys, provider) {
             "✓ set"
         } else {
             "✗ missing"
@@ -69,7 +67,7 @@ pub fn list() -> anyhow::Result<()> {
             p.name(),
             p.default_model(),
             p.api_key_var(),
-            if key_present(p) { "✓" } else { "·" },
+            if key_present(&keys, p) { "✓" } else { "·" },
         );
     }
 
@@ -95,13 +93,14 @@ pub fn set(provider_str: &str, model: Option<String>) -> anyhow::Result<()> {
     }
     println!("wrote {}", path.display());
 
-    if env_nonempty("SHION_PROVIDER").is_some() || env_nonempty("SHION_MODEL").is_some() {
+    let env = ShionEnv::load_lenient();
+    if env.provider.is_some() || env.model.is_some() {
         eprintln!(
             "note: SHION_PROVIDER/SHION_MODEL are set and override config.toml; \
              unset them for this change to take effect"
         );
     }
-    if !key_present(provider) {
+    if !key_present(&ApiKeys::load(), provider) {
         eprintln!(
             "note: {} is not set — add it to {}/.env before using {}",
             provider.api_key_var(),

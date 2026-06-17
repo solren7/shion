@@ -5,6 +5,8 @@ pub mod reminder;
 pub mod session;
 pub mod shell;
 pub mod skill;
+pub mod task;
 pub mod time;
+pub mod todo;
 pub mod web_fetch;
 pub mod web_search;

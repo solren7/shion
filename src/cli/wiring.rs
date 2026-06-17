@@ -8,21 +8,30 @@
 use std::{path::PathBuf, sync::Arc};
 
 use crate::{
-    agent::{planner::KeywordPlanner, reviewer::ReflectiveReviewer, runtime::AgentRuntime},
+    agent::{
+        planner::KeywordPlanner, reviewer::ReflectiveReviewer, runtime::AgentRuntime,
+        system_prompt::SystemPromptBuilder,
+    },
     config::ModelConfig,
     domain::{
         approval::Approver,
+        llm::LlmClient,
         memory::MemoryRepository,
         repository::{SessionRepository, SkillRepository},
         reviewer::Reviewer,
         workspace::Workspace,
     },
-    infra::{db::Db, llm::build_llm, md_memory::MdMemoryStore},
+    infra::{
+        db::Db,
+        kanban::KanbanDb,
+        llm::{PreambleFn, build_llm},
+        memory_db::MemoryDb,
+    },
     services::{skill_registry::SkillRegistry, tool_registry::ToolRegistry},
     tools::{
         delegate::DelegateTool, file::FileTool, memory::MemoryTool, reminder::ReminderTool,
-        session::SessionTool, shell::ShellTool, skill::SkillTool, time::TimeTool,
-        web_fetch::WebFetchTool, web_search::WebSearchTool,
+        session::SessionTool, shell::ShellTool, skill::SkillTool, task::TaskTool, time::TimeTool,
+        todo::TodoTool, web_fetch::WebFetchTool, web_search::WebSearchTool,
     },
 };
 
@@ -32,10 +41,19 @@ pub struct Wiring {
     pub runtime: AgentRuntime,
     pub sessions: Arc<dyn SessionRepository>,
     pub reviewer: Arc<dyn Reviewer>,
+    /// The auxiliary (cheaper) LLM, reused by the daily briefing sweep.
+    pub aux_llm: Arc<dyn LlmClient>,
+    /// The markdown memory store, also read by the briefing sweep.
+    pub memories: Arc<dyn MemoryRepository>,
 }
 
-/// Build the agent against `db`, gating side-effecting tools through `approver`.
-pub async fn build(db: Arc<Db>, approver: Arc<dyn Approver>) -> anyhow::Result<Wiring> {
+/// Build the agent against `db` (sessions/messages/etc.) and `kanban` (durable
+/// tasks, a separate file), gating side-effecting tools through `approver`.
+pub async fn build(
+    db: Arc<Db>,
+    kanban: Arc<KanbanDb>,
+    approver: Arc<dyn Approver>,
+) -> anyhow::Result<Wiring> {
     let model_config = ModelConfig::from_env()?;
     // File operations are confined to the current working directory.
     let workspace = Arc::new(Workspace::current_dir()?);
@@ -51,26 +69,42 @@ pub async fn build(db: Arc<Db>, approver: Arc<dyn Approver>) -> anyhow::Result<W
     tools.register(Arc::new(WebSearchTool::new()));
     tools.register(Arc::new(SessionTool::new(db.clone())));
     tools.register(Arc::new(ReminderTool::new(db.clone())));
+    tools.register(Arc::new(TaskTool::new(kanban.clone())));
+    tools.register(Arc::new(TodoTool::new(db.clone())));
 
-    // Memories live as markdown files under ~/.shion/memory/, shared by the
-    // `memory` tool and the reflective reviewer.
-    let memory_repo: Arc<dyn MemoryRepository> = Arc::new(MdMemoryStore::new(
-        crate::config::shion_home().join("memory"),
-    ));
+    // Memories live in their own SQLite file (~/.shion/memory.db), shared by the
+    // `memory` tool, the reflective reviewer, the L1 pinned injection, and the
+    // briefing sweep. On first run it seeds itself from any legacy markdown
+    // memories under ~/.shion/memory/ (a one-time, no-op-once-populated import).
+    let memory_db = MemoryDb::connect(&crate::config::default_memory_db_url()).await?;
+    let imported = memory_db
+        .import_legacy_markdown(&crate::config::shion_home().join("memory"))
+        .await
+        .unwrap_or(0);
+    if imported > 0 {
+        tracing::info!(imported, "migrated legacy markdown memories into memory.db");
+    }
+    let memory_repo: Arc<dyn MemoryRepository> = Arc::new(memory_db);
     tools.register(Arc::new(MemoryTool::new(memory_repo.clone())));
 
     // The delegate tool runs a separate, tool-less sub-agent on the (optionally
-    // cheaper) aux model.
-    let aux_llm = build_llm(&model_config.aux_variant(), Vec::new(), None)?;
+    // cheaper) aux model. It gets a minimal identity-only preamble — no tools,
+    // skills, or project context — rebuilt per turn like the main agent.
+    let aux_config = model_config.aux_variant();
+    let aux_builder = Arc::new(SystemPromptBuilder::new(&aux_config));
+    let aux_preamble: PreambleFn = Arc::new(move || aux_builder.build());
+    // Aux/delegate sub-agents must not be fed the user's memory library.
+    let aux_llm = build_llm(&aux_config, Vec::new(), aux_preamble, None)?;
     tools.register(Arc::new(DelegateTool::new(aux_llm.clone())));
 
     // Skills load from, in priority order (first to define a name wins):
     //   SHION_SKILLS_PATH (colon-separated), <workspace>/skills,
     //   <workspace>/.claude/skills, and the user-global ~/.claude/skills shared
     //   by general agents (Claude Agent Skills `SKILL.md` format).
+    let env = crate::config::ShionEnv::load()?;
     let root = workspace.roots().first().cloned().unwrap_or_default();
     let mut skill_dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(extra) = std::env::var("SHION_SKILLS_PATH") {
+    if let Some(extra) = &env.skills_path {
         skill_dirs.extend(
             extra
                 .split(':')
@@ -80,8 +114,8 @@ pub async fn build(db: Arc<Db>, approver: Arc<dyn Approver>) -> anyhow::Result<W
     }
     skill_dirs.push(root.join("skills"));
     skill_dirs.push(root.join(".claude/skills"));
-    if let Ok(home) = std::env::var("HOME") {
-        skill_dirs.push(PathBuf::from(home).join(".claude/skills"));
+    if let Some(home) = dirs::home_dir() {
+        skill_dirs.push(home.join(".claude/skills"));
     }
     let skills = Arc::new(SkillRegistry::load_from_dirs(&skill_dirs));
 
@@ -98,11 +132,35 @@ pub async fn build(db: Arc<Db>, approver: Arc<dyn Approver>) -> anyhow::Result<W
     });
     tools.register(Arc::new(SkillTool::new(skills.clone())));
 
-    // Hand the same tool instances to the LLM so the model can call them.
-    let llm = build_llm(&model_config, tools.tools(), skills_note)?;
+    // Assemble the tiered system prompt: stable identity + tool-aware guidance
+    // (gated on the tools actually loaded) + skills catalog, then the workspace
+    // project-instruction file, then the day-precision volatile footer. Wrapped
+    // in a factory so `complete` rebuilds it per turn (per session) rather than
+    // freezing the date at process start — important for the long-lived gateway.
+    let tool_names = tools.tools().iter().map(|t| t.name().to_string()).collect();
+    let prompt_builder = Arc::new(
+        SystemPromptBuilder::new(&model_config)
+            .tools(tool_names)
+            .skills_note(skills_note)
+            .workspace_root(Some(root.clone())),
+    );
+    let preamble: PreambleFn = Arc::new(move || prompt_builder.build());
+
+    // Hand the same tool instances to the LLM so the model can call them, plus
+    // the memory store for L1 pinned injection (main agent only).
+    let llm = build_llm(
+        &model_config,
+        tools.tools(),
+        preamble,
+        Some(memory_repo.clone()),
+    )?;
     let skill_repo: Arc<dyn SkillRepository> = db.clone();
-    let reviewer: Arc<dyn Reviewer> =
-        Arc::new(ReflectiveReviewer::new(aux_llm, memory_repo, skill_repo));
+    let reviewer: Arc<dyn Reviewer> = Arc::new(ReflectiveReviewer::new(
+        aux_llm.clone(),
+        memory_repo.clone(),
+        skill_repo,
+        kanban.clone(),
+    ));
 
     let runtime = AgentRuntime {
         planner: Box::new(KeywordPlanner),
@@ -111,20 +169,14 @@ pub async fn build(db: Arc<Db>, approver: Arc<dyn Approver>) -> anyhow::Result<W
         sessions: db.clone(),
         messages: db.clone(),
         reviewer: Some(reviewer.clone()),
-        review_interval: review_interval_from_env(),
+        review_interval: env.review_interval.filter(|v| *v > 0).unwrap_or(10),
     };
 
     Ok(Wiring {
         runtime,
         sessions: db.clone(),
         reviewer,
+        aux_llm,
+        memories: memory_repo,
     })
-}
-
-pub fn review_interval_from_env() -> usize {
-    std::env::var("SHION_REVIEW_INTERVAL")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(10)
 }

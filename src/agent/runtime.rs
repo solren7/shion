@@ -11,7 +11,7 @@ use crate::{
         reviewer::Reviewer,
         session::Session,
     },
-    services::tool_registry::ToolRegistry,
+    services::tool_registry::{SessionContext, ToolRegistry, current_session, with_session},
 };
 
 pub struct AgentRuntime {
@@ -30,6 +30,19 @@ impl AgentRuntime {
         session_id: &str,
         user_input: String,
     ) -> anyhow::Result<String> {
+        // Session-scoped tools (e.g. `todo`) read the turn's session from the
+        // ambient context. The gateway dispatcher sets it (with a real reply
+        // sink); the REPL calls us directly, so establish a detached context
+        // here when none exists. Don't override an existing one — that would
+        // drop the gateway's sink and break mid-turn approval.
+        if current_session().is_none() {
+            let ctx = SessionContext::detached(session_id);
+            return with_session(ctx, self.run_turn(session_id, user_input)).await;
+        }
+        self.run_turn(session_id, user_input).await
+    }
+
+    async fn run_turn(&self, session_id: &str, user_input: String) -> anyhow::Result<String> {
         // Load or create session.
         let mut session = match self.sessions.find(session_id).await? {
             Some(s) => s,

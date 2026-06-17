@@ -5,11 +5,17 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::domain::{
+    home::HomeRepository,
     message::{Message, Role},
+    pairing::{
+        APPROVE_LOCKOUT_SECS, APPROVE_MAX_FAILURES, ApproveOutcome, PAIRING_CODE_TTL_SECS,
+        PairingRepository, PairingRequest, PairingStatus, parse_pairing_status, verify_code,
+    },
     reminder::{Reminder, ReminderRepository, ReminderStatus, parse_reminder_status},
     repository::{MessageRepository, SessionRepository, SkillRepository},
     session::Session,
     skill::Skill,
+    todo::{SessionTodoRepository, TodoItem},
 };
 
 // ── toasty models (infra-internal) ───────────────────────────────────────────
@@ -61,6 +67,53 @@ struct ReminderRecord {
     created_at: i64,
 }
 
+/// Session-scoped working todo list (`domain/todo.rs`). One row per session;
+/// `items` is the JSON-serialized `Vec<TodoItem>`. Disposable working state —
+/// cleared on `/new` rotate.
+#[derive(Debug, toasty::Model)]
+struct SessionTodoRecord {
+    #[key]
+    session_id: String,
+    items: String, // JSON array of TodoItem
+    updated_at: i64,
+}
+
+#[derive(Debug, toasty::Model)]
+struct PairingRecord {
+    /// One row per sender: `{platform}:{sender_id}`.
+    #[key]
+    id: String,
+    platform: String,
+    sender_id: String,
+    chat_id: String,
+    code_hash: String, // salted SHA-256 of the code; plaintext never stored
+    salt: String,
+    status: String, // "pending" | "approved"
+    created_at: i64,
+}
+
+/// Failure-lockout counter for the `shion pair approve` path. A singleton row
+/// (`id = "approve"`); mirrors hermes' per-platform approve lockout.
+#[derive(Debug, toasty::Model)]
+struct LockoutRecord {
+    #[key]
+    id: String,
+    failed_count: i64,
+    locked_until: i64,
+}
+
+/// Generic key/value settings. One row per setting (`id` is the key); the home
+/// channel set via `/sethome` lives under `id = "home_chat"`.
+#[derive(Debug, toasty::Model)]
+struct SettingRecord {
+    #[key]
+    id: String,
+    value: String,
+}
+
+/// Setting key for the runtime home channel (`/sethome`).
+const HOME_SETTING_KEY: &str = "home_chat";
+
 // ── Db ───────────────────────────────────────────────────────────────────────
 
 pub struct Db {
@@ -79,7 +132,11 @@ impl Db {
                 SessionRecord,
                 MessageRecord,
                 SkillRecord,
-                ReminderRecord
+                ReminderRecord,
+                SessionTodoRecord,
+                PairingRecord,
+                LockoutRecord,
+                SettingRecord
             ))
             .connect(url)
             .await?;
@@ -194,6 +251,41 @@ impl SessionRepository for Db {
         }
         Ok(removed)
     }
+
+    async fn rotate(&self, session_id: &str) -> anyhow::Result<Option<String>> {
+        let mut db = self.inner.lock().await;
+        // Nothing to archive if the session is absent or already empty.
+        let Ok(live) = SessionRecord::get_by_id(&mut *db, session_id).await else {
+            return Ok(None);
+        };
+        let msgs = live.messages().exec(&mut *db).await?;
+        if msgs.is_empty() {
+            return Ok(None);
+        }
+
+        // Move the transcript to a fresh archive session, preserving its start
+        // time; the live row stays and is now empty for the next conversation.
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let archived_id = format!("{session_id}#{now}");
+        toasty::create!(SessionRecord {
+            id: archived_id.clone(),
+            created_at: live.created_at,
+        })
+        .exec(&mut *db)
+        .await?;
+        let archive = SessionRecord::get_by_id(&mut *db, &archived_id).await?;
+        for msg in msgs {
+            toasty::create!(in archive.messages() {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+                timestamp: msg.timestamp,
+            })
+            .exec(&mut *db)
+            .await?;
+            msg.delete().exec(&mut *db).await?;
+        }
+        Ok(Some(archived_id))
+    }
 }
 
 // ── MessageRepository ─────────────────────────────────────────────────────────
@@ -280,6 +372,233 @@ impl ReminderRepository for Db {
     }
 }
 
+// ── SessionTodoRepository ─────────────────────────────────────────────────────
+
+#[async_trait]
+impl SessionTodoRepository for Db {
+    async fn get(&self, session_id: &str) -> anyhow::Result<Vec<TodoItem>> {
+        let mut db = self.inner.lock().await;
+        match SessionTodoRecord::get_by_session_id(&mut *db, session_id).await {
+            Ok(record) => Ok(serde_json::from_str(&record.items).unwrap_or_default()),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+
+    async fn set(&self, session_id: &str, items: &[TodoItem]) -> anyhow::Result<()> {
+        let json = serde_json::to_string(items)?;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut db = self.inner.lock().await;
+        match SessionTodoRecord::get_by_session_id(&mut *db, session_id).await {
+            Ok(mut record) => {
+                record
+                    .update()
+                    .items(json)
+                    .updated_at(now)
+                    .exec(&mut *db)
+                    .await?;
+            }
+            Err(_) => {
+                toasty::create!(SessionTodoRecord {
+                    session_id: session_id.to_string(),
+                    items: json,
+                    updated_at: now,
+                })
+                .exec(&mut *db)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear(&self, session_id: &str) -> anyhow::Result<()> {
+        let mut db = self.inner.lock().await;
+        if let Ok(record) = SessionTodoRecord::get_by_session_id(&mut *db, session_id).await {
+            record.delete().exec(&mut *db).await?;
+        }
+        Ok(())
+    }
+}
+
+// ── PairingRepository ─────────────────────────────────────────────────────────
+
+#[async_trait]
+impl PairingRepository for Db {
+    async fn upsert(&self, request: &PairingRequest) -> anyhow::Result<()> {
+        let mut db = self.inner.lock().await;
+        if let Ok(record) = PairingRecord::get_by_id(&mut *db, &request.id).await {
+            record.delete().exec(&mut *db).await?;
+        }
+        toasty::create!(PairingRecord {
+            id: request.id.clone(),
+            platform: request.platform.clone(),
+            sender_id: request.sender_id.clone(),
+            chat_id: request.chat_id.clone(),
+            code_hash: request.code_hash.clone(),
+            salt: request.salt.clone(),
+            status: request.status.as_str().to_string(),
+            created_at: request.created_at,
+        })
+        .exec(&mut *db)
+        .await?;
+        Ok(())
+    }
+
+    async fn find(
+        &self,
+        platform: &str,
+        sender_id: &str,
+    ) -> anyhow::Result<Option<PairingRequest>> {
+        let mut db = self.inner.lock().await;
+        let id = format!("{platform}:{sender_id}");
+        match PairingRecord::get_by_id(&mut *db, &id).await {
+            Ok(record) => Ok(Some(pairing_from_record(record))),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn count_active_pending(&self, platform: &str) -> anyhow::Result<usize> {
+        let mut db = self.inner.lock().await;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let rows = toasty::query!(PairingRecord).exec(&mut *db).await?;
+        Ok(rows
+            .iter()
+            .filter(|r| {
+                r.platform == platform
+                    && r.status == "pending"
+                    && now - r.created_at <= PAIRING_CODE_TTL_SECS
+            })
+            .count())
+    }
+
+    async fn approve_code(&self, code: &str) -> anyhow::Result<ApproveOutcome> {
+        const LOCK_ID: &str = "approve";
+        let mut db = self.inner.lock().await;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+        // Honor an active lockout before testing the code.
+        let lock = LockoutRecord::get_by_id(&mut *db, LOCK_ID).await.ok();
+        if let Some(l) = &lock
+            && l.locked_until > now
+        {
+            return Ok(ApproveOutcome::Locked {
+                retry_after_secs: l.locked_until - now,
+            });
+        }
+
+        let rows = toasty::query!(PairingRecord).exec(&mut *db).await?;
+        let matched = rows.into_iter().find(|r| {
+            r.status == "pending"
+                && now - r.created_at <= PAIRING_CODE_TTL_SECS
+                && verify_code(&r.salt, &r.code_hash, code)
+        });
+
+        match matched {
+            Some(mut record) => {
+                record
+                    .update()
+                    .status(PairingStatus::Approved.as_str().to_string())
+                    .exec(&mut *db)
+                    .await?;
+                // Success clears the failure counter.
+                if let Some(mut l) = lock {
+                    l.update()
+                        .failed_count(0)
+                        .locked_until(0)
+                        .exec(&mut *db)
+                        .await?;
+                }
+                Ok(ApproveOutcome::Approved(pairing_from_record(record)))
+            }
+            None => {
+                let mut count = lock.as_ref().map(|l| l.failed_count).unwrap_or(0) + 1;
+                let mut locked_until = 0;
+                if count >= APPROVE_MAX_FAILURES {
+                    locked_until = now + APPROVE_LOCKOUT_SECS;
+                    count = 0; // reset the counter once locked
+                }
+                match lock {
+                    Some(mut l) => {
+                        l.update()
+                            .failed_count(count)
+                            .locked_until(locked_until)
+                            .exec(&mut *db)
+                            .await?;
+                    }
+                    None => {
+                        toasty::create!(LockoutRecord {
+                            id: LOCK_ID.to_string(),
+                            failed_count: count,
+                            locked_until,
+                        })
+                        .exec(&mut *db)
+                        .await?;
+                    }
+                }
+                if locked_until > now {
+                    Ok(ApproveOutcome::Locked {
+                        retry_after_secs: locked_until - now,
+                    })
+                } else {
+                    Ok(ApproveOutcome::NotFound)
+                }
+            }
+        }
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<PairingRequest>> {
+        let mut db = self.inner.lock().await;
+        let mut rows = toasty::query!(PairingRecord).exec(&mut *db).await?;
+        rows.sort_by_key(|r| r.created_at);
+        Ok(rows.into_iter().map(pairing_from_record).collect())
+    }
+
+    async fn revoke(&self, id: &str) -> anyhow::Result<bool> {
+        let mut db = self.inner.lock().await;
+        match PairingRecord::get_by_id(&mut *db, id).await {
+            Ok(record) => {
+                record.delete().exec(&mut *db).await?;
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+// ── HomeRepository ────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl HomeRepository for Db {
+    async fn get(&self) -> anyhow::Result<Option<String>> {
+        let mut db = self.inner.lock().await;
+        match SettingRecord::get_by_id(&mut *db, HOME_SETTING_KEY).await {
+            Ok(record) => Ok(Some(record.value).filter(|v| !v.is_empty())),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn set(&self, session_id: &str) -> anyhow::Result<()> {
+        let mut db = self.inner.lock().await;
+        match SettingRecord::get_by_id(&mut *db, HOME_SETTING_KEY).await {
+            Ok(mut record) => {
+                record
+                    .update()
+                    .value(session_id.to_string())
+                    .exec(&mut *db)
+                    .await?;
+            }
+            Err(_) => {
+                toasty::create!(SettingRecord {
+                    id: HOME_SETTING_KEY.to_string(),
+                    value: session_id.to_string(),
+                })
+                .exec(&mut *db)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn parse_role(s: &str) -> Role {
@@ -320,6 +639,19 @@ fn skill_from_record(record: SkillRecord) -> Skill {
         description: record.description,
         instructions: record.instructions,
         protected: record.protected,
+    }
+}
+
+fn pairing_from_record(record: PairingRecord) -> PairingRequest {
+    PairingRequest {
+        id: record.id,
+        platform: record.platform,
+        sender_id: record.sender_id,
+        chat_id: record.chat_id,
+        code_hash: record.code_hash,
+        salt: record.salt,
+        status: parse_pairing_status(&record.status),
+        created_at: record.created_at,
     }
 }
 
@@ -459,6 +791,226 @@ mod tests {
             .unwrap();
         let pending = ReminderRepository::list_pending(&db).await.unwrap();
         assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn db_session_todo_set_get_clear() {
+        use crate::domain::todo::{TodoItem, TodoStatus};
+        let db = Db::connect(&sqlite_url("shion_session_todo_test.db"))
+            .await
+            .unwrap();
+
+        // Absent session reads as empty.
+        assert!(
+            SessionTodoRepository::get(&db, "s1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let items = vec![
+            TodoItem {
+                content: "step one".to_string(),
+                status: TodoStatus::InProgress,
+                active_form: "doing step one".to_string(),
+            },
+            TodoItem {
+                content: "step two".to_string(),
+                status: TodoStatus::Pending,
+                active_form: String::new(),
+            },
+        ];
+        SessionTodoRepository::set(&db, "s1", &items).await.unwrap();
+        let got = SessionTodoRepository::get(&db, "s1").await.unwrap();
+        assert_eq!(got, items);
+
+        // set replaces the whole list (upsert, not append).
+        let replaced = vec![TodoItem {
+            content: "only step".to_string(),
+            status: TodoStatus::Completed,
+            active_form: String::new(),
+        }];
+        SessionTodoRepository::set(&db, "s1", &replaced)
+            .await
+            .unwrap();
+        assert_eq!(
+            SessionTodoRepository::get(&db, "s1").await.unwrap(),
+            replaced
+        );
+
+        // Scoped per session.
+        assert!(
+            SessionTodoRepository::get(&db, "s2")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        SessionTodoRepository::clear(&db, "s1").await.unwrap();
+        assert!(
+            SessionTodoRepository::get(&db, "s1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn db_pairing_upsert_approve_revoke_roundtrip() {
+        use crate::domain::pairing::ApproveOutcome;
+
+        let db = Db::connect(&sqlite_url("shion_pairing_repo_test.db"))
+            .await
+            .unwrap();
+        let (request, code) = PairingRequest::mint("telegram", "777", "777");
+
+        PairingRepository::upsert(&db, &request).await.unwrap();
+        let found = PairingRepository::find(&db, "telegram", "777")
+            .await
+            .unwrap()
+            .unwrap();
+        // The plaintext code is never persisted — only the salted hash.
+        assert_eq!(found.code_hash, request.code_hash);
+        assert_ne!(found.code_hash, code);
+        assert_eq!(found.status, crate::domain::pairing::PairingStatus::Pending);
+        assert_eq!(
+            PairingRepository::count_active_pending(&db, "telegram")
+                .await
+                .unwrap(),
+            1
+        );
+
+        // Upsert with a fresh code replaces the row (one row per sender).
+        let (refreshed, refreshed_code) = PairingRequest::mint("telegram", "777", "777");
+        PairingRepository::upsert(&db, &refreshed).await.unwrap();
+        assert_eq!(PairingRepository::list(&db).await.unwrap().len(), 1);
+
+        assert!(matches!(
+            PairingRepository::approve_code(&db, "NOSUCHCD")
+                .await
+                .unwrap(),
+            ApproveOutcome::NotFound
+        ));
+        let ApproveOutcome::Approved(approved) =
+            PairingRepository::approve_code(&db, &refreshed_code)
+                .await
+                .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        assert_eq!(approved.sender_id, "777");
+        let found = PairingRepository::find(&db, "telegram", "777")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found.status,
+            crate::domain::pairing::PairingStatus::Approved
+        );
+
+        assert!(
+            PairingRepository::revoke(&db, "telegram:777")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !PairingRepository::revoke(&db, "telegram:777")
+                .await
+                .unwrap()
+        );
+        assert!(
+            PairingRepository::find(&db, "telegram", "777")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn db_pairing_locks_out_after_repeated_bad_codes() {
+        use crate::domain::pairing::{APPROVE_MAX_FAILURES, ApproveOutcome};
+
+        let db = Db::connect(&sqlite_url("shion_pairing_lockout_test.db"))
+            .await
+            .unwrap();
+
+        // The first APPROVE_MAX_FAILURES - 1 wrong codes are NotFound; the
+        // attempt that reaches the limit locks out.
+        for _ in 0..APPROVE_MAX_FAILURES - 1 {
+            assert!(matches!(
+                PairingRepository::approve_code(&db, "BADCODE1")
+                    .await
+                    .unwrap(),
+                ApproveOutcome::NotFound
+            ));
+        }
+        assert!(matches!(
+            PairingRepository::approve_code(&db, "BADCODE1")
+                .await
+                .unwrap(),
+            ApproveOutcome::Locked { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn rotate_archives_transcript_and_empties_live_session() {
+        let db = Db::connect(&sqlite_url("shion_rotate_test.db"))
+            .await
+            .unwrap();
+        let sid = "telegram:rot";
+        SessionRepository::save(&db, &Session::new(sid))
+            .await
+            .unwrap();
+        MessageRepository::save(&db, sid, &Message::user("hi"))
+            .await
+            .unwrap();
+        MessageRepository::save(&db, sid, &Message::assistant("hello"))
+            .await
+            .unwrap();
+
+        let archived = SessionRepository::rotate(&db, sid)
+            .await
+            .unwrap()
+            .expect("a non-empty session rotates");
+        assert_ne!(archived, sid);
+
+        // Live session is now empty; the archive holds the transcript.
+        assert!(
+            MessageRepository::list_by_session(&db, sid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let archived_msgs = MessageRepository::list_by_session(&db, &archived)
+            .await
+            .unwrap();
+        assert_eq!(archived_msgs.len(), 2);
+        assert_eq!(archived_msgs[0].content, "hi");
+
+        // Rotating an empty session is a no-op.
+        assert!(SessionRepository::rotate(&db, sid).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn home_repository_roundtrips_and_overwrites() {
+        let db = Db::connect(&sqlite_url("shion_home_repo_test.db"))
+            .await
+            .unwrap();
+
+        assert!(HomeRepository::get(&db).await.unwrap().is_none());
+
+        HomeRepository::set(&db, "telegram:123456").await.unwrap();
+        assert_eq!(
+            HomeRepository::get(&db).await.unwrap().as_deref(),
+            Some("telegram:123456")
+        );
+
+        // /sethome from another chat replaces the home (one row per key).
+        HomeRepository::set(&db, "feishu:oc_home").await.unwrap();
+        assert_eq!(
+            HomeRepository::get(&db).await.unwrap().as_deref(),
+            Some("feishu:oc_home")
+        );
     }
 
     #[tokio::test]

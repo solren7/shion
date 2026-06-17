@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::io::{self, Write};
 use std::sync::Mutex;
 
+use async_trait::async_trait;
+
 use crate::domain::approval::{ApprovalRequest, Approver, Risk};
 
 /// What the user answered at the approval prompt.
@@ -45,8 +47,9 @@ impl Default for CliApprover {
     }
 }
 
+#[async_trait]
 impl Approver for CliApprover {
-    fn approve(&self, request: &ApprovalRequest) -> bool {
+    async fn approve(&self, request: &ApprovalRequest) -> bool {
         if request.risk == Risk::Safe {
             return true;
         }
@@ -60,33 +63,23 @@ impl Approver for CliApprover {
             }
         }
 
-        match request.risk {
-            Risk::Safe => unreachable!("handled above"),
-            Risk::Dangerous => {
-                print!("\n🛑 DANGEROUS — request to {}", request.summary);
-                if let Some(detail) = &request.detail {
-                    print!("\n   ({detail})");
-                }
-                print!("\n   Approve? [y]es once / [s]ession / [N]o ");
+        // The prompt + stdin read is blocking; run it off the async runtime.
+        let prompt = prompt_text(request);
+        let answer = tokio::task::spawn_blocking(move || {
+            print!("{prompt}");
+            if io::stdout().flush().is_err() {
+                return Answer::Deny;
             }
-            Risk::Normal => {
-                print!(
-                    "\n⚠  Approve request to {}? [y]es once / [s]ession / [N]o ",
-                    request.summary
-                );
+            let mut answer = String::new();
+            if io::stdin().read_line(&mut answer).is_err() {
+                return Answer::Deny;
             }
-        }
+            parse_answer(&answer)
+        })
+        .await
+        .unwrap_or(Answer::Deny);
 
-        if io::stdout().flush().is_err() {
-            return false;
-        }
-
-        let mut answer = String::new();
-        if io::stdin().read_line(&mut answer).is_err() {
-            return false;
-        }
-
-        match parse_answer(&answer) {
+        match answer {
             Answer::Once => true,
             Answer::Session => {
                 if let Some(key) = &request.scope_key {
@@ -99,22 +92,29 @@ impl Approver for CliApprover {
     }
 }
 
-/// Non-interactive approver for unattended contexts (the gateway): there is no
-/// human at a TTY to consent, so every approval-gated action is denied — even
-/// `Risk::Safe` ones. This mirrors hermes disabling interactive/dangerous
-/// toolsets in its cron/gateway context — tools that never request approval
-/// still work; everything gated is refused.
-pub struct DenyApprover;
-
-impl Approver for DenyApprover {
-    fn approve(&self, request: &ApprovalRequest) -> bool {
-        tracing::warn!(
-            summary = %request.summary,
-            "approval auto-denied (non-interactive gateway)"
-        );
-        false
+/// The interactive prompt text for a non-`Safe` request.
+fn prompt_text(request: &ApprovalRequest) -> String {
+    match request.risk {
+        Risk::Safe => unreachable!("handled before prompting"),
+        Risk::Dangerous => {
+            let mut s = format!("\n🛑 DANGEROUS — request to {}", request.summary);
+            if let Some(detail) = &request.detail {
+                s.push_str(&format!("\n   ({detail})"));
+            }
+            s.push_str("\n   Approve? [y]es once / [s]ession / [N]o ");
+            s
+        }
+        Risk::Normal => format!(
+            "\n⚠  Approve request to {}? [y]es once / [s]ession / [N]o ",
+            request.summary
+        ),
     }
 }
+
+// The gateway uses `agent::interaction::ChatApprover`, which routes the prompt
+// to the chat channel and denies when there is no chat session in context
+// (maintenance sweeps, aux sub-agents) — so a separate deny-only approver is no
+// longer needed.
 
 #[cfg(test)]
 mod tests {
@@ -131,14 +131,18 @@ mod tests {
         assert_eq!(parse_answer("whatever"), Answer::Deny);
     }
 
-    #[test]
-    fn safe_requests_skip_the_prompt() {
+    #[tokio::test]
+    async fn safe_requests_skip_the_prompt() {
         let approver = CliApprover::new();
-        assert!(approver.approve(&ApprovalRequest::safe("run shell command: ls")));
+        assert!(
+            approver
+                .approve(&ApprovalRequest::safe("run shell command: ls"))
+                .await
+        );
     }
 
-    #[test]
-    fn session_cache_short_circuits_the_prompt() {
+    #[tokio::test]
+    async fn session_cache_short_circuits_the_prompt() {
         let approver = CliApprover::new();
         approver
             .session_allowed
@@ -147,11 +151,6 @@ mod tests {
             .insert("file:write".to_string());
         let request =
             ApprovalRequest::normal("write 5 bytes to /tmp/x").with_scope_key("file:write");
-        assert!(approver.approve(&request));
-    }
-
-    #[test]
-    fn deny_approver_denies_even_safe_requests() {
-        assert!(!DenyApprover.approve(&ApprovalRequest::safe("run shell command: ls")));
+        assert!(approver.approve(&request).await);
     }
 }

@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 
-use super::{chat, gateway, inspect, model, service};
+use super::{chat, gateway, inspect, model, pair, service};
 
 #[derive(Parser)]
 #[command(name = "shion", version, about = "Personal agent framework")]
@@ -31,11 +31,24 @@ enum Commands {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Inspect the durable task list
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
+    /// Manage channel pairing: unknown senders must be approved from this
+    /// host before the agent talks to them
+    Pair {
+        #[command(subcommand)]
+        action: PairAction,
+    },
     /// Show or switch the active LLM provider and model
     Model {
         #[command(subcommand)]
         action: ModelAction,
     },
+    /// Print the shion version
+    Version,
 }
 
 #[derive(Subcommand)]
@@ -55,6 +68,28 @@ enum ModelAction {
 enum CronAction {
     /// List pending reminders with their schedules and next fire times
     List,
+}
+
+#[derive(Subcommand)]
+enum TaskAction {
+    /// List open tasks (inbox / todo / waiting), grouped by status
+    List,
+}
+
+#[derive(Subcommand)]
+enum PairAction {
+    /// List pending pairing requests (with codes) and approved senders
+    List,
+    /// Approve a pending request by its pairing code
+    Approve {
+        /// The code the bot sent to the unpaired chat
+        code: String,
+    },
+    /// Remove a pairing by id (`platform:sender_id`, as shown by `pair list`)
+    Revoke {
+        /// Pairing id to remove
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -84,12 +119,15 @@ pub async fn run() -> anyhow::Result<()> {
     // The database always lives in the config directory; use SHION_HOME to
     // point at a different home (e.g. for tests or a second instance).
     let db = crate::config::default_db_url();
+    // Durable tasks live in a separate file so resetting `shion.db` (disposable
+    // dev state) never wipes them.
+    let kanban = crate::config::default_kanban_db_url();
     match cli.command {
-        Commands::Chat => chat::run(&db).await,
+        Commands::Chat => chat::run(&db, &kanban).await,
         Commands::Gateway { action } => match action {
             None => {
                 let schedule = crate::config::maintenance_schedule();
-                gateway::run(&db, &schedule).await
+                gateway::run(&db, &kanban, &schedule).await
             }
             Some(GatewayAction::Start) => service::start(),
             Some(GatewayAction::Stop) => service::stop(),
@@ -103,9 +141,21 @@ pub async fn run() -> anyhow::Result<()> {
             SessionAction::List => inspect::session_list(&db).await,
             SessionAction::Clean => inspect::session_clean(&db).await,
         },
+        Commands::Task { action } => match action {
+            TaskAction::List => inspect::task_list(&kanban).await,
+        },
+        Commands::Pair { action } => match action {
+            PairAction::List => pair::list(&db).await,
+            PairAction::Approve { code } => pair::approve(&db, &code).await,
+            PairAction::Revoke { id } => pair::revoke(&db, &id).await,
+        },
         Commands::Model { action } => match action {
             ModelAction::List => model::list(),
             ModelAction::Set { provider, model } => model::set(&provider, model),
         },
+        Commands::Version => {
+            println!("shion {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
     }
 }

@@ -18,18 +18,23 @@
 //! still deferred — this is the in-process host only.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     agent::{
         daemon::{Maintenance, Schedule, supervise},
+        interaction::GatewayDispatcher,
         runtime::AgentRuntime,
     },
-    domain::gateway::MessageHandler,
+    domain::{gateway::MessageHandler, notify::Notifier},
 };
+
+/// How long the shutdown notice may take before we stop waiting and shut down.
+const SHUTDOWN_NOTICE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `AgentRuntime` is the production message handler: an inbound message is just
 /// another turn in its session lifecycle.
@@ -41,13 +46,14 @@ impl MessageHandler for AgentRuntime {
 }
 
 /// A long-lived ingress: accepts inbound messages over some transport and routes
-/// them through `handler`, until `shutdown` flips to `true`.
+/// them through `dispatcher` (which classifies control commands and runs agent
+/// turns), until `shutdown` flips to `true`.
 #[async_trait]
 pub trait Channel: Send + Sync {
     fn name(&self) -> &str;
     async fn serve(
         &self,
-        handler: Arc<dyn MessageHandler>,
+        dispatcher: Arc<GatewayDispatcher>,
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()>;
 }
@@ -60,18 +66,27 @@ pub struct MaintenanceService {
 }
 
 pub struct Gateway {
-    handler: Arc<dyn MessageHandler>,
+    dispatcher: Arc<GatewayDispatcher>,
     channels: Vec<Box<dyn Channel>>,
     services: Vec<MaintenanceService>,
+    shutdown_notice: Option<Arc<dyn Notifier>>,
 }
 
 impl Gateway {
-    pub fn new(handler: Arc<dyn MessageHandler>) -> Self {
+    pub fn new(dispatcher: Arc<GatewayDispatcher>) -> Self {
         Self {
-            handler,
+            dispatcher,
             channels: Vec::new(),
             services: Vec::new(),
+            shutdown_notice: None,
         }
+    }
+
+    /// Notify the home channel that the gateway is going offline as part of
+    /// shutdown (mirrors hermes' offline notice). No-op when unset.
+    pub fn with_shutdown_notice(mut self, notifier: Arc<dyn Notifier>) -> Self {
+        self.shutdown_notice = Some(notifier);
+        self
     }
 
     pub fn add_channel(mut self, channel: Box<dyn Channel>) -> Self {
@@ -93,10 +108,16 @@ impl Gateway {
     where
         S: std::future::Future<Output = ()>,
     {
+        let Gateway {
+            dispatcher,
+            channels,
+            services,
+            shutdown_notice,
+        } = self;
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut handles = Vec::new();
 
-        for service in self.services {
+        for service in services {
             let mut rx = stop_rx.clone();
             handles.push(tokio::spawn(async move {
                 let stop = async move {
@@ -108,12 +129,12 @@ impl Gateway {
             }));
         }
 
-        for channel in self.channels {
-            let handler = self.handler.clone();
+        for channel in channels {
+            let dispatcher = dispatcher.clone();
             let rx = stop_rx.clone();
             let name = channel.name().to_string();
             handles.push(tokio::spawn(async move {
-                if let Err(error) = channel.serve(handler, rx).await {
+                if let Err(error) = channel.serve(dispatcher, rx).await {
                     error!(%error, channel = %name, "channel stopped");
                 }
             }));
@@ -122,6 +143,23 @@ impl Gateway {
         info!("gateway running");
         shutdown.await;
         info!("shutdown signal received; stopping gateway");
+
+        // Tell the home channel we're going offline before tearing down. The
+        // notifier's sender is independent of the channel serve loops, so this
+        // still works as they wind down; a bounded timeout keeps a hung network
+        // from blocking shutdown.
+        if let Some(notice) = &shutdown_notice {
+            let send = notice.notify(
+                "⚠️ Shion 已下线",
+                "网关正在停止，暂时无法响应消息，稍后回来。",
+            );
+            match tokio::time::timeout(SHUTDOWN_NOTICE_TIMEOUT, send).await {
+                Ok(Ok(())) => info!("sent shutdown notice to home channel"),
+                Ok(Err(error)) => warn!(%error, "failed to send shutdown notice"),
+                Err(_) => warn!("shutdown notice timed out"),
+            }
+        }
+
         let _ = stop_tx.send(true);
 
         for handle in handles {

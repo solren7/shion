@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::domain::{
-    memory::{Memory, MemoryKind, MemoryRepository, parse_memory_kind},
+    memory::{Memory, MemoryConfidence, MemoryKind, MemoryRepository, parse_memory_kind},
     tool::Tool,
 };
 
@@ -18,6 +18,10 @@ struct MemoryArgs {
     kind: Option<String>,
     #[serde(default)]
     query: Option<String>,
+    /// Optional TTL in days (action=save): the memory is hidden from recall
+    /// once it elapses. Omit for a memory that never expires.
+    #[serde(default)]
+    expiry_days: Option<i64>,
 }
 
 /// Long-term, cross-session memory. The model decides what to remember
@@ -41,9 +45,9 @@ impl Tool for MemoryTool {
 
     fn description(&self) -> &'static str {
         "Persistent long-term memory across sessions. action=\"save\" stores a \
-         fact (optional kind: user | feedback | project | reference); \
-         action=\"search\" returns stored facts matching a query; \
-         action=\"list\" returns all stored facts."
+         fact (optional kind: profile | preference | feedback | project | person | \
+         fact | decision | reference); action=\"search\" returns stored facts \
+         matching a query; action=\"list\" returns all stored facts."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -58,8 +62,12 @@ impl Tool for MemoryTool {
                 "text": { "type": "string", "description": "Fact to store (action=save)." },
                 "kind": {
                     "type": "string",
-                    "enum": ["user", "feedback", "project", "reference"],
-                    "description": "Category of the fact (action=save, default: user)."
+                    "enum": ["profile", "preference", "feedback", "project", "person", "fact", "decision", "reference"],
+                    "description": "Category of the fact (action=save, default: profile)."
+                },
+                "expiry_days": {
+                    "type": "integer",
+                    "description": "Optional TTL in days (action=save); the fact is forgotten after this many days. Omit for a permanent memory."
                 },
                 "query": { "type": "string", "description": "Search term (action=search)." }
             },
@@ -80,8 +88,14 @@ impl Tool for MemoryTool {
                     .kind
                     .as_deref()
                     .map(parse_memory_kind)
-                    .unwrap_or(MemoryKind::User);
-                let memory = Memory::new(kind, text);
+                    .unwrap_or(MemoryKind::Profile);
+                let mut memory = Memory::new(kind, text);
+                // An explicit user save is the highest trust tier.
+                memory.confidence = MemoryConfidence::UserWritten;
+                if let Some(days) = args.expiry_days.filter(|d| *d > 0) {
+                    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                    memory.expires_at = Some(now + days * 86_400);
+                }
                 self.memories.save(&memory).await?;
                 Ok(format!("Saved memory {}.", memory.id))
             }
@@ -116,7 +130,13 @@ fn render(memories: &[Memory]) -> String {
     }
     memories
         .iter()
-        .map(|m| format!("[{}] {}: {}", m.kind.as_str(), m.id, m.content))
+        .map(|m| {
+            let mut line = format!("[{}] {}: {}", m.kind.as_str(), m.id, m.content);
+            if !m.source.is_empty() {
+                line.push_str(&format!(" (from {})", m.source));
+            }
+            line
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

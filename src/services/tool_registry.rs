@@ -1,7 +1,60 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::domain::{error::DomainError, tool::Tool};
+use crate::domain::{error::DomainError, gateway::ReplySink, tool::Tool};
+
+/// Ambient context for the turn a tool is executing within: which session it
+/// belongs to and how to talk back to that conversation. Set by the gateway
+/// dispatcher around a turn (`agent::interaction`) and read by a chat-channel
+/// approver when a tool needs mid-execution approval.
+///
+/// It rides a task-local rather than the tool's argument string because rig's
+/// `ToolDyn::call` signature is fixed — we can't thread it through the LLM
+/// tool-call path. `execute_isolated` re-establishes it across its `spawn`.
+#[derive(Clone)]
+pub struct SessionContext {
+    pub session_id: String,
+    pub sink: Arc<dyn ReplySink>,
+}
+
+impl SessionContext {
+    /// A context that knows the session but cannot talk back mid-turn (its sink
+    /// is a no-op). Used by the REPL and any caller that has a session id but no
+    /// channel to prompt on — enough for session-scoped tools like `todo`, while
+    /// a mid-turn approval prompt simply goes nowhere (the REPL gates approvals
+    /// at the TTY, not through this sink).
+    pub fn detached(session_id: &str) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            sink: Arc::new(NoopSink),
+        }
+    }
+}
+
+/// A [`ReplySink`] that drops everything — see [`SessionContext::detached`].
+struct NoopSink;
+
+#[async_trait::async_trait]
+impl ReplySink for NoopSink {
+    async fn send(&self, _text: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+tokio::task_local! {
+    static SESSION: SessionContext;
+}
+
+/// Run `future` with `ctx` as the ambient session context.
+pub async fn with_session<F: std::future::Future>(ctx: SessionContext, future: F) -> F::Output {
+    SESSION.scope(ctx, future).await
+}
+
+/// The ambient session context, if the current task is running inside one.
+/// `None` for the REPL, aux sub-agents, and maintenance sweeps.
+pub fn current_session() -> Option<SessionContext> {
+    SESSION.try_with(|c| c.clone()).ok()
+}
 
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -51,7 +104,13 @@ impl ToolRegistry {
 /// the LLM function-calling adapter (`infra::rig_tool::RigTool`).
 pub async fn execute_isolated(tool: Arc<dyn Tool>, input: String) -> anyhow::Result<String> {
     let name = tool.name();
-    match tokio::spawn(async move { tool.execute(input).await }).await {
+    // Carry the turn's session context into the spawned task; `tokio::spawn`
+    // starts a fresh task that wouldn't otherwise inherit the task-local.
+    let join = match current_session() {
+        Some(ctx) => tokio::spawn(SESSION.scope(ctx, async move { tool.execute(input).await })),
+        None => tokio::spawn(async move { tool.execute(input).await }),
+    };
+    match join.await {
         Ok(result) => result,
         Err(join_err) if join_err.is_panic() => {
             let panic = join_err.into_panic();

@@ -1,5 +1,10 @@
 pub mod db;
+pub mod feishu;
+pub mod home_notifier;
+pub mod kanban;
 pub mod llm;
 pub mod macos_notifier;
 pub mod md_memory;
+pub mod memory_db;
 pub mod rig_tool;
+pub mod telegram;

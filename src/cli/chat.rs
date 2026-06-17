@@ -6,17 +6,18 @@ use rustyline::error::ReadlineError;
 use crate::{
     cli::{approver::CliApprover, wiring},
     domain::{approval::Approver, repository::SessionRepository, session::Session},
-    infra::db::Db,
+    infra::{db::Db, kanban::KanbanDb},
 };
 
-pub async fn run(db_url: &str) -> anyhow::Result<()> {
+pub async fn run(db_url: &str, kanban_url: &str) -> anyhow::Result<()> {
     let db = Arc::new(Db::connect(db_url).await?);
+    let kanban = Arc::new(KanbanDb::connect(kanban_url).await?);
     // Session ids are program-managed: every run starts a fresh session.
     let mut current_session = new_session_id();
 
     // Interactive approval at the TTY for side-effecting tools.
     let approver: Arc<dyn Approver> = Arc::new(CliApprover::new());
-    let runtime = wiring::build(db.clone(), approver).await?.runtime;
+    let runtime = wiring::build(db.clone(), kanban, approver).await?.runtime;
 
     ensure_session(&db, &current_session).await?;
     println!(
