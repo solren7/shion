@@ -6,6 +6,11 @@ pub const SELF_REVIEW_PROMPT: &str = r#"Review the completed session for durable
 
 Classify insights by ownership:
 - memory: user-disclosed facts, persona, identity, project state, or stable references.
+  Write each as a declarative fact, not an instruction ("User prefers concise replies" ✓,
+  "Always reply concisely" ✗). Prioritize what reduces future steering — a fact that keeps
+  the user from having to correct or remind you again. If a fact will be stale within a
+  week it does not belong in memory: never store task progress, session outcomes,
+  completed-work logs, PR/issue numbers, or commit SHAs.
 - skill: style, tone, format, verbosity, workflow corrections, non-trivial techniques,
   fixes, workarounds, debugging paths, or corrections to a loaded skill.
 - commitment: an open loop the user took on or is waiting on — something they said they

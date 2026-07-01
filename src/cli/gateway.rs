@@ -4,8 +4,8 @@ use std::sync::Arc;
 use crate::{
     agent::{
         daemon::{
-            BriefingSweep, Maintenance, ReminderSweep, ReviewSweep, Schedule, TaskSweep,
-            WorkdayGated,
+            BriefingSweep, DreamSweep, Maintenance, ReminderSweep, ReviewSweep, Schedule,
+            TaskSweep, WorkdayGated,
         },
         gateway::{Gateway, MaintenanceService},
         interaction::{ApprovalState, ChatApprover, GatewayDispatcher},
@@ -19,7 +19,7 @@ use crate::{
         notify::Notifier,
         pairing::PairingRepository,
         reminder::ReminderRepository,
-        repository::{MessageRepository, SessionRepository},
+        repository::{MessageRepository, SessionRepository, SkillRepository},
         run::RunRepository,
         task::TaskRepository,
         todo::SessionTodoRepository,
@@ -49,6 +49,10 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
     // Opt-in daily briefing: parse its schedule now so a typo fails at startup.
     let briefing_expr = crate::config::briefing_schedule();
     let briefing_schedule = briefing_expr.as_deref().map(Schedule::parse).transpose()?;
+    // Opt-in usage-driven memory consolidation ("dreaming"); parse now so a typo
+    // fails at startup.
+    let dream_expr = crate::config::dream_schedule();
+    let dream_schedule = dream_expr.as_deref().map(Schedule::parse).transpose()?;
 
     let db = Arc::new(Db::connect(db_url).await?);
     // Reconcile runs left `Running` by a crashed earlier process (launchd
@@ -104,10 +108,13 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
     // a successful login pulses this so the channel starts polling without a
     // restart.
     let wechat_ready = Arc::new(tokio::sync::Notify::new());
-    let wechat_login: Option<Arc<dyn WeChatLogin>> = wechat_bot.as_ref().map(|_| {
+    let wechat_provisioning = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wechat_login: Option<Arc<dyn WeChatLogin>> = wechat_bot.as_ref().map(|bot| {
         Arc::new(WeChatQrLogin::new(
             wechat_cred_path.clone(),
             wechat_ready.clone(),
+            bot.clone(),
+            wechat_provisioning.clone(),
         )) as Arc<dyn WeChatLogin>
     });
 
@@ -171,6 +178,7 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
         home_repo,
         todos,
         wechat_login,
+        db.clone(),
     ));
     let mut gateway = Gateway::new(dispatcher)
         .with_maintenance(MaintenanceService {
@@ -212,6 +220,19 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
         });
     }
 
+    // Dreaming — only when the user opted in with `dream_schedule`. Reads the
+    // whole memory library, promotes well-recalled candidates to active, and
+    // archives ones that never earned a recall. Never auto-pins.
+    if let Some(schedule) = dream_schedule {
+        let dream_sweep: Arc<dyn Maintenance> = Arc::new(DreamSweep {
+            memories: wired.memories.clone(),
+        });
+        gateway = gateway.with_maintenance(MaintenanceService {
+            schedule,
+            maintenance: dream_sweep,
+        });
+    }
+
     // Senders outside `allow_from` go through the pairing handshake; the
     // pairing store is shared with the `shion pair` CLI via the same db.
     let pairings: Arc<dyn PairingRepository> = db.clone();
@@ -238,6 +259,7 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
             cfg,
             wechat_cred_path.clone(),
             wechat_ready.clone(),
+            wechat_provisioning.clone(),
             pairings.clone(),
         )));
         channels.push("wechat");
@@ -259,7 +281,12 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
     // client. It calls the handler directly (synchronous request/response), so
     // it needs the repositories rather than just the dispatcher. Added last so
     // `/api/status` can report every other channel that came up.
-    if let Some(cfg) = &api {
+    // The api channel is **always on** (see `config::api_config`): it is how the
+    // local `shion` CLI reaches this gateway while we hold the exclusive Turso db
+    // lock. By default it is loopback-only on an ephemeral port (published in the
+    // rendezvous file); `[channels.api] enabled = true` widens it to an external
+    // bind/port for Open WebUI / the dashboard.
+    {
         let enabled = {
             let mut names: Vec<String> = channels.iter().map(|s| s.to_string()).collect();
             names.push("api".to_string());
@@ -268,14 +295,19 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
         let messages: Arc<dyn MessageRepository> = db.clone();
         let runs: Arc<dyn RunRepository> = db.clone();
         let memories: Arc<dyn MemoryRepository> = wired.memories.clone();
+        let reminders: Arc<dyn ReminderRepository> = db.clone();
+        let skills: Arc<dyn SkillRepository> = db.clone();
         gateway = gateway.add_channel(Box::new(ApiChannel::new(
-            cfg,
+            &api,
             handler.clone(),
             db.clone(),
             messages,
             kanban.clone(),
             memories,
             runs,
+            reminders,
+            skills,
+            pairings.clone(),
             enabled,
             config_home.clone(),
         )));
@@ -289,13 +321,16 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
         gateway = gateway.with_shutdown_notice(notifier);
     }
 
-    println!(
-        "Shion gateway — maintenance `{}`, reminders every minute, briefing {}, channels: {}. Ctrl-C to stop.\n",
-        schedule_expr,
-        briefing_expr
-            .as_deref()
+    let fmt_opt = |e: &Option<String>| {
+        e.as_deref()
             .map(|e| format!("`{e}`"))
-            .unwrap_or_else(|| "off".to_string()),
+            .unwrap_or_else(|| "off".to_string())
+    };
+    println!(
+        "Shion gateway — maintenance `{}`, reminders every minute, briefing {}, dreaming {}, channels: {}. Ctrl-C to stop.\n",
+        schedule_expr,
+        fmt_opt(&briefing_expr),
+        fmt_opt(&dream_expr),
         if channels.is_empty() {
             "none".to_string()
         } else {
@@ -303,9 +338,32 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
         }
     );
 
-    gateway
-        .run(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
+    gateway.run(shutdown_signal()).await
+}
+
+/// Resolve when the process is asked to stop. Catches both Ctrl-C (SIGINT, the
+/// foreground case) and SIGTERM — the signal `launchctl bootout` sends when
+/// `shion gateway stop`/`restart` tears the job down. Without the SIGTERM arm
+/// launchd would kill the process before the shutdown notice could be sent.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(term) => term,
+            Err(error) => {
+                tracing::warn!(%error, "failed to install SIGTERM handler; relying on Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

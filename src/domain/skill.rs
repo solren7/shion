@@ -1,6 +1,6 @@
 /// A named capability package: lightweight metadata (`name` + `description`)
 /// plus a full instruction body loaded on demand (progressive disclosure).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Skill {
     pub name: String,
     pub description: String,

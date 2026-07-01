@@ -5,9 +5,9 @@
 //! `set` persists a new selection into `~/.shion/config.toml`. Neither touches
 //! the database or requires the API key to be present.
 
-use crate::config::{self, ApiKeys, FileConfig, Provider, ShionEnv};
+use crate::config::{self, FileConfig, Provider, Secrets, ShionEnv};
 
-fn key_present(keys: &ApiKeys, provider: Provider) -> bool {
+fn key_present(keys: &Secrets, provider: Provider) -> bool {
     keys.key(provider).is_some()
 }
 
@@ -16,7 +16,7 @@ pub fn list() -> anyhow::Result<()> {
     let home = config::ensure_shion_home();
     let file = FileConfig::load(&home);
     let env = ShionEnv::load_lenient();
-    let keys = ApiKeys::load();
+    let keys = Secrets::load();
 
     let provider_str = env
         .provider
@@ -100,7 +100,7 @@ pub fn set(provider_str: &str, model: Option<String>) -> anyhow::Result<()> {
              unset them for this change to take effect"
         );
     }
-    if !key_present(&ApiKeys::load(), provider) {
+    if !key_present(&Secrets::load(), provider) {
         eprintln!(
             "note: {} is not set — add it to {}/.env before using {}",
             provider.api_key_var(),

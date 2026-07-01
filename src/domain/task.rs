@@ -5,7 +5,8 @@
 
 use async_trait::async_trait;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     /// Captured but not yet triaged (replaces a separate InboxItem model).
     Inbox,
@@ -46,7 +47,7 @@ pub fn parse_task_status(s: &str) -> anyhow::Result<TaskStatus> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Task {
     pub id: String,
     pub title: String,

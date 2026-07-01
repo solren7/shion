@@ -42,9 +42,15 @@ pub struct Memory {
     /// Optional governance TTL: a unix timestamp past which the memory is
     /// treated as stale and hidden from recall. `None` = never expires.
     pub expires_at: Option<i64>,
-    /// Last time this memory surfaced in recall, for future usage-based
+    /// Last time this memory surfaced in recall, for usage-based
     /// promotion/archival signals. `None` = never used.
     pub last_used_at: Option<i64>,
+    /// How many times this memory has surfaced in L3 recall. The OpenClaw-style
+    /// "dreaming" signal: importance proven by use, not guessed at write time.
+    /// A candidate that earns enough recalls is auto-promoted to active by the
+    /// `DreamSweep`; one that never does is eventually archived. See
+    /// [`dream_verdict`].
+    pub recall_count: i64,
 }
 
 /// Default ranking weight for a new memory.
@@ -74,6 +80,7 @@ impl Memory {
             updated_at: now,
             expires_at: None,
             last_used_at: None,
+            recall_count: 0,
         }
     }
 
@@ -269,7 +276,6 @@ impl MemoryScope {
 /// can never widen beyond what the context permits.
 #[derive(Debug, Clone)]
 pub struct MemoryContext {
-    pub session_id: String,
     pub allowed_scopes: Vec<MemoryScope>,
 }
 
@@ -286,10 +292,7 @@ impl MemoryContext {
             });
         }
         allowed_scopes.push(MemoryScope::Session(session_id.to_string()));
-        Self {
-            session_id: session_id.to_string(),
-            allowed_scopes,
-        }
+        Self { allowed_scopes }
     }
 
     /// The scope an automated write from this context should carry: the channel
@@ -573,13 +576,21 @@ pub trait MemoryRepository: Send + Sync {
             .find(|m| m.source == source && m.source_message_id == source_message_id))
     }
 
-    /// L3 active recall: the active, in-scope memories most relevant to `text`
-    /// (the current user message), ranked by [`recall_score`], top `limit`.
-    /// Unlike [`search`](MemoryRepository::search) — which substring-matches a
-    /// focused query — recall does token-overlap matching against a whole
-    /// message. Scope/status are enforced here (design principle 3: never widen
-    /// in the render layer). Default runs over [`list`](MemoryRepository::list);
-    /// a store may override the candidate fetch later without changing scoring.
+    /// L3 active recall: the in-scope memories most relevant to `text` (the
+    /// current user message), ranked by [`recall_score`], top `limit`. Unlike
+    /// [`search`](MemoryRepository::search) — which substring-matches a focused
+    /// query — recall does token-overlap matching against a whole message.
+    /// Scope/status are enforced here (design principle 3: never widen in the
+    /// render layer). Default runs over [`list`](MemoryRepository::list); a
+    /// store may override the candidate fetch later without changing scoring.
+    ///
+    /// **Candidates are recallable.** Both `Active` and `Candidate` memories
+    /// surface (only `Archived`/`Rejected` are excluded). This is what makes the
+    /// OpenClaw-style dreaming loop possible: a reviewer-extracted candidate must
+    /// be visible to recall to *earn* its usage signal (`recall_count`), which
+    /// the `DreamSweep` then uses to auto-promote it. Candidates score lower
+    /// (their `Extracted` confidence adds nothing) and the rendered block tags
+    /// each line with confidence, so the model treats them cautiously.
     async fn recall(
         &self,
         ctx: &MemoryContext,
@@ -595,7 +606,7 @@ pub trait MemoryRepository: Send + Sync {
             .list()
             .await?
             .into_iter()
-            .filter(|m| m.status == MemoryStatus::Active)
+            .filter(|m| matches!(m.status, MemoryStatus::Active | MemoryStatus::Candidate))
             .filter(|m| ctx.allows(&m.scope))
             .filter_map(|m| {
                 recall_score(&m, &query_terms, now).map(|score| ScoredMemory { memory: m, score })
@@ -612,18 +623,84 @@ pub trait MemoryRepository: Send + Sync {
         Ok(scored)
     }
 
-    /// Record that memories surfaced in recall, for future usage-based
-    /// promotion/archival signals (Phase 4). Updates only `last_used_at`, never
-    /// `updated_at`, so the recency-decay signal stays tied to real edits.
-    /// Best-effort: ids that no longer resolve are skipped.
+    /// Record that memories surfaced in recall: bump `recall_count` and stamp
+    /// `last_used_at`, never touching `updated_at` so the recency-decay signal
+    /// stays tied to real edits. `recall_count` is the dreaming system's
+    /// usage signal — the more a memory is actually recalled, the stronger its
+    /// case for promotion (see [`dream_verdict`]). Best-effort: ids that no
+    /// longer resolve are skipped.
     async fn mark_used(&self, ids: &[String], now: i64) -> anyhow::Result<()> {
         for id in ids {
             if let Some(mut memory) = self.get(id).await? {
+                memory.recall_count += 1;
                 memory.last_used_at = Some(now);
                 self.save(&memory).await?;
             }
         }
         Ok(())
+    }
+}
+
+// ── dreaming (usage-driven consolidation) ──────────────────────────────────────
+
+/// What the nightly `DreamSweep` should do with a candidate memory, decided
+/// purely from its accumulated usage. Borrowed from OpenClaw's dreaming system,
+/// adapted to shion's governance ladder: instead of promoting daily-journal
+/// fragments into `MEMORY.md`, we promote reviewer-extracted **candidates** into
+/// the active, recallable set — and archive the ones that never earn their keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DreamVerdict {
+    /// Recalled often enough, recently enough → promote to active.
+    Promote,
+    /// Old and never recalled → archive (reversible; not rejected).
+    Archive,
+    /// Leave as-is this cycle.
+    Keep,
+}
+
+/// Minimum recalls a candidate must have earned to be promoted (OpenClaw's
+/// `minRecallCount`, default 3).
+pub const DREAM_MIN_RECALL_COUNT: i64 = 3;
+/// A candidate older than this (days) with no recalls is archived — the
+/// "forget the flotsam" half of dreaming.
+pub const DREAM_FORGET_AGE_DAYS: i64 = 30;
+/// Score a candidate must clear to be promoted (alongside the recall-count gate),
+/// so a barely-relevant fact recalled by coincidence does not auto-promote.
+pub const DREAM_PROMOTE_MIN_SCORE: f64 = 1.0;
+
+/// Dreaming score for a candidate: dominated by recall frequency, nudged by
+/// recency and importance. Explainable and embedding-free, matching the rest of
+/// shion's ranking. Higher = stronger case for promotion. (Query-diversity —
+/// OpenClaw's `minUniqueQueries` — is deliberately omitted: shion tracks a recall
+/// *count*, not per-query provenance, so diversity is deferred to a later phase.)
+pub fn dream_score(memory: &Memory, now: i64) -> f64 {
+    let mut score = memory.recall_count as f64; // each recall = 1.0, the core signal
+    score += memory.importance as f64 / 100.0; // 0..~1
+    // Recency of last use: a 30-day half-life decay, 0 when never used.
+    if let Some(last) = memory.last_used_at {
+        let age_days = (now - last).max(0) as f64 / 86_400.0;
+        score += 0.5 * (-age_days / 30.0).exp();
+    }
+    score
+}
+
+/// Decide a candidate's fate for this dream cycle. Only `Candidate` memories are
+/// ever acted on — active memories (user-saved or already promoted) are left to
+/// the operator (`shion memory report` flags long-unused ones), so dreaming can
+/// never silently retire something the user deliberately kept.
+pub fn dream_verdict(memory: &Memory, now: i64) -> DreamVerdict {
+    if memory.status != MemoryStatus::Candidate {
+        return DreamVerdict::Keep;
+    }
+    let age_days = (now - memory.created_at).max(0) as f64 / 86_400.0;
+    if memory.recall_count >= DREAM_MIN_RECALL_COUNT
+        && dream_score(memory, now) >= DREAM_PROMOTE_MIN_SCORE
+    {
+        DreamVerdict::Promote
+    } else if memory.recall_count == 0 && age_days as i64 > DREAM_FORGET_AGE_DAYS {
+        DreamVerdict::Archive
+    } else {
+        DreamVerdict::Keep
     }
 }
 
@@ -756,6 +833,61 @@ mod tests {
         let s_more = recall_score(&more, &q, now).unwrap();
         let s_fewer = recall_score(&fewer, &q, now).unwrap();
         assert!(s_more > s_fewer, "more overlapping terms must score higher");
+    }
+
+    fn candidate(recall_count: i64, age_days: i64, now: i64) -> Memory {
+        let mut m = Memory::new(MemoryKind::Fact, "the rust toolchain is pinned");
+        m.status = MemoryStatus::Candidate;
+        m.confidence = MemoryConfidence::Extracted;
+        m.created_at = now - age_days * 86_400;
+        m.recall_count = recall_count;
+        if recall_count > 0 {
+            m.last_used_at = Some(now - 86_400); // used yesterday
+        }
+        m
+    }
+
+    #[test]
+    fn dream_promotes_well_recalled_recent_candidate() {
+        let now = 10_000 * 86_400;
+        let m = candidate(DREAM_MIN_RECALL_COUNT, 5, now);
+        assert_eq!(dream_verdict(&m, now), DreamVerdict::Promote);
+    }
+
+    #[test]
+    fn dream_keeps_under_recalled_candidate() {
+        let now = 10_000 * 86_400;
+        // Two recalls — below the threshold of three — and still young.
+        let m = candidate(2, 5, now);
+        assert_eq!(dream_verdict(&m, now), DreamVerdict::Keep);
+    }
+
+    #[test]
+    fn dream_archives_old_never_recalled_candidate() {
+        let now = 10_000 * 86_400;
+        let m = candidate(0, DREAM_FORGET_AGE_DAYS + 1, now);
+        assert_eq!(dream_verdict(&m, now), DreamVerdict::Archive);
+    }
+
+    #[test]
+    fn dream_keeps_young_never_recalled_candidate() {
+        let now = 10_000 * 86_400;
+        // Never recalled but still within the forget window — give it time.
+        let m = candidate(0, DREAM_FORGET_AGE_DAYS - 1, now);
+        assert_eq!(dream_verdict(&m, now), DreamVerdict::Keep);
+    }
+
+    #[test]
+    fn dream_never_touches_active_memories() {
+        let now = 10_000 * 86_400;
+        // An active memory recalled a lot is still left alone (no auto-archive of
+        // user-kept memories), and an old unused active is not archived either.
+        let mut hot = candidate(99, 1, now);
+        hot.status = MemoryStatus::Active;
+        assert_eq!(dream_verdict(&hot, now), DreamVerdict::Keep);
+        let mut cold = candidate(0, DREAM_FORGET_AGE_DAYS + 100, now);
+        cold.status = MemoryStatus::Active;
+        assert_eq!(dream_verdict(&cold, now), DreamVerdict::Keep);
     }
 
     #[test]

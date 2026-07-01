@@ -52,14 +52,48 @@ const HARDLINE_PATTERNS: &[&str] = &[
     "halt",
 ];
 
+/// True if `pattern` occurs in `haystack` (already lowercased) at a command
+/// boundary, not buried inside a larger alphanumeric word. A naive `contains`
+/// flags `terraform apply` and `kill -TERM 1` as the `rm ` pattern, because
+/// "rm " is a substring of "terrafo*rm* " and "-te*rm* 1". We require the char
+/// before the match to be a non-alphanumeric (or start), and — when the pattern
+/// ends in a letter/digit — the char after it likewise, so the pattern lines up
+/// with a real token rather than the middle of one.
+fn matches_at_boundary(haystack: &str, pattern: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let pat = pattern.as_bytes();
+    let pattern_ends_alnum = pat.last().is_some_and(u8::is_ascii_alphanumeric);
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(pattern) {
+        let at = from + rel;
+        let before_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
+        let after = at + pat.len();
+        let after_ok =
+            !pattern_ends_alnum || after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        // The matched pattern starts on an ASCII byte, so `at + 1` is a valid
+        // char boundary to resume the scan from.
+        from = at + 1;
+    }
+    false
+}
+
 fn dangerous_pattern(command: &str) -> Option<&'static str> {
     let lc = command.to_lowercase();
-    DANGEROUS_PATTERNS.iter().copied().find(|p| lc.contains(p))
+    DANGEROUS_PATTERNS
+        .iter()
+        .copied()
+        .find(|p| matches_at_boundary(&lc, p))
 }
 
 fn hardline_pattern(command: &str) -> Option<&'static str> {
     let lc = command.to_lowercase();
-    HARDLINE_PATTERNS.iter().copied().find(|p| lc.contains(p))
+    HARDLINE_PATTERNS
+        .iter()
+        .copied()
+        .find(|p| matches_at_boundary(&lc, p))
 }
 
 #[derive(Deserialize)]
@@ -340,6 +374,24 @@ mod tests {
                 "cmd: {cmd}"
             );
         }
+    }
+
+    #[test]
+    fn dangerous_pattern_matches_at_command_boundary() {
+        // Real dangerous commands still match.
+        assert_eq!(dangerous_pattern("rm -rf foo"), Some("rm "));
+        assert_eq!(dangerous_pattern("git push origin main"), Some("git push"));
+        // ...including when chained after a shell separator.
+        assert_eq!(dangerous_pattern("cd /tmp && rm -rf x"), Some("rm "));
+
+        // `kill -TERM 1` is dangerous because of `kill `, NOT a stray `rm ` buried
+        // in "-te*rm* 1" (the bug that mislabeled the prompt as `rm`).
+        assert_eq!(dangerous_pattern("kill -TERM 1"), Some("kill "));
+
+        // Innocuous commands that merely contain a pattern as a substring inside
+        // a word must not be flagged.
+        assert_eq!(dangerous_pattern("terraform apply"), None);
+        assert_eq!(dangerous_pattern("echo perform task"), None);
     }
 
     #[test]

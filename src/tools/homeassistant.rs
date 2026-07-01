@@ -90,11 +90,17 @@ impl HomeAssistantTool {
             .bearer_auth(&self.token)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("request to Home Assistant failed: {e}"))?;
+            .map_err(|e| {
+                crate::tools::http::transport_error(e, "request to Home Assistant failed")
+            })?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            anyhow::bail!("Home Assistant returned HTTP {status}: {body}");
+            return Err(crate::tools::http::status_error(
+                status,
+                "Home Assistant",
+                &body,
+            ));
         }
         serde_json::from_str(&body)
             .map_err(|e| anyhow::anyhow!("invalid JSON from Home Assistant: {e}"))
@@ -282,11 +288,17 @@ impl Tool for HomeAssistantTool {
                     .json(&body)
                     .send()
                     .await
-                    .map_err(|e| anyhow::anyhow!("request to Home Assistant failed: {e}"))?;
+                    .map_err(|e| {
+                        crate::tools::http::transport_error(e, "request to Home Assistant failed")
+                    })?;
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
                 if !status.is_success() {
-                    anyhow::bail!("Home Assistant returned HTTP {status}: {text}");
+                    return Err(crate::tools::http::status_error(
+                        status,
+                        "Home Assistant",
+                        &text,
+                    ));
                 }
                 // The response is the array of entities that changed state.
                 let changed = serde_json::from_str::<Value>(&text)
@@ -364,11 +376,17 @@ impl Tool for HomeAssistantTool {
                     .json(&config)
                     .send()
                     .await
-                    .map_err(|e| anyhow::anyhow!("request to Home Assistant failed: {e}"))?;
+                    .map_err(|e| {
+                        crate::tools::http::transport_error(e, "request to Home Assistant failed")
+                    })?;
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
                 if !status.is_success() {
-                    anyhow::bail!("Home Assistant returned HTTP {status}: {text}");
+                    return Err(crate::tools::http::status_error(
+                        status,
+                        "Home Assistant",
+                        &text,
+                    ));
                 }
                 Ok(format!(
                     "Saved automation {id}{name}; HA reloaded automations."
@@ -404,11 +422,17 @@ impl Tool for HomeAssistantTool {
                     .bearer_auth(&self.token)
                     .send()
                     .await
-                    .map_err(|e| anyhow::anyhow!("request to Home Assistant failed: {e}"))?;
+                    .map_err(|e| {
+                        crate::tools::http::transport_error(e, "request to Home Assistant failed")
+                    })?;
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
                 if !status.is_success() {
-                    anyhow::bail!("Home Assistant returned HTTP {status}: {text}");
+                    return Err(crate::tools::http::status_error(
+                        status,
+                        "Home Assistant",
+                        &text,
+                    ));
                 }
                 Ok(format!("Deleted automation {id}; HA reloaded automations."))
             }

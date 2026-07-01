@@ -25,6 +25,12 @@ pub enum ActionRef {
     /// A filesystem access (`file` tool). Matched against the path.
     File { path: PathBuf, write: bool },
     /// An outbound network fetch (`web_fetch`). Matched against the URL's host.
+    ///
+    /// Constructed by no tool yet — `web_fetch` runs un-gated — but it is *not*
+    /// dead: the policy layer matches it (`domain::policy`) and config exposes a
+    /// `network` rule category, so the capability is wired end-to-end and waiting
+    /// only for a tool to route network access through the approver.
+    #[allow(dead_code)]
     Network { url: String },
     /// A Home Assistant service call, matched as `domain.service`.
     Service { domain: String, service: String },

@@ -102,6 +102,9 @@ mod tests {
         async fn find(&self, _id: &str) -> anyhow::Result<Option<Session>> {
             Ok(None)
         }
+        async fn find_windowed(&self, _id: &str, _limit: usize) -> anyhow::Result<Option<Session>> {
+            Ok(None)
+        }
         async fn list(&self) -> anyhow::Result<Vec<Session>> {
             Ok(self.0.clone())
         }

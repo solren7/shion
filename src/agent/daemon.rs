@@ -77,6 +77,10 @@ pub struct MaintenanceSummary {
     pub tasks_captured: usize,
     /// Daily briefings composed and delivered this sweep (0 or 1).
     pub briefings_sent: usize,
+    /// Candidate memories the dream sweep promoted to active this cycle.
+    pub memories_promoted: usize,
+    /// Candidate memories the dream sweep archived (never earned a recall) this cycle.
+    pub memories_archived: usize,
 }
 
 /// The fixed maintenance action: review every stored session that has at least
@@ -110,6 +114,77 @@ impl Maintenance for ReviewSweep {
             }
         }
         Ok(summary)
+    }
+}
+
+/// The "dreaming" consolidation sweep (OpenClaw's dreaming, adapted to shion's
+/// governance ladder). Runs on a low-frequency schedule (e.g. nightly `0 3 * * *`)
+/// and decides each candidate memory's fate purely from its accumulated usage:
+/// a candidate recalled often enough is promoted to active (and so becomes
+/// eligible for L3 recall going forward), while one that is old and never
+/// recalled is archived. **Importance is proven by use, not guessed at write
+/// time.** Only candidates are ever touched — user-saved/active memories are left
+/// to the operator (`shion memory report`) — and nothing is ever auto-*pinned*:
+/// dreaming can promote into recall (L3) but never into the always-injected
+/// profile (L1), which stays a manual, confirmed-only path.
+///
+/// On by default (nightly `0 3 * * *` via `dream_schedule`; set it to `"off"` to
+/// disable). Wired in `cli/gateway.rs`.
+pub struct DreamSweep {
+    pub memories: Arc<dyn MemoryRepository>,
+}
+
+impl DreamSweep {
+    /// Apply one dream cycle over all memories, returning what changed. Shared by
+    /// the scheduled sweep and the `shion dream --apply` CLI. A promotion lifts a
+    /// candidate to `Active` with `Inferred` confidence — usage-proven, but not
+    /// user-confirmed, so it surfaces in recall yet stays ineligible for L1
+    /// pinning (which requires confirmed/user-written). Per-memory failures are
+    /// logged and skipped, never aborting the cycle.
+    pub async fn apply(&self) -> anyhow::Result<MaintenanceSummary> {
+        use crate::domain::memory::{DreamVerdict, MemoryConfidence, MemoryStatus, dream_verdict};
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut summary = MaintenanceSummary::default();
+        for mut memory in self.memories.list().await? {
+            match dream_verdict(&memory, now) {
+                DreamVerdict::Promote => {
+                    memory.status = MemoryStatus::Active;
+                    memory.confidence = MemoryConfidence::Inferred;
+                    memory.updated_at = now;
+                    match self.memories.save(&memory).await {
+                        Ok(()) => {
+                            summary.memories_promoted += 1;
+                            info!(id = %memory.id, recalls = memory.recall_count, "dream: promoted candidate to active");
+                        }
+                        Err(error) => {
+                            warn!(%error, id = %memory.id, "dream: promote failed (skipped)")
+                        }
+                    }
+                }
+                DreamVerdict::Archive => {
+                    memory.status = MemoryStatus::Archived;
+                    memory.updated_at = now;
+                    match self.memories.save(&memory).await {
+                        Ok(()) => {
+                            summary.memories_archived += 1;
+                            info!(id = %memory.id, "dream: archived unused candidate");
+                        }
+                        Err(error) => {
+                            warn!(%error, id = %memory.id, "dream: archive failed (skipped)")
+                        }
+                    }
+                }
+                DreamVerdict::Keep => {}
+            }
+        }
+        Ok(summary)
+    }
+}
+
+#[async_trait]
+impl Maintenance for DreamSweep {
+    async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
+        self.apply().await
     }
 }
 
@@ -478,6 +553,8 @@ where
                     reminders = summary.reminders_fired,
                     tasks_captured = summary.tasks_captured,
                     briefings = summary.briefings_sent,
+                    promoted = summary.memories_promoted,
+                    archived = summary.memories_archived,
                     elapsed_s = started.elapsed().as_secs(),
                     "maintenance cycle complete"
                 );
@@ -1023,6 +1100,96 @@ mod tests {
         let summary = sweep.run().await.unwrap();
         assert_eq!(summary.briefings_sent, 0);
         assert!(notifier.calls.lock().unwrap().is_empty());
+    }
+
+    // ── DreamSweep ────────────────────────────────────────────────────────────
+
+    use crate::domain::memory::{
+        DREAM_FORGET_AGE_DAYS, DREAM_MIN_RECALL_COUNT, MemoryConfidence, MemoryStatus,
+    };
+
+    /// A `FakeMemories` whose `save` overwrites by id (the real store is
+    /// create-or-replace), so a promotion is observable on the next `list`.
+    #[derive(Default)]
+    struct OverwriteMemories(Mutex<Vec<Memory>>);
+
+    #[async_trait]
+    impl MemoryRepository for OverwriteMemories {
+        async fn list(&self) -> anyhow::Result<Vec<Memory>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        async fn save(&self, memory: &Memory) -> anyhow::Result<()> {
+            let mut mems = self.0.lock().unwrap();
+            if let Some(slot) = mems.iter_mut().find(|m| m.id == memory.id) {
+                *slot = memory.clone();
+            } else {
+                mems.push(memory.clone());
+            }
+            Ok(())
+        }
+    }
+
+    fn dream_candidate(id: &str, recall_count: i64, age_days: i64, now: i64) -> Memory {
+        let mut m = Memory::new(MemoryKind::Fact, "a candidate fact");
+        m.id = id.to_string();
+        m.status = MemoryStatus::Candidate;
+        m.confidence = MemoryConfidence::Extracted;
+        m.created_at = now - age_days * 86_400;
+        m.recall_count = recall_count;
+        if recall_count > 0 {
+            m.last_used_at = Some(now - 86_400);
+        }
+        m
+    }
+
+    #[tokio::test]
+    async fn dream_sweep_promotes_and_archives() {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let promote = dream_candidate("mem-promote", DREAM_MIN_RECALL_COUNT, 5, now);
+        let archive = dream_candidate("mem-archive", 0, DREAM_FORGET_AGE_DAYS + 5, now);
+        let keep = dream_candidate("mem-keep", 0, 1, now); // young, never recalled
+        let (pid, aid, kid) = (promote.id.clone(), archive.id.clone(), keep.id.clone());
+
+        let repo = Arc::new(OverwriteMemories(Mutex::new(vec![promote, archive, keep])));
+        let sweep = DreamSweep {
+            memories: repo.clone(),
+        };
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.memories_promoted, 1);
+        assert_eq!(summary.memories_archived, 1);
+
+        let mems = repo.0.lock().unwrap();
+        let by_id = |id: &str| mems.iter().find(|m| m.id == id).unwrap();
+        // Promoted → active + inferred (usage-proven, not user-confirmed), so it
+        // recalls but stays ineligible for L1 pinning.
+        assert_eq!(by_id(&pid).status, MemoryStatus::Active);
+        assert_eq!(by_id(&pid).confidence, MemoryConfidence::Inferred);
+        assert_eq!(by_id(&aid).status, MemoryStatus::Archived);
+        assert_eq!(by_id(&kid).status, MemoryStatus::Candidate);
+    }
+
+    #[tokio::test]
+    async fn dream_sweep_never_promotes_to_pinnable() {
+        // Even a heavily-recalled promotion must not become L1-eligible: pinning
+        // stays a manual, confirmed-only path.
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut m = dream_candidate("mem-hot", 99, 1, now);
+        m.kind = MemoryKind::Preference; // an identity kind
+        let id = m.id.clone();
+        let repo = Arc::new(OverwriteMemories(Mutex::new(vec![m])));
+        DreamSweep {
+            memories: repo.clone(),
+        }
+        .run()
+        .await
+        .unwrap();
+        let mems = repo.0.lock().unwrap();
+        let promoted = mems.iter().find(|m| m.id == id).unwrap();
+        let ctx = crate::domain::memory::MemoryContext::from_session("cli");
+        assert!(
+            !promoted.is_pinnable(&ctx, now),
+            "auto-promoted memory must not be pinnable"
+        );
     }
 
     // ── WorkdayGated ──────────────────────────────────────────────────────────

@@ -32,22 +32,6 @@ impl Message {
             timestamp: now(),
         }
     }
-
-    pub fn tool(content: impl Into<String>) -> Self {
-        Self {
-            role: Role::Tool,
-            content: content.into(),
-            timestamp: now(),
-        }
-    }
-
-    pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: Role::System,
-            content: content.into(),
-            timestamp: now(),
-        }
-    }
 }
 
 fn now() -> i64 {

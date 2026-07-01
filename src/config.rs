@@ -10,15 +10,20 @@ pub enum Provider {
     OpenAi,
     Anthropic,
     OpenRouter,
+    /// OpenAI Codex via the ChatGPT backend, authenticated with the Codex CLI's
+    /// OAuth tokens (`~/.codex/auth.json`) rather than an API key. See
+    /// `infra/codex.rs`.
+    Codex,
 }
 
 impl Provider {
     /// Every supported provider, in display order.
-    pub const ALL: [Provider; 4] = [
+    pub const ALL: [Provider; 5] = [
         Provider::DeepSeek,
         Provider::OpenAi,
         Provider::Anthropic,
         Provider::OpenRouter,
+        Provider::Codex,
     ];
 
     pub fn parse(s: &str) -> anyhow::Result<Self> {
@@ -27,9 +32,10 @@ impl Provider {
             "openai" | "oai" | "gpt" => Provider::OpenAi,
             "anthropic" | "claude" => Provider::Anthropic,
             "openrouter" | "or" => Provider::OpenRouter,
+            "codex" | "openai-codex" => Provider::Codex,
             other => anyhow::bail!(
                 "unknown provider `{other}` \
-                 (expected: deepseek | openai | anthropic | openrouter)"
+                 (expected: deepseek | openai | anthropic | openrouter | codex)"
             ),
         })
     }
@@ -41,6 +47,7 @@ impl Provider {
             Provider::OpenAi => "openai",
             Provider::Anthropic => "anthropic",
             Provider::OpenRouter => "openrouter",
+            Provider::Codex => "codex",
         }
     }
 
@@ -51,17 +58,30 @@ impl Provider {
             Provider::OpenAi => "gpt-4o-mini",
             Provider::Anthropic => "claude-3-5-sonnet-latest",
             Provider::OpenRouter => "deepseek/deepseek-chat",
+            // A slug the ChatGPT Codex backend currently accepts (others seen:
+            // gpt-5.4, gpt-5.4-mini). Account-/tier-dependent — override via
+            // config.toml `model`; discover live at GET /codex/models.
+            Provider::Codex => "gpt-5.5",
         }
     }
 
-    /// Environment variable holding this provider's API key.
+    /// Environment variable holding this provider's API key. Codex has none —
+    /// it authenticates from `~/.codex/auth.json` (see [`Provider::uses_api_key`]).
     pub fn api_key_var(self) -> &'static str {
         match self {
             Provider::DeepSeek => "DEEPSEEK_API_KEY",
             Provider::OpenAi => "OPENAI_API_KEY",
             Provider::Anthropic => "ANTHROPIC_API_KEY",
             Provider::OpenRouter => "OPENROUTER_API_KEY",
+            Provider::Codex => "",
         }
+    }
+
+    /// Whether this provider authenticates with an environment API key.
+    /// Codex is the exception: its credentials come from the Codex CLI's OAuth
+    /// login, resolved at build time in `infra/codex.rs`.
+    pub fn uses_api_key(self) -> bool {
+        !matches!(self, Provider::Codex)
     }
 }
 
@@ -94,8 +114,10 @@ pub struct ShionEnv {
     pub schedule: Option<String>,
     pub briefing_schedule: Option<String>,
     pub briefing_workdays_only: Option<bool>,
+    pub dream_schedule: Option<String>,
     pub max_turns: Option<usize>,
     pub max_tool_result_bytes: Option<usize>,
+    pub max_history_messages: Option<usize>,
     pub review_interval: Option<usize>,
     pub skills_path: Option<String>,
 }
@@ -129,6 +151,7 @@ impl ShionEnv {
             &mut self.aux_model,
             &mut self.schedule,
             &mut self.briefing_schedule,
+            &mut self.dream_schedule,
             &mut self.skills_path,
         ] {
             if slot.as_deref().is_some_and(|s| s.is_empty()) {
@@ -139,27 +162,45 @@ impl ShionEnv {
     }
 }
 
-/// Provider API keys, read from the (unprefixed) environment via envy.
+/// Every credential shion reads, loaded once from the environment (and thus from
+/// `~/.shion/.env`, which dotenvy folds into the process env at startup) via
+/// envy. Secrets live ONLY here, never in `config.toml` — keeping behavior (the
+/// `*FileConfig` types) and secrets (this one) in separate types is shion's
+/// security boundary, which a single merged config would erode. envy maps each
+/// field to its SCREAMING_SNAKE_CASE name, so `feishu_app_id` reads `FEISHU_APP_ID`
+/// — the per-channel prefixes are encoded in the field names, no `envy::prefixed`
+/// call per channel. All fields are private; the channel resolvers in this module
+/// read them directly, and external callers go through [`Secrets::key`].
 #[derive(Debug, Deserialize, Default)]
-pub struct ApiKeys {
+pub struct Secrets {
+    // Provider API keys (their env vars are unprefixed).
     deepseek_api_key: Option<String>,
     openai_api_key: Option<String>,
     anthropic_api_key: Option<String>,
     openrouter_api_key: Option<String>,
+    // Channel credentials (formerly the per-channel `*Env` structs).
+    feishu_app_id: Option<String>,
+    feishu_app_secret: Option<String>,
+    telegram_bot_token: Option<String>,
+    api_server_key: Option<String>,
+    hass_token: Option<String>,
+    hass_url: Option<String>,
 }
 
-impl ApiKeys {
+impl Secrets {
     pub fn load() -> Self {
         envy::from_env().unwrap_or_default()
     }
 
-    /// The key for `provider`, treating empty strings as unset.
+    /// The API key for `provider`, treating empty strings as unset.
     pub fn key(&self, provider: Provider) -> Option<&str> {
         let slot = match provider {
             Provider::DeepSeek => &self.deepseek_api_key,
             Provider::OpenAi => &self.openai_api_key,
             Provider::Anthropic => &self.anthropic_api_key,
             Provider::OpenRouter => &self.openrouter_api_key,
+            // Codex has no env API key (OAuth via ~/.codex/auth.json).
+            Provider::Codex => return None,
         };
         slot.as_deref().filter(|s| !s.is_empty())
     }
@@ -185,26 +226,31 @@ pub fn ensure_shion_home() -> PathBuf {
     home
 }
 
-/// Default database URL: `sqlite:<shion_home>/shion.db`.
-/// Creates the config directory on first use so SQLite can create the file.
+/// `turso:<shion_home>/<file>` (Turso engine). Creates the config directory on
+/// first use so the engine can create the database file.
+fn db_url(file: &str) -> String {
+    format!("turso:{}", ensure_shion_home().join(file).display())
+}
+
+/// Default database URL: `turso:<shion_home>/shion.db` (Turso engine).
 /// Holds disposable state (sessions, messages, session todos, pairings,
 /// reminders, skills, settings) — deletable to reset.
 pub fn default_db_url() -> String {
-    format!("sqlite:{}", ensure_shion_home().join("shion.db").display())
+    db_url("shion.db")
 }
 
-/// Kanban database URL: `sqlite:<shion_home>/kanban.db`. Durable cross-session
+/// Kanban database URL: `turso:<shion_home>/kanban.db`. Durable cross-session
 /// tasks live here, separate from `shion.db` so resetting the latter never
 /// wipes real task data.
 pub fn default_kanban_db_url() -> String {
-    format!("sqlite:{}", ensure_shion_home().join("kanban.db").display())
+    db_url("kanban.db")
 }
 
-/// Memory database URL: `sqlite:<shion_home>/memory.db`. Durable long-term
+/// Memory database URL: `turso:<shion_home>/memory.db`. Durable long-term
 /// memories live here, separate from `shion.db` (like `kanban.db`) so resetting
 /// the session db never wipes real personal data.
 pub fn default_memory_db_url() -> String {
-    format!("sqlite:{}", ensure_shion_home().join("memory.db").display())
+    db_url("memory.db")
 }
 
 /// Maintenance cron schedule: `SHION_SCHEDULE` env > config.toml `schedule`
@@ -224,6 +270,43 @@ pub fn briefing_schedule() -> Option<String> {
     ShionEnv::load_lenient()
         .briefing_schedule
         .or_else(|| FileConfig::load(&shion_home()).briefing_schedule)
+}
+
+/// Default dreaming-sweep schedule: nightly at 3am, mirroring OpenClaw's
+/// dreaming. Unlike the briefing (proactive notifications → opt-in), dreaming is
+/// internal memory housekeeping with no user-facing output, so it is **on by
+/// default**.
+pub const DEFAULT_DREAM_SCHEDULE: &str = "0 3 * * *";
+
+/// Dreaming-sweep cron schedule: `SHION_DREAM_SCHEDULE` env > config.toml
+/// `dream_schedule` > [`DEFAULT_DREAM_SCHEDULE`]. The usage-driven memory
+/// consolidation runs by default; to disable it set `dream_schedule = "off"`
+/// (or empty). `None` means disabled — wiring then skips the sweep entirely.
+pub fn dream_schedule() -> Option<String> {
+    let configured = ShionEnv::load_lenient()
+        .dream_schedule
+        .or_else(|| FileConfig::load(&shion_home()).dream_schedule);
+    resolve_dream_schedule(configured)
+}
+
+/// Pure resolution of the dreaming schedule from its configured value: unset →
+/// the default; empty or `off`/`none`/`disabled` → `None` (off); anything else
+/// is taken as the cron expression. Split out so the default-on / opt-out logic
+/// is testable without touching the real env or config file.
+fn resolve_dream_schedule(configured: Option<String>) -> Option<String> {
+    match configured {
+        Some(s)
+            if s.trim().is_empty()
+                || matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "off" | "none" | "disabled"
+                ) =>
+        {
+            None
+        }
+        Some(s) => Some(s),
+        None => Some(DEFAULT_DREAM_SCHEDULE.to_string()),
+    }
 }
 
 /// Whether the daily briefing should only fire on Chinese working days
@@ -262,12 +345,21 @@ pub struct FileConfig {
     /// Gate the daily briefing to Chinese working days only (statutory holidays
     /// and 调休-adjusted weekends respected). Default false.
     pub briefing_workdays_only: Option<bool>,
+    /// 5-field Unix cron expression for the usage-driven memory "dreaming" sweep.
+    /// Unset = on by default (nightly `0 3 * * *`); set to `"off"` (or empty) to
+    /// disable.
+    pub dream_schedule: Option<String>,
     /// Maximum tool-calling round-trips per user turn (default: 30).
     pub max_turns: Option<usize>,
     /// Byte cap on a tool result handed back to the LLM, a global backstop
     /// against context-window bloat (default: 16384). See
     /// `services::tool_registry::cap_tool_result`.
     pub max_tool_result_bytes: Option<usize>,
+    /// Max prior messages replayed as history per turn — the global backstop
+    /// against an ever-growing chat session sending its whole transcript to the
+    /// model every turn (default: 50; `0` = unlimited). See
+    /// `infra::llm::RigLlm::assemble`.
+    pub max_history_messages: Option<usize>,
     /// Ingress channel declarations (`[channels.*]` tables), shaped after
     /// hermes-agent's per-platform config blocks.
     pub channels: Option<ChannelsFileConfig>,
@@ -369,6 +461,18 @@ pub struct ChannelsFileConfig {
     pub api: Option<ApiFileConfig>,
 }
 
+/// Resolve a required channel credential read from `~/.shion/.env`. Channels
+/// keep secrets in the environment, never in `config.toml`; when a channel is
+/// `enabled` but its secret is absent (or empty), fail fast at startup with one
+/// uniform message instead of silently starting a half-configured channel.
+fn require_secret(value: Option<String>, channel: &str, var: &str) -> anyhow::Result<String> {
+    value.filter(|s| !s.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "[channels.{channel}] is enabled but {var} is not set (put it in ~/.shion/.env)"
+        )
+    })
+}
+
 /// `[channels.homeassistant]` table: HA as an event-ingress channel. The URL
 /// and token are *not* here — they come from `HASS_URL` / `HASS_TOKEN` (shared
 /// with the `homeassistant` tool). This table only carries event-filter
@@ -444,13 +548,6 @@ pub struct FeishuFileConfig {
     pub home_chat: Option<String>,
 }
 
-/// `FEISHU_*` app credentials from the environment (`~/.shion/.env`).
-#[derive(Debug, Deserialize, Default)]
-struct FeishuEnv {
-    app_id: Option<String>,
-    app_secret: Option<String>,
-}
-
 /// Resolved Feishu channel settings.
 pub struct FeishuConfig {
     pub app_id: String,
@@ -479,12 +576,6 @@ pub struct TelegramFileConfig {
     pub home_chat: Option<String>,
 }
 
-/// `TELEGRAM_*` bot credentials from the environment (`~/.shion/.env`).
-#[derive(Debug, Deserialize, Default)]
-struct TelegramEnv {
-    bot_token: Option<String>,
-}
-
 /// Resolved Telegram channel settings.
 pub struct TelegramConfig {
     pub bot_token: String,
@@ -497,16 +588,6 @@ pub struct TelegramConfig {
 /// Default Home Assistant URL when `HASS_URL` is unset.
 const DEFAULT_HASS_URL: &str = "http://homeassistant.local:8123";
 
-/// `HASS_*` Home Assistant settings from the environment (`~/.shion/.env`).
-/// Unlike the other backends, HA keeps both its URL and its token in `.env` as
-/// one self-contained block (`HASS_TOKEN` required, `HASS_URL` optional) rather
-/// than splitting the URL into config.toml.
-#[derive(Debug, Deserialize, Default)]
-struct HomeAssistantEnv {
-    token: Option<String>,
-    url: Option<String>,
-}
-
 /// Resolved Home Assistant settings.
 pub struct HomeAssistantConfig {
     pub base_url: String,
@@ -517,10 +598,10 @@ pub struct HomeAssistantConfig {
 /// (required) and `HASS_URL` (optional, defaults to homeassistant.local:8123).
 /// `None` means no token is set, so the `homeassistant` tool is not registered.
 pub fn homeassistant_config() -> Option<HomeAssistantConfig> {
-    let env: HomeAssistantEnv = envy::prefixed("HASS_").from_env().unwrap_or_default();
-    let token = env.token.filter(|s| !s.is_empty())?;
-    let base_url = env
-        .url
+    let secrets = Secrets::load();
+    let token = secrets.hass_token.filter(|s| !s.is_empty())?;
+    let base_url = secrets
+        .hass_url
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_HASS_URL.to_string());
     Some(HomeAssistantConfig {
@@ -541,12 +622,11 @@ pub fn telegram_config() -> anyhow::Result<Option<TelegramConfig>> {
     if !telegram.enabled {
         return Ok(None);
     }
-    let env: TelegramEnv = envy::prefixed("TELEGRAM_").from_env().unwrap_or_default();
-    let bot_token = env.bot_token.filter(|s| !s.is_empty()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "[channels.telegram] is enabled but TELEGRAM_BOT_TOKEN is not set (put it in ~/.shion/.env)"
-        )
-    })?;
+    let bot_token = require_secret(
+        Secrets::load().telegram_bot_token,
+        "telegram",
+        "TELEGRAM_BOT_TOKEN",
+    )?;
     Ok(Some(TelegramConfig {
         bot_token,
         allow_from: telegram.allow_from,
@@ -565,55 +645,69 @@ const DEFAULT_API_PORT: u16 = 8765;
 /// `[channels.api]` table: the OpenAI-compatible + dashboard HTTP API. The
 /// bearer key never lives here — it is read from `API_SERVER_KEY` (in
 /// `~/.shion/.env`), like the other channels' credentials.
+///
+/// The api channel is **always on**: the `shion` CLI (and `shion chat`) reach a
+/// running gateway through it, because Turso's exclusive db lock means the CLI
+/// can't open the db itself while the gateway holds it. `enabled = true` widens
+/// it from the default loopback-only, ephemeral-port, CLI-only listener to an
+/// **externally reachable** one on a stable `bind`/`port` (for Open WebUI / the
+/// dashboard), and then `API_SERVER_KEY` is required.
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct ApiFileConfig {
+    /// Expose the api externally on a stable address (requires `API_SERVER_KEY`).
+    /// When false/absent the channel still runs, but loopback-only on an
+    /// ephemeral port with an auto-generated key — enough for the local CLI.
     pub enabled: bool,
     /// Bind address (default `127.0.0.1`). Set `0.0.0.0` only behind a trusted
     /// proxy — the key is the only auth.
     pub bind: Option<String>,
-    /// Listen port (default 8765).
+    /// Listen port (default 8765 when `enabled`; an ephemeral port otherwise).
     pub port: Option<u16>,
-}
-
-/// `API_*` server credentials from the environment (`~/.shion/.env`).
-#[derive(Debug, Deserialize, Default)]
-struct ApiEnv {
-    server_key: Option<String>,
 }
 
 /// Resolved HTTP API channel settings.
 pub struct ApiConfig {
     pub bind: String,
+    /// `0` means "let the OS assign an ephemeral port" — the actual port is read
+    /// back after bind and published in the rendezvous file for the CLI.
     pub port: u16,
     pub server_key: String,
 }
 
-/// Resolve the HTTP API channel config. `None` means the channel is not
-/// enabled; an error means it is enabled but `API_SERVER_KEY` is missing
-/// (fail fast at startup — a keyless API is never started).
-pub fn api_config() -> anyhow::Result<Option<ApiConfig>> {
+/// Resolve the (always-on) HTTP API channel config. An error means the channel
+/// is explicitly `enabled` for external use but `API_SERVER_KEY` is missing
+/// (fail fast — a keyless externally-bound API is never started). When not
+/// enabled, the channel still runs loopback-only with a generated key so the
+/// local CLI can always reach a running gateway.
+pub fn api_config() -> anyhow::Result<ApiConfig> {
     let file = FileConfig::load(&shion_home());
-    let Some(api) = file.channels.and_then(|c| c.api) else {
-        return Ok(None);
-    };
-    if !api.enabled {
-        return Ok(None);
-    }
-    let env: ApiEnv = envy::prefixed("API_").from_env().unwrap_or_default();
-    let server_key = env.server_key.filter(|s| !s.is_empty()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "[channels.api] is enabled but API_SERVER_KEY is not set (put it in ~/.shion/.env)"
-        )
-    })?;
-    Ok(Some(ApiConfig {
-        bind: api
-            .bind
+    let api = file.channels.and_then(|c| c.api).unwrap_or_default();
+    if api.enabled {
+        // Externally reachable: honor the configured bind/port and require a key.
+        let server_key = require_secret(Secrets::load().api_server_key, "api", "API_SERVER_KEY")?;
+        Ok(ApiConfig {
+            bind: api
+                .bind
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_API_BIND.to_string()),
+            port: api.port.unwrap_or(DEFAULT_API_PORT),
+            server_key,
+        })
+    } else {
+        // Always-on, loopback-only, CLI-facing: ephemeral port (discovered via
+        // the rendezvous file), and the configured key if any, else a generated
+        // one. Loopback-only, so a v4 token is ample.
+        let server_key = Secrets::load()
+            .api_server_key
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_API_BIND.to_string()),
-        port: api.port.unwrap_or(DEFAULT_API_PORT),
-        server_key,
-    }))
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        Ok(ApiConfig {
+            bind: DEFAULT_API_BIND.to_string(),
+            port: 0,
+            server_key,
+        })
+    }
 }
 
 /// `[channels.wechat]` table: WeChat (微信) over the iLink personal-bot
@@ -674,20 +768,9 @@ pub fn feishu_config() -> anyhow::Result<Option<FeishuConfig>> {
     if !feishu.enabled {
         return Ok(None);
     }
-    let env: FeishuEnv = envy::prefixed("FEISHU_").from_env().unwrap_or_default();
-    let missing = |var: &'static str| {
-        anyhow::anyhow!(
-            "[channels.feishu] is enabled but {var} is not set (put it in ~/.shion/.env)"
-        )
-    };
-    let app_id = env
-        .app_id
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| missing("FEISHU_APP_ID"))?;
-    let app_secret = env
-        .app_secret
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| missing("FEISHU_APP_SECRET"))?;
+    let secrets = Secrets::load();
+    let app_id = require_secret(secrets.feishu_app_id, "feishu", "FEISHU_APP_ID")?;
+    let app_secret = require_secret(secrets.feishu_app_secret, "feishu", "FEISHU_APP_SECRET")?;
     Ok(Some(FeishuConfig {
         app_id,
         app_secret,
@@ -776,6 +859,8 @@ pub struct ModelConfig {
     pub max_turns: usize,
     /// Byte cap on a tool result handed back to the LLM (global backstop).
     pub max_tool_result_bytes: usize,
+    /// Max prior messages replayed as history per turn (`0` = unlimited).
+    pub max_history_messages: usize,
 }
 
 /// Built-in default for `max_turns` when neither `SHION_MAX_TURNS` nor
@@ -788,6 +873,13 @@ pub const DEFAULT_MAX_TURNS: usize = 30;
 /// catches tools that don't self-trim.
 pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 16 * 1024;
 
+/// Built-in default for `max_history_messages` when neither
+/// `SHION_MAX_HISTORY_MESSAGES` nor config.toml sets one. Counts prior messages
+/// (user + assistant alternating, so ~25 turns), enough context for a chat
+/// assistant while keeping a long-lived session's per-turn cost bounded. `0`
+/// disables the window (replay the whole transcript, the pre-windowing behavior).
+pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
+
 impl fmt::Debug for ModelConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ModelConfig")
@@ -798,6 +890,7 @@ impl fmt::Debug for ModelConfig {
             .field("aux_model", &self.aux_model)
             .field("max_turns", &self.max_turns)
             .field("max_tool_result_bytes", &self.max_tool_result_bytes)
+            .field("max_history_messages", &self.max_history_messages)
             .finish()
     }
 }
@@ -835,11 +928,19 @@ impl ModelConfig {
             .or(file.model)
             .unwrap_or_else(|| provider.default_model().to_string());
 
-        let key_var = provider.api_key_var();
-        let api_key = ApiKeys::load()
-            .key(provider)
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("{key_var} is not set (required for {provider:?})"))?;
+        // Codex authenticates from `~/.codex/auth.json`, not an env key — its
+        // `api_key` field stays empty and is resolved in `infra/codex.rs`.
+        let api_key = if provider.uses_api_key() {
+            let key_var = provider.api_key_var();
+            Secrets::load()
+                .key(provider)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{key_var} is not set (required for {provider:?})")
+                })?
+        } else {
+            String::new()
+        };
 
         Ok(Self {
             provider,
@@ -855,6 +956,10 @@ impl ModelConfig {
                 .max_tool_result_bytes
                 .or(file.max_tool_result_bytes)
                 .unwrap_or(DEFAULT_MAX_TOOL_RESULT_BYTES),
+            max_history_messages: env
+                .max_history_messages
+                .or(file.max_history_messages)
+                .unwrap_or(DEFAULT_MAX_HISTORY_MESSAGES),
         })
     }
 
@@ -873,6 +978,7 @@ impl ModelConfig {
             aux_model: self.aux_model.clone(),
             max_turns: self.max_turns,
             max_tool_result_bytes: self.max_tool_result_bytes,
+            max_history_messages: self.max_history_messages,
         }
     }
 }
@@ -887,6 +993,28 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn dream_schedule_defaults_on_and_can_be_disabled() {
+        // Unset → on by default at the nightly slot.
+        assert_eq!(
+            resolve_dream_schedule(None).as_deref(),
+            Some(DEFAULT_DREAM_SCHEDULE)
+        );
+        // A custom cron is taken verbatim.
+        assert_eq!(
+            resolve_dream_schedule(Some("0 4 * * *".into())).as_deref(),
+            Some("0 4 * * *")
+        );
+        // Empty or off-like values disable it.
+        for off in ["", "  ", "off", "OFF", "none", "disabled"] {
+            assert_eq!(
+                resolve_dream_schedule(Some(off.into())),
+                None,
+                "`{off}` should disable dreaming"
+            );
+        }
     }
 
     #[test]
@@ -997,7 +1125,7 @@ mod tests {
 
     #[test]
     fn api_keys_maps_provider_and_filters_empty() {
-        let keys = ApiKeys {
+        let keys = Secrets {
             deepseek_api_key: Some("sk-x".into()),
             openai_api_key: Some(String::new()),
             ..Default::default()
@@ -1039,6 +1167,7 @@ mod tests {
             aux_model: None,
             max_turns: DEFAULT_MAX_TURNS,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_history_messages: DEFAULT_MAX_HISTORY_MESSAGES,
         };
         let s = format!("{cfg:?}");
         assert!(

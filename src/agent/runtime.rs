@@ -4,7 +4,7 @@ use tracing::{Instrument, info, info_span, warn};
 
 use crate::{
     domain::{
-        llm::LlmClient,
+        llm::{LlmClient, Step, ToolOutcome},
         message::Message,
         repository::{MessageRepository, SessionRepository},
         reviewer::Reviewer,
@@ -12,9 +12,16 @@ use crate::{
         session::Session,
     },
     services::tool_registry::{
-        RunContext, SessionContext, current_session, with_run, with_session,
+        RunContext, SessionContext, ToolRegistry, current_session, execute_isolated, with_run,
+        with_session,
     },
 };
+
+/// Fed back to the model in place of tool results once the per-turn round
+/// budget (`max_turns`) is exceeded, so it answers instead of calling more
+/// tools. The turn then terminates regardless of the model's next move.
+const BUDGET_REACHED_NOTE: &str = "Tool-call budget for this turn reached; do not call any \
+     more tools. Reply to the user now using what you already have.";
 
 pub struct AgentRuntime {
     pub llm: Arc<dyn LlmClient>,
@@ -23,6 +30,19 @@ pub struct AgentRuntime {
     /// Run ledger: every turn is recorded here, with one step per tool call
     /// (captured at `execute_isolated`). See `domain/run.rs`, roadmap §7.
     pub runs: Arc<dyn RunRepository>,
+    /// Tool catalog the in-house loop dispatches against. shion (not rig) now
+    /// owns the multi-step loop, so it looks tools up here and runs them through
+    /// `execute_isolated` directly. See `turn_body`, roadmap §7.
+    pub tools: Arc<ToolRegistry>,
+    /// Max tool-calling rounds per turn before the loop forces a final answer
+    /// (config `max_turns`). The hard, loop-level budget — distinct from the
+    /// per-call fan-out cap in `execute_isolated`.
+    pub max_turns: usize,
+    /// How many recent messages to load for the turn's agent loop (mirrors the
+    /// LLM's `max_history_messages`; `0` = load the whole transcript). Keeps the
+    /// per-turn hot path off a full-transcript read for long-lived chat
+    /// sessions — the LLM windows again to the same bound, so this is loss-free.
+    pub history_window: usize,
     pub reviewer: Option<Arc<dyn Reviewer>>,
     pub review_interval: usize,
 }
@@ -93,12 +113,19 @@ impl AgentRuntime {
         outcome
     }
 
-    /// The turn's actual work: persist the user message, let the LLM answer
-    /// (it drives any tool calls itself via rig), persist the reply, and kick
-    /// off the periodic reviewer.
+    /// The turn's actual work: persist the user message, drive the agent loop
+    /// (shion owns it — model round-trip, execute requested tools, feed results
+    /// back, repeat), persist the reply, and kick off the periodic reviewer.
     async fn turn_body(&self, session_id: &str, user_input: String) -> anyhow::Result<String> {
-        // Load or create session.
-        let mut session = match self.sessions.find(session_id).await? {
+        // Load only the recent window for the agent loop — the LLM windows the
+        // history to the same bound anyway, so a long-lived chat session no
+        // longer deserializes its whole transcript every turn. The reviewer
+        // (below) still gets the full transcript, on the turns it actually runs.
+        let mut session = match self
+            .sessions
+            .find_windowed(session_id, self.history_window)
+            .await?
+        {
             Some(s) => s,
             None => {
                 let s = Session::new(session_id);
@@ -111,7 +138,7 @@ impl AgentRuntime {
         self.messages.save(session_id, &user_msg).await?;
         session.messages.push(user_msg);
 
-        let reply = self.llm.complete(&session).await?;
+        let reply = self.run_agent_loop(&session).await?;
 
         let assistant_msg = Message::assistant(&reply);
         self.messages.save(session_id, &assistant_msg).await?;
@@ -119,22 +146,108 @@ impl AgentRuntime {
 
         if let Some(reviewer) = &self.reviewer {
             let interval = self.review_interval.max(1);
-            if session.user_turns() % interval == 0 {
-                let reviewer = reviewer.clone();
-                let snapshot = session.clone();
-                tokio::spawn(async move {
-                    match reviewer.review(&snapshot).await {
-                        Ok(outcome) if !outcome.is_empty() => {
-                            info!(?outcome, "self-improvement review")
+            // Cadence is driven by the true user-turn total (a cheap COUNT), not
+            // the windowed in-memory session, whose count would plateau at the
+            // window size and mis-fire the modulo.
+            let turns = self.messages.count_user_turns(session_id).await?;
+            if turns % interval == 0 {
+                // The reflective reviewer needs the whole transcript, so reload
+                // the full session (this turn's messages are already persisted)
+                // rather than handing it the truncated working window.
+                if let Some(snapshot) = self.sessions.find(session_id).await? {
+                    let reviewer = reviewer.clone();
+                    tokio::spawn(async move {
+                        match reviewer.review(&snapshot).await {
+                            Ok(outcome) if !outcome.is_empty() => {
+                                info!(?outcome, "self-improvement review")
+                            }
+                            Ok(_) => {}
+                            Err(error) => warn!(%error, "review failed (non-fatal)"),
                         }
-                        Ok(_) => {}
-                        Err(error) => warn!(%error, "review failed (non-fatal)"),
-                    }
-                });
+                    });
+                }
             }
         }
 
         Ok(reply)
+    }
+
+    /// shion's own tool-calling loop (roadmap §7 — the loop lives here, not in
+    /// rig, so control points can sit between rounds). Drive the model a round
+    /// at a time: a [`Step::Final`] ends the turn; [`Step::ToolCalls`] are run
+    /// through `execute_isolated` (preserving the run-ledger/approval task-locals
+    /// already in scope, plus its retry/budget/cap) and threaded back. Once the
+    /// per-turn round budget is exceeded, feed [`BUDGET_REACHED_NOTE`] back in
+    /// place of results and force a final answer.
+    async fn run_agent_loop(&self, session: &Session) -> anyhow::Result<String> {
+        let mut driver = self.llm.begin_turn(session).await?;
+        let mut step = driver.first().await?;
+        let mut rounds = 0usize;
+
+        loop {
+            match step {
+                Step::Final(text) => return Ok(text),
+                Step::ToolCalls(calls) => {
+                    rounds += 1;
+                    let over_budget = rounds > self.max_turns;
+
+                    let results: Vec<ToolOutcome> = if over_budget {
+                        calls
+                            .iter()
+                            .map(|call| ToolOutcome {
+                                id: call.id.clone(),
+                                call_id: call.call_id.clone(),
+                                content: BUDGET_REACHED_NOTE.to_string(),
+                            })
+                            .collect()
+                    } else {
+                        // Run a round's tool calls concurrently. `execute_isolated`
+                        // already spawns each on its own task; doing them in a
+                        // sequential `for` only made them queue behind one another,
+                        // so a round of N reads paid N× latency. `join_all`
+                        // preserves order, so results still line up with `calls`.
+                        // Approval prompts stay safe under concurrency: the
+                        // interactive approver serializes them per session (its
+                        // single pending slot is never raced), so two
+                        // side-effecting tools in one round still prompt
+                        // one-at-a-time.
+                        let futures = calls.iter().map(|call| async move {
+                            let content = match self.tools.get(&call.name) {
+                                // A tool error is fed back as the result (the
+                                // model can recover), not propagated — only a
+                                // driver/LLM error aborts the turn.
+                                Some(tool) => match execute_isolated(tool, call.args.clone()).await
+                                {
+                                    Ok(out) => out,
+                                    Err(error) => format!("tool `{}` failed: {error:#}", call.name),
+                                },
+                                None => format!("error: unknown tool `{}`", call.name),
+                            };
+                            ToolOutcome {
+                                id: call.id.clone(),
+                                call_id: call.call_id.clone(),
+                                content,
+                            }
+                        });
+                        futures_util::future::join_all(futures).await
+                    };
+
+                    let next = driver.step(results).await?;
+                    // Over budget, the note went back as well-formed tool results;
+                    // terminate now no matter what the model did with it.
+                    step = if over_budget {
+                        return Ok(match next {
+                            Step::Final(text) => text,
+                            Step::ToolCalls(_) => "(Reached the tool-call limit for this turn; \
+                                 answering with what I have.)"
+                                .to_string(),
+                        });
+                    } else {
+                        next
+                    };
+                }
+            }
+        }
     }
 }
 
@@ -142,50 +255,133 @@ impl AgentRuntime {
 mod tests {
     use super::*;
     use crate::{
-        domain::{llm::LlmClient, run::RunStatus, session::Session, tool::Tool},
+        domain::{
+            llm::{LlmClient, Step, ToolCallReq, TurnDriver},
+            run::RunStatus,
+            session::Session,
+            tool::Tool,
+        },
         infra::persistence::db::Db,
-        services::tool_registry::execute_isolated,
         tools::time::TimeTool,
     };
     use async_trait::async_trait;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
-    /// Stub LLM: returns a fixed reply, and (to mimic rig's tool-calling loop)
-    /// optionally invokes one tool through `execute_isolated` — the same path a
-    /// real tool call takes — so we can assert the run context set by
-    /// `run_turn` reaches the tool and a step is recorded.
-    struct StubLlm {
-        reply: &'static str,
-        tool: Option<Arc<dyn Tool>>,
+    /// An [`LlmClient`] that replays a scripted sequence of [`Step`]s and records
+    /// the tool results fed back to each `step()` — no rig, no network. Lets us
+    /// drive `run_agent_loop` deterministically and assert dispatch, threading,
+    /// the ledger, and the round budget.
+    struct ScriptedLlm {
+        script: Mutex<VecDeque<Step>>,
+        received: Arc<Mutex<Vec<Vec<ToolOutcome>>>>,
     }
 
     #[async_trait]
-    impl LlmClient for StubLlm {
+    impl LlmClient for ScriptedLlm {
         async fn complete(&self, _session: &Session) -> anyhow::Result<String> {
-            if let Some(tool) = &self.tool {
-                let _ = execute_isolated(tool.clone(), "{}".into()).await;
-            }
-            Ok(self.reply.to_string())
+            Ok("unused".to_string())
+        }
+        async fn begin_turn(&self, _session: &Session) -> anyhow::Result<Box<dyn TurnDriver>> {
+            // One turn per test, so hand the whole script to the driver.
+            let steps = std::mem::take(&mut *self.script.lock().unwrap());
+            Ok(Box::new(ScriptedDriver {
+                steps,
+                received: self.received.clone(),
+            }))
+        }
+    }
+
+    struct ScriptedDriver {
+        steps: VecDeque<Step>,
+        received: Arc<Mutex<Vec<Vec<ToolOutcome>>>>,
+    }
+
+    #[async_trait]
+    impl TurnDriver for ScriptedDriver {
+        async fn first(&mut self) -> anyhow::Result<Step> {
+            Ok(self.steps.pop_front().expect("script exhausted at first()"))
+        }
+        async fn step(&mut self, results: Vec<ToolOutcome>) -> anyhow::Result<Step> {
+            self.received.lock().unwrap().push(results);
+            Ok(self.steps.pop_front().expect("script exhausted at step()"))
+        }
+    }
+
+    /// A tool that echoes its raw input, for asserting result threading.
+    struct EchoArgsTool;
+    #[async_trait]
+    impl Tool for EchoArgsTool {
+        fn name(&self) -> &'static str {
+            "echo"
+        }
+        fn description(&self) -> &'static str {
+            "echoes its input args"
+        }
+        async fn execute(&self, input: String) -> anyhow::Result<String> {
+            Ok(format!("echo:{input}"))
+        }
+    }
+
+    /// A tool that always errors, for asserting failures feed back (not abort).
+    struct FailTool;
+    #[async_trait]
+    impl Tool for FailTool {
+        fn name(&self) -> &'static str {
+            "fail"
+        }
+        fn description(&self) -> &'static str {
+            "always errors"
+        }
+        async fn execute(&self, _input: String) -> anyhow::Result<String> {
+            anyhow::bail!("boom")
         }
     }
 
     fn sqlite_url(name: &str) -> String {
         let path = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_file(&path);
-        format!("sqlite:{}", path.display())
+        crate::infra::persistence::reset_test_db(&path);
+        format!("turso:{}", path.display())
     }
 
-    fn runtime_with(db: Arc<Db>, tool: Option<Arc<dyn Tool>>) -> AgentRuntime {
-        AgentRuntime {
-            llm: Arc::new(StubLlm {
-                reply: "hello there",
-                tool,
+    fn call(name: &str, args: &str) -> ToolCallReq {
+        ToolCallReq {
+            id: format!("id-{name}"),
+            call_id: None,
+            name: name.to_string(),
+            args: args.to_string(),
+        }
+    }
+
+    /// Build a runtime whose LLM replays `script`, with `tools` registered and a
+    /// round budget of `max_turns`. Returns the runtime and a handle to the tool
+    /// results fed back to the driver, round by round.
+    fn scripted_runtime(
+        db: Arc<Db>,
+        script: Vec<Step>,
+        tools: Vec<Arc<dyn Tool>>,
+        max_turns: usize,
+    ) -> (AgentRuntime, Arc<Mutex<Vec<Vec<ToolOutcome>>>>) {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = ToolRegistry::new();
+        for t in tools {
+            reg.register(t);
+        }
+        let rt = AgentRuntime {
+            llm: Arc::new(ScriptedLlm {
+                script: Mutex::new(script.into()),
+                received: received.clone(),
             }),
             sessions: db.clone(),
             messages: db.clone(),
             runs: db.clone(),
+            tools: Arc::new(reg),
+            max_turns,
+            history_window: 0,
             reviewer: None,
             review_interval: 10,
-        }
+        };
+        (rt, received)
     }
 
     #[tokio::test]
@@ -195,7 +391,15 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let rt = runtime_with(db.clone(), Some(Arc::new(TimeTool)));
+        let (rt, _) = scripted_runtime(
+            db.clone(),
+            vec![
+                Step::ToolCalls(vec![call("time", "{}")]),
+                Step::Final("the time is now".into()),
+            ],
+            vec![Arc::new(TimeTool)],
+            30,
+        );
 
         rt.handle_input("cli:s1", "hi".into()).await.unwrap();
 
@@ -217,7 +421,12 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let rt = runtime_with(db.clone(), None);
+        let (rt, _) = scripted_runtime(
+            db.clone(),
+            vec![Step::Final("hello there".into())],
+            vec![],
+            30,
+        );
 
         let reply = rt.handle_input("cli:s2", "hi".into()).await.unwrap();
         assert_eq!(reply, "hello there");
@@ -230,5 +439,115 @@ mod tests {
 
         let steps = RunRepository::steps(&*db, &runs[0].id).await.unwrap();
         assert!(steps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_round_threads_tool_results_back() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("shion_rt_threading.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, received) = scripted_runtime(
+            db.clone(),
+            vec![
+                Step::ToolCalls(vec![call("echo", "A")]),
+                Step::ToolCalls(vec![call("echo", "B")]),
+                Step::Final("done".into()),
+            ],
+            vec![Arc::new(EchoArgsTool)],
+            30,
+        );
+
+        let reply = rt.handle_input("cli:s3", "hi".into()).await.unwrap();
+        assert_eq!(reply, "done");
+
+        let rec = received.lock().unwrap();
+        assert_eq!(rec.len(), 2, "two tool rounds before the final answer");
+        assert_eq!(rec[0][0].content, "echo:A");
+        assert_eq!(rec[0][0].id, "id-echo");
+        assert_eq!(rec[1][0].content, "echo:B");
+    }
+
+    #[tokio::test]
+    async fn tool_error_feeds_back_without_aborting() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("shion_rt_toolerr.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, received) = scripted_runtime(
+            db.clone(),
+            vec![
+                Step::ToolCalls(vec![call("fail", "{}")]),
+                Step::Final("recovered".into()),
+            ],
+            vec![Arc::new(FailTool)],
+            30,
+        );
+
+        let reply = rt.handle_input("cli:s4", "hi".into()).await.unwrap();
+        assert_eq!(reply, "recovered");
+        assert!(received.lock().unwrap()[0][0].content.contains("failed"));
+
+        let runs = RunRepository::list(&*db, 10).await.unwrap();
+        assert_eq!(runs[0].status, RunStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_feeds_back_without_aborting() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("shion_rt_unknown.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, received) = scripted_runtime(
+            db.clone(),
+            vec![
+                Step::ToolCalls(vec![call("nope", "{}")]),
+                Step::Final("ok".into()),
+            ],
+            vec![],
+            30,
+        );
+
+        let reply = rt.handle_input("cli:s5", "hi".into()).await.unwrap();
+        assert_eq!(reply, "ok");
+        assert!(
+            received.lock().unwrap()[0][0]
+                .content
+                .contains("unknown tool")
+        );
+    }
+
+    #[tokio::test]
+    async fn round_budget_forces_a_final_answer() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("shion_rt_budget.db"))
+                .await
+                .unwrap(),
+        );
+        // Driver keeps requesting tools; with max_turns=2 the loop must stop.
+        let (rt, _) = scripted_runtime(
+            db.clone(),
+            vec![
+                Step::ToolCalls(vec![call("time", "{}")]),
+                Step::ToolCalls(vec![call("time", "{}")]),
+                Step::ToolCalls(vec![call("time", "{}")]),
+                Step::ToolCalls(vec![call("time", "{}")]),
+            ],
+            vec![Arc::new(TimeTool)],
+            2,
+        );
+
+        let reply = rt.handle_input("cli:s6", "hi".into()).await.unwrap();
+        assert!(reply.contains("tool-call limit"), "got: {reply}");
+
+        let runs = RunRepository::list(&*db, 10).await.unwrap();
+        assert_eq!(runs[0].status, RunStatus::Done);
+        // Only the first two rounds actually dispatched; round 3 got the budget
+        // note instead of executing, so exactly two ledger steps.
+        let steps = RunRepository::steps(&*db, &runs[0].id).await.unwrap();
+        assert_eq!(steps.len(), 2);
     }
 }

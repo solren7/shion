@@ -1,6 +1,6 @@
 //! Interactive gateway layer: lets a chat-channel turn pause for the user's
 //! approval mid-execution, and handles the chat control commands (`/new`,
-//! `/approve`, `/deny`).
+//! `/approve`, `/deny`, `/sethome`, `/wechat login`, `/pair`).
 //!
 //! Borrowed from hermes-agent's gateway approval. Hermes runs the agent on a
 //! worker thread that blocks on a `threading.Event` keyed by session while the
@@ -32,6 +32,7 @@ use crate::{
         approval::{ApprovalRequest, Approver, Risk},
         gateway::{MessageHandler, ReplySink, WeChatLogin},
         home::HomeRepository,
+        pairing::{ApproveOutcome, PairingRepository, PairingStatus},
         repository::SessionRepository,
         todo::SessionTodoRepository,
     },
@@ -58,6 +59,14 @@ pub enum Decision {
 pub struct ApprovalState {
     pending: Mutex<HashMap<String, oneshot::Sender<Decision>>>,
     approved: Mutex<HashMap<String, HashSet<String>>>,
+    /// Per-session serialization gate. A round's tool calls now run
+    /// concurrently (`AgentRuntime::run_agent_loop`), so two side-effecting
+    /// tools can ask for approval at once; holding this across the
+    /// prompt→await→resolve cycle keeps the single `pending` slot from being
+    /// raced (a second `register` would otherwise drop the first sender, denying
+    /// it). Per session, not global, so a slow approver in one chat never blocks
+    /// another chat's prompt.
+    gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     timeout: Duration,
 }
 
@@ -66,8 +75,21 @@ impl ApprovalState {
         Self {
             pending: Mutex::new(HashMap::new()),
             approved: Mutex::new(HashMap::new()),
+            gates: Mutex::new(HashMap::new()),
             timeout: APPROVAL_TIMEOUT,
         }
+    }
+
+    /// The approval gate for `session`, created on first use. Held by
+    /// [`ChatApprover`] across an interactive prompt so concurrent approvals in
+    /// the same session queue instead of racing the `pending` slot.
+    fn gate(&self, session: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.gates
+            .lock()
+            .unwrap()
+            .entry(session.to_string())
+            .or_default()
+            .clone()
     }
 
     /// Register a pending approval for `session`, returning the receiver the
@@ -117,6 +139,7 @@ impl ApprovalState {
     pub fn clear(&self, session: &str) {
         self.forget_pending(session);
         self.approved.lock().unwrap().remove(session);
+        self.gates.lock().unwrap().remove(session);
     }
 }
 
@@ -154,6 +177,13 @@ impl Approver for ChatApprover {
             return false;
         };
 
+        // Trusted turn (a `shion chat` routed over the gateway's loopback api
+        // channel): the CLI user is the host operator, so run without prompting.
+        // The api channel only builds a trusted context for loopback callers.
+        if ctx.auto_approve {
+            return true;
+        }
+
         // No human to answer (HTTP API, detached REPL context): deny rather than
         // prompt a sink no one reads and wait out the timeout.
         if !ctx.interactive {
@@ -162,6 +192,19 @@ impl Approver for ChatApprover {
         }
 
         // Already approved this kind of action for the session?
+        if let Some(key) = &request.scope_key {
+            if self.state.is_session_approved(&ctx.session_id, key) {
+                return true;
+            }
+        }
+
+        // Serialize concurrent approvals for this session (a round's tools run
+        // concurrently now) so they don't race the single `pending` slot. Held
+        // until the decision resolves below.
+        let gate = self.state.gate(&ctx.session_id);
+        let _guard = gate.lock().await;
+        // A concurrent approval may have granted this scope "for session" while
+        // we waited on the gate — re-check so we don't prompt twice for it.
         if let Some(key) = &request.scope_key {
             if self.state.is_session_approved(&ctx.session_id, key) {
                 return true;
@@ -217,14 +260,46 @@ pub enum Command {
     SetHome,
     /// Provision the WeChat channel by QR (delivered to this chat).
     WechatLogin,
+    /// Approve/list/revoke pairings from chat — the gateway holds the db lock,
+    /// so the `shion pair` CLI can't open it while the gateway runs.
+    Pair(PairAction),
     /// Ordinary message — run a turn.
     Plain(String),
 }
 
-/// Classify an inbound message. Commands are matched case-insensitively on the
-/// whole (trimmed) message; anything else is plain text.
+/// The sub-action of a `/pair` chat command.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PairAction {
+    List,
+    Approve(String),
+    Revoke(String),
+    /// Unrecognized `/pair …` — reply with usage.
+    Usage,
+}
+
+/// Classify an inbound message. No-arg commands match case-insensitively on the
+/// whole (trimmed) message. `/pair …` takes an argument, so it is parsed from
+/// the original text (the code/id keep their case); anything else is plain text.
 pub fn classify(text: &str) -> Command {
-    match text.trim().to_lowercase().as_str() {
+    let trimmed = text.trim();
+    let lower = trimmed.to_lowercase();
+
+    if lower == "/pair" || lower.starts_with("/pair ") {
+        // Split off the verb + argument from the *original* text so a revoke id
+        // (`{platform}:{sender_id}`) and a code keep their case.
+        let mut parts = trimmed.split_whitespace();
+        let _ = parts.next(); // "/pair"
+        let verb = parts.next().map(|v| v.to_lowercase());
+        let arg = parts.next().map(|s| s.to_string());
+        return Command::Pair(match (verb.as_deref(), arg) {
+            (Some("list"), _) | (None, _) => PairAction::List,
+            (Some("approve"), Some(code)) => PairAction::Approve(code),
+            (Some("revoke"), Some(id)) => PairAction::Revoke(id),
+            _ => PairAction::Usage,
+        });
+    }
+
+    match lower.as_str() {
         "/new" | "/clear" | "/reset" => Command::New,
         "/approve" | "/yes" | "/y" | "/ok" => Command::Approve(Decision::Once),
         "/approve session" | "/approve all" => Command::Approve(Decision::Session),
@@ -250,6 +325,8 @@ pub struct GatewayDispatcher {
     todos: Arc<dyn SessionTodoRepository>,
     /// Set when the WeChat channel is enabled — drives `/wechat login`.
     wechat_login: Option<Arc<dyn WeChatLogin>>,
+    /// Backs the `/pair` chat commands (same store the `shion pair` CLI uses).
+    pairings: Arc<dyn PairingRepository>,
     inflight: Mutex<HashSet<String>>,
 }
 
@@ -261,6 +338,7 @@ impl GatewayDispatcher {
         home: Arc<dyn HomeRepository>,
         todos: Arc<dyn SessionTodoRepository>,
         wechat_login: Option<Arc<dyn WeChatLogin>>,
+        pairings: Arc<dyn PairingRepository>,
     ) -> Self {
         Self {
             handler,
@@ -269,6 +347,7 @@ impl GatewayDispatcher {
             home,
             todos,
             wechat_login,
+            pairings,
             inflight: Mutex::new(HashSet::new()),
         }
     }
@@ -331,7 +410,81 @@ impl GatewayDispatcher {
                 let _ = sink.send(reply).await;
             }
             Command::WechatLogin => self.spawn_wechat_login(sink),
+            Command::Pair(action) => {
+                let reply = self.handle_pair(action).await;
+                let _ = sink.send(&reply).await;
+            }
             Command::Plain(input) => self.spawn_turn(session_id, input, sink),
+        }
+    }
+
+    /// Run a `/pair` command against the shared pairing store. Lives in the
+    /// gateway (which holds the db lock) so admitting a new sender no longer
+    /// needs the `shion pair` CLI — that CLI can't open the db while the
+    /// gateway is running. Any already-admitted sender may run it (same trust
+    /// level as `/sethome` and `/wechat login`).
+    async fn handle_pair(&self, action: PairAction) -> String {
+        match action {
+            PairAction::Usage => {
+                "用法：/pair list · /pair approve <code> · /pair revoke <platform:sender_id>"
+                    .to_string()
+            }
+            PairAction::List => match self.pairings.list().await {
+                Ok(list) if list.is_empty() => {
+                    "暂无配对。陌生发送者首次联系时会收到一个配对码。".to_string()
+                }
+                Ok(list) => {
+                    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                    let mut out = String::from("配对列表：\n");
+                    for p in list {
+                        let state = match p.status {
+                            PairingStatus::Approved => "approved",
+                            PairingStatus::Pending if p.is_expired(now) => "expired",
+                            PairingStatus::Pending => "pending",
+                        };
+                        out.push_str(&format!("· {} [{}]\n", p.id, state));
+                    }
+                    out.push_str("\n批准：/pair approve <发送者给你的 code>");
+                    out
+                }
+                Err(error) => {
+                    warn!(%error, "pair list via chat failed");
+                    "读取配对列表失败，请稍后再试。".to_string()
+                }
+            },
+            PairAction::Approve(code) => {
+                let code = code.trim().to_uppercase();
+                match self.pairings.approve_code(&code).await {
+                    Ok(ApproveOutcome::Approved(req)) => {
+                        info!(id = %req.id, "pairing approved via chat");
+                        format!("✅ 已配对 {} —— 对方现在可以对话了。", req.id)
+                    }
+                    Ok(ApproveOutcome::NotFound) => {
+                        format!(
+                            "没有匹配 code {code} 的待批准配对（未知或已过期，见 /pair list）。"
+                        )
+                    }
+                    Ok(ApproveOutcome::Locked { retry_after_secs }) => format!(
+                        "失败次数过多，批准已锁定，请 {} 分钟后再试。",
+                        (retry_after_secs + 59) / 60
+                    ),
+                    Err(error) => {
+                        warn!(%error, "pair approve via chat failed");
+                        "批准失败，请稍后再试。".to_string()
+                    }
+                }
+            }
+            PairAction::Revoke(id) => match self.pairings.revoke(&id).await {
+                Ok(true) => {
+                    info!(%id, "pairing revoked via chat");
+                    format!("已解除配对 {id}。")
+                }
+                Ok(false) => format!("没有配对 {id}（见 /pair list）。"),
+                Err(error) => {
+                    warn!(%error, "pair revoke via chat failed");
+                    "解除配对失败，请稍后再试。".to_string()
+                }
+            },
         }
     }
 
@@ -382,6 +535,8 @@ impl GatewayDispatcher {
             sink: sink.clone(),
             // A chat channel has a human who can answer an approval prompt.
             interactive: true,
+            // Real human prompting — not the trusted loopback-CLI shortcut.
+            auto_approve: false,
         };
         tokio::spawn(async move {
             let reply = match with_session(ctx, this.handler.handle(&session, input)).await {
@@ -425,6 +580,27 @@ mod tests {
         assert_eq!(
             classify("/approve the budget"),
             Command::Plain("/approve the budget".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_parses_pair_subcommands_preserving_arg_case() {
+        assert_eq!(classify("/pair"), Command::Pair(PairAction::List));
+        assert_eq!(classify("/pair list"), Command::Pair(PairAction::List));
+        // The verb is case-insensitive but the code/id keep their case.
+        assert_eq!(
+            classify("/PAIR approve aB12cD34"),
+            Command::Pair(PairAction::Approve("aB12cD34".to_string()))
+        );
+        assert_eq!(
+            classify("/pair revoke feishu:ou_AbC"),
+            Command::Pair(PairAction::Revoke("feishu:ou_AbC".to_string()))
+        );
+        // Missing argument → usage, not a turn.
+        assert_eq!(classify("/pair approve"), Command::Pair(PairAction::Usage));
+        assert_eq!(
+            classify("/pair frobnicate"),
+            Command::Pair(PairAction::Usage)
         );
     }
 

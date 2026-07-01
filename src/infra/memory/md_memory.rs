@@ -85,6 +85,9 @@ fn render_md(memory: &Memory) -> String {
     if let Some(last_used_at) = memory.last_used_at {
         front.push_str(&format!("last_used_at: {last_used_at}\n"));
     }
+    if memory.recall_count > 0 {
+        front.push_str(&format!("recall_count: {}\n", memory.recall_count));
+    }
     format!("{front}---\n\n{}\n", memory.content)
 }
 
@@ -109,6 +112,7 @@ fn parse_md(id: &str, text: &str) -> Option<Memory> {
     let mut updated_at: Option<i64> = None;
     let mut expires_at: Option<i64> = None;
     let mut last_used_at: Option<i64> = None;
+    let mut recall_count: i64 = 0;
 
     for line in front.lines() {
         if let Some(v) = line.strip_prefix("kind:") {
@@ -140,6 +144,8 @@ fn parse_md(id: &str, text: &str) -> Option<Memory> {
             expires_at = v.trim().parse::<i64>().ok();
         } else if let Some(v) = line.strip_prefix("last_used_at:") {
             last_used_at = v.trim().parse::<i64>().ok();
+        } else if let Some(v) = line.strip_prefix("recall_count:") {
+            recall_count = v.trim().parse::<i64>().unwrap_or(0);
         }
     }
 
@@ -168,6 +174,7 @@ fn parse_md(id: &str, text: &str) -> Option<Memory> {
         updated_at: updated_at.unwrap_or(created_at),
         expires_at,
         last_used_at,
+        recall_count,
     })
 }
 

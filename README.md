@@ -53,15 +53,16 @@ The gateway hosts chat/event ingress and scheduled maintenance:
 - Feishu, Telegram, WeChat, and Home Assistant channels when configured
 
 ```bash
-shion gateway start              # install + start under launchd (auto-restart, login start)
-shion gateway status             # launchd state
-shion gateway restart            # pick up a reinstalled binary
-shion gateway stop               # stop and remove from launchd
+shion gateway start              # macOS only: install + start under launchd
+shion gateway status             # macOS only: launchd state
+shion gateway restart            # macOS only: pick up a reinstalled binary
+shion gateway stop               # macOS only: stop and remove from launchd
 ```
 
 Bare `shion gateway` runs in the foreground (this is what launchd
-invokes). In chat channels, side-effecting tools can ask for approval in the
-conversation; reply `/approve`, `/approve session`, or `/deny`.
+invokes, and what Docker should run as the container process). In chat channels,
+side-effecting tools can ask for approval in the conversation; reply `/approve`,
+`/approve session`, or `/deny`.
 
 ## Built-in tools
 

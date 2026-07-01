@@ -2,10 +2,15 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use rig::{
+    OneOrMany,
     agent::Agent,
     client::{ClientBuilder, CompletionClient},
-    completion::{CompletionModel, Message as RigMessage, Prompt},
+    completion::{
+        AssistantContent, Completion, CompletionModel, Message as RigMessage, Prompt,
+        message::{ToolResultContent, UserContent},
+    },
     providers::{anthropic, deepseek, openai, openrouter},
     tool::ToolDyn,
 };
@@ -14,13 +19,16 @@ use crate::{
     agent::system_prompt::{render_pinned_memory_block, render_recalled_memory_block},
     config::{ModelConfig, Provider},
     domain::{
-        llm::LlmClient,
+        llm::{LlmClient, Step, ToolCallReq, ToolOutcome, TurnDriver},
         memory::{MemoryContext, MemoryRepository},
         message::{Message, Role},
         session::Session,
         tool::Tool,
     },
-    infra::rig_tool::RigTool,
+    infra::{
+        codex::{CODEX_BASE_URL, CodexAuth, CodexHttpClient, codex_static_headers},
+        rig_tool::RigTool,
+    },
 };
 
 /// Produces the system prompt (preamble) on demand. Called once per user turn
@@ -44,18 +52,36 @@ pub struct RigLlm<M: CompletionModel> {
     max_turns: usize,
     /// Rebuilds the system prompt each turn (see [`PreambleFn`]).
     preamble: PreambleFn,
+    /// Max prior messages replayed as history per turn (config
+    /// `max_history_messages`; `0` = unlimited). The backstop against a
+    /// long-lived chat session sending its entire transcript every turn — see
+    /// [`RigLlm::assemble`].
+    max_history_messages: usize,
     /// Optional long-term memory store. When set (the main agent), each turn's
     /// L1 pinned profile is injected after the preamble. `None` for aux/delegate
     /// sub-agents, which must not be fed the user's memory library.
     memories: Option<Arc<dyn MemoryRepository>>,
+    /// Drive each round over the streaming API instead of one-shot `send()`.
+    /// Required by the ChatGPT Codex backend (it rejects non-streamed requests);
+    /// `false` for every other provider, which keeps the simpler non-streaming
+    /// path. The streamed chunks are aggregated back into one assistant turn, so
+    /// the rest of the loop is identical either way.
+    stream: bool,
 }
 
-#[async_trait]
-impl<M> LlmClient for RigLlm<M>
+impl<M> RigLlm<M>
 where
     M: CompletionModel + 'static,
 {
-    async fn complete(&self, session: &Session) -> anyhow::Result<String> {
+    /// Assemble this turn's `(preamble, prompt, history)`: split the session
+    /// into the latest user prompt + prior history, rebuild the system prompt,
+    /// and inject L1 pinned + L3 recalled memories (main agent only). Run once
+    /// per turn — never per tool-loop round (recall is keyed on the user
+    /// message, and re-running it each round would churn the cached prefix).
+    async fn assemble(
+        &self,
+        session: &Session,
+    ) -> anyhow::Result<(String, String, Vec<RigMessage>)> {
         // The current prompt is the most recent user message; everything before
         // it forms the conversation history sent to the model.
         let last_user_idx = session
@@ -64,10 +90,26 @@ where
             .rposition(|m| m.role == Role::User)
             .context("no user message to respond to")?;
         let prompt = session.messages[last_user_idx].content.clone();
-        let history: Vec<RigMessage> = session.messages[..last_user_idx]
-            .iter()
-            .filter_map(to_rig_message)
-            .collect();
+
+        // Window the replayed history to the most recent `max_history_messages`
+        // (0 = keep everything). Without this a long-lived chat session
+        // (telegram/feishu/wechat are keyed by chat id and only rotate on an
+        // explicit `/new`) would resend its entire transcript every turn —
+        // unbounded token cost and latency, eventually overflowing the context
+        // window. The stable system-prompt + memory prefix is untouched, so the
+        // upstream prompt cache is unaffected by trimming the tail.
+        let prior = &session.messages[..last_user_idx];
+        let mut window: &[Message] = match self.max_history_messages {
+            0 => prior,
+            n => &prior[prior.len().saturating_sub(n)..],
+        };
+        // The transcript strictly alternates user/assistant, so a tail cut can
+        // open on an assistant message; drop it so the history starts on a user
+        // turn (Anthropic rejects a leading assistant message).
+        if window.first().is_some_and(|m| m.role == Role::Assistant) {
+            window = &window[1..];
+        }
+        let history: Vec<RigMessage> = window.iter().filter_map(to_rig_message).collect();
 
         // Rebuild the system prompt for this turn. `Agent` is cheap to clone
         // (`Arc<model>` + an `Arc`-backed tool handle), and its `preamble` field
@@ -128,9 +170,33 @@ where
             }
         }
 
+        Ok((preamble, prompt, history))
+    }
+
+    /// Clone the agent with this turn's assembled preamble installed.
+    fn agent_with_preamble(&self, preamble: String) -> Agent<M> {
         let mut agent = self.agent.clone();
         agent.preamble = Some(preamble);
+        agent
+    }
+}
 
+#[async_trait]
+impl<M> LlmClient for RigLlm<M>
+where
+    M: CompletionModel + 'static,
+{
+    async fn complete(&self, session: &Session) -> anyhow::Result<String> {
+        // Tool-less callers (aux/delegate/reviewer/briefing): rig's own loop does
+        // a single completion and returns, since no tools are exposed.
+        let (preamble, prompt, history) = self.assemble(session).await?;
+        let agent = self.agent_with_preamble(preamble);
+        if self.stream {
+            // Codex: one streamed completion, aggregated to its text. (No tools
+            // are exposed here, so a single round is the whole answer.)
+            let (choice, _) = stream_completion(&agent, RigMessage::user(prompt), history).await?;
+            return Ok(choice_text(&choice));
+        }
         let reply = agent
             .prompt(prompt)
             .with_history(history)
@@ -138,6 +204,155 @@ where
             .await
             .context("LLM completion failed")?;
         Ok(reply)
+    }
+
+    async fn begin_turn(&self, session: &Session) -> anyhow::Result<Box<dyn TurnDriver>> {
+        let (preamble, prompt, history) = self.assemble(session).await?;
+        Ok(Box::new(RigTurnDriver {
+            agent: self.agent_with_preamble(preamble),
+            history,
+            pending: Some(RigMessage::user(prompt)),
+            stream: self.stream,
+        }))
+    }
+}
+
+/// A [`TurnDriver`] backed by a per-turn rig [`Agent`] clone. Holds the growing
+/// conversation history (excluding the not-yet-sent prompt) so each round is a
+/// single `agent.completion(...).send()` — rig does one completion, shion owns
+/// the loop.
+struct RigTurnDriver<M: CompletionModel> {
+    agent: Agent<M>,
+    history: Vec<RigMessage>,
+    /// The opening prompt; consumed by `first()`, then `None`.
+    pending: Option<RigMessage>,
+    /// Stream each round instead of one-shot `send()` (see [`RigLlm::stream`]).
+    stream: bool,
+}
+
+impl<M> RigTurnDriver<M>
+where
+    M: CompletionModel + 'static,
+{
+    /// Send one round-trip: complete over `history + prompt`, then commit both
+    /// the prompt and the assistant turn (verbatim — text + tool calls +
+    /// reasoning together) to history so the next round sees a provider-correct
+    /// transcript.
+    async fn run(&mut self, prompt: RigMessage) -> anyhow::Result<Step> {
+        let (choice, message_id) = if self.stream {
+            stream_completion(&self.agent, prompt.clone(), self.history.clone()).await?
+        } else {
+            let resp = self
+                .agent
+                .completion(prompt.clone(), self.history.clone())
+                .await
+                .context("failed to build completion request")?
+                .send()
+                .await
+                .context("LLM completion failed")?;
+            (resp.choice, resp.message_id)
+        };
+        self.history.push(prompt);
+        self.history.push(RigMessage::Assistant {
+            id: message_id,
+            content: choice.clone(),
+        });
+        Ok(choice_to_step(&choice))
+    }
+}
+
+#[async_trait]
+impl<M> TurnDriver for RigTurnDriver<M>
+where
+    M: CompletionModel + 'static,
+{
+    async fn first(&mut self) -> anyhow::Result<Step> {
+        let prompt = self.pending.take().context("turn driver already started")?;
+        self.run(prompt).await
+    }
+
+    async fn step(&mut self, results: Vec<ToolOutcome>) -> anyhow::Result<Step> {
+        // One user message carrying every tool result, mirroring rig's own
+        // `tool_result_user_content`: key by `call_id` when present (OpenAI),
+        // else `id` (Anthropic).
+        let contents: Vec<UserContent> = results
+            .into_iter()
+            .map(|r| {
+                let content = ToolResultContent::from_tool_output(r.content);
+                match r.call_id {
+                    Some(call_id) => UserContent::tool_result_with_call_id(r.id, call_id, content),
+                    None => UserContent::tool_result(r.id, content),
+                }
+            })
+            .collect();
+        let content = OneOrMany::many(contents)
+            .map_err(|_| anyhow::anyhow!("no tool results to send back"))?;
+        self.run(RigMessage::User { content }).await
+    }
+}
+
+/// Run one streamed completion to exhaustion and return the aggregated assistant
+/// turn — `(choice, message_id)`, the same pair the non-streaming `send()` yields.
+/// rig accumulates the streamed deltas into `choice`/`message_id` as the inner
+/// stream drains, so we consume every chunk (surfacing any provider error) and
+/// then read the final aggregate. Used for backends that require streaming
+/// (Codex); identical downstream handling to the one-shot path.
+async fn stream_completion<M>(
+    agent: &Agent<M>,
+    prompt: RigMessage,
+    history: Vec<RigMessage>,
+) -> anyhow::Result<(OneOrMany<AssistantContent>, Option<String>)>
+where
+    M: CompletionModel + 'static,
+{
+    let mut stream = agent
+        .completion(prompt, history)
+        .await
+        .context("failed to build completion request")?
+        .stream()
+        .await
+        .context("LLM completion failed")?;
+    while let Some(item) = stream.next().await {
+        item.context("LLM completion failed")?;
+    }
+    Ok((stream.choice.clone(), stream.message_id.clone()))
+}
+
+/// Concatenate the text blocks of an assistant turn (ignoring tool calls /
+/// reasoning) — the final answer for a tool-less completion.
+fn choice_text(choice: &OneOrMany<AssistantContent>) -> String {
+    let mut text = String::new();
+    for content in choice.iter() {
+        if let AssistantContent::Text(t) = content {
+            text.push_str(&t.text);
+        }
+    }
+    text
+}
+
+/// Split a model's assistant turn into shion's [`Step`]: any tool call makes it
+/// a [`Step::ToolCalls`]; otherwise the concatenated text is the final answer.
+/// Reasoning/image blocks are ignored for control flow (the driver still echoes
+/// them back into history verbatim).
+fn choice_to_step(choice: &OneOrMany<AssistantContent>) -> Step {
+    let mut calls = Vec::new();
+    let mut text = String::new();
+    for content in choice.iter() {
+        match content {
+            AssistantContent::ToolCall(tc) => calls.push(ToolCallReq {
+                id: tc.id.clone(),
+                call_id: tc.call_id.clone(),
+                name: tc.function.name.clone(),
+                args: tc.function.arguments.to_string(),
+            }),
+            AssistantContent::Text(t) => text.push_str(&t.text),
+            _ => {}
+        }
+    }
+    if calls.is_empty() {
+        Step::Final(text)
+    } else {
+        Step::ToolCalls(calls)
     }
 }
 
@@ -163,6 +378,11 @@ pub fn build_llm(
     let key = config.api_key.clone();
     let base = config.base_url.as_deref();
     let max_turns = config.max_turns;
+    let max_history_messages = config.max_history_messages;
+    // The ChatGPT Codex backend only accepts streamed requests; everyone else
+    // uses the simpler one-shot path. Declared before `rig_llm!` so the macro's
+    // (hygienic) body can capture it alongside `max_turns`/`preamble`/`memories`.
+    let stream = matches!(config.provider, Provider::Codex);
     // Seed the agent with an initial preamble; `complete` overrides it per turn.
     let initial = preamble();
 
@@ -182,7 +402,9 @@ pub fn build_llm(
                 agent,
                 max_turns,
                 preamble,
+                max_history_messages,
                 memories,
+                stream,
             }) as Arc<dyn LlmClient>
         }};
     }
@@ -210,6 +432,22 @@ pub fn build_llm(
             let client = with_base_url(openrouter::Client::builder().api_key(key), base)
                 .build()
                 .context("failed to build OpenRouter client")?;
+            rig_llm!(client)
+        }
+        Provider::Codex => {
+            // Codex speaks the OpenAI Responses API (rig's default `openai`
+            // client) but at the ChatGPT backend, authenticated with the Codex
+            // CLI's OAuth tokens. `CodexHttpClient` re-stamps a fresh bearer on
+            // every request; the static Cloudflare-dodging headers are baked in
+            // here. `base` (config base_url) overrides the endpoint if set.
+            let auth = CodexAuth::load().context("loading Codex credentials")?;
+            let client = openai::Client::builder()
+                .api_key(auth.initial_access_token())
+                .base_url(base.unwrap_or(CODEX_BASE_URL))
+                .http_headers(codex_static_headers(auth.account_id()))
+                .http_client(CodexHttpClient::new(auth))
+                .build()
+                .context("failed to build Codex client")?;
             rig_llm!(client)
         }
     };

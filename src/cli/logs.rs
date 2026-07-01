@@ -1,9 +1,9 @@
 //! `shion logs` — print (and optionally follow) the gateway log.
 //!
-//! The gateway runs under launchd, which captures its stderr (where the
-//! `tracing` subscriber writes) to `~/.shion/logs/gateway.err.log` and its
-//! stdout to `gateway.log`. This is the operator-facing tail of that file, so
-//! you don't have to remember the path or reach for `tail -f`.
+//! The gateway writes stderr (where the `tracing` subscriber writes) to
+//! `~/.shion/logs/gateway.err.log` and stdout to `gateway.log` when launchd
+//! manages it on macOS. Docker deployments usually read process logs through
+//! Docker itself.
 
 use std::collections::VecDeque;
 use std::fs::File;

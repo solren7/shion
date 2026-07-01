@@ -12,17 +12,22 @@
 //! is not idempotent (a column change means deleting the file). See
 //! `docs/personal-agent-roadmap.md`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use toasty_driver_turso::Turso;
+use tracing::info;
 
 use crate::domain::memory::{
     Memory, MemoryRepository, MemoryScope, parse_memory_confidence, parse_memory_kind,
     parse_memory_status,
 };
 use crate::infra::memory::md_memory::MdMemoryStore;
+use crate::infra::persistence::{
+    DEFAULT_POOL_SIZE, sqlite_backup_path, stage_sqlite_backup, turso_marker_path, with_write_retry,
+};
 
 // Optional i64 fields use 0 as the "unset" sentinel (same convention as `Db`).
 #[derive(Debug, toasty::Model)]
@@ -43,32 +48,100 @@ struct MemoryRecord {
     updated_at: i64,
     expires_at: i64,
     last_used_at: i64,
+    recall_count: i64,
 }
 
 /// Connection to the memory database. Holds only `MemoryRecord`.
+///
+/// Backed by the Turso engine with a per-operation connection pool: `inner` is a
+/// plain `Arc<toasty::Db>` (no outer `Mutex`), and every method checks out a
+/// pooled `Connection`, so independent reads/writes run concurrently. Writes use
+/// Turso's MVCC concurrent-write mode and retry on commit conflict (see
+/// `infra::persistence::with_write_retry`).
 pub struct MemoryDb {
-    inner: Arc<Mutex<toasty::Db>>,
+    inner: Arc<toasty::Db>,
 }
 
 impl MemoryDb {
     pub async fn connect(url: &str) -> anyhow::Result<Self> {
-        let is_new = url
-            .strip_prefix("sqlite:")
-            .map(|path| !Path::new(path).exists())
-            .unwrap_or(true);
+        // `url` is `turso:<path>`; the bare scheme-less path is what the engine
+        // and the migration probe below operate on. In-memory (no path) skips
+        // migration entirely.
+        let path = url
+            .strip_prefix("turso:")
+            .filter(|p| *p != ":memory:")
+            .map(PathBuf::from);
 
+        // Durable data: memories must survive the engine switch. A file written
+        // by the old rusqlite/SQLite backend is staged aside here, then its rows
+        // are extracted and reloaded into a fresh Turso db after the schema is
+        // pushed (below). The original is kept as a `.sqlite-backup`, and a
+        // `.turso` marker records that the live file is now Turso-native so we
+        // never re-migrate or misread it.
+        if let Some(p) = &path {
+            if let Some(dir) = p.parent() {
+                std::fs::create_dir_all(dir).ok();
+            }
+            stage_sqlite_backup(p)?;
+        }
+
+        let is_new = path.as_deref().map(|p| !p.exists()).unwrap_or(true);
+
+        // Additive in-place migration for an EXISTING db: toasty's `push_schema`
+        // is not idempotent and only runs for new files, so a column added to
+        // `MemoryRecord` after the file was created would otherwise be missing
+        // (every query referencing it would fail). Rather than force a destructive
+        // "delete memory.db" reset — these are durable personal memories — we run
+        // the one DDL toasty's typed API can't: `ALTER TABLE ADD COLUMN` with a
+        // default, directly against the Turso file, before toasty opens it. The
+        // turso handle is dropped here so it never contends with toasty's pool.
+        if !is_new && let Some(p) = &path {
+            ensure_columns(p).await?;
+        }
+
+        // MVCC concurrent-writes on: writers run in parallel and conflicting
+        // commits are retried (see `with_write_retry`). shion's keys are all
+        // UUIDs (no AUTOINCREMENT, which MVCC rejects), so this is uniform across
+        // every db.
+        let driver = match &path {
+            Some(p) => Turso::file(p).concurrent_writes(),
+            None => Turso::in_memory().concurrent_writes(),
+        };
         let db = toasty::Db::builder()
             .models(toasty::models!(MemoryRecord))
-            .connect(url)
+            .max_pool_size(DEFAULT_POOL_SIZE)
+            .build(driver)
             .await?;
 
         if is_new {
             db.push_schema().await?;
         }
 
-        Ok(Self {
-            inner: Arc::new(Mutex::new(db)),
-        })
+        let me = Self {
+            inner: Arc::new(db),
+        };
+
+        // Load the rows extracted from a legacy SQLite file (if any) into the
+        // fresh Turso db, then drop the marker so this only ever happens once.
+        if let Some(p) = &path {
+            let pending = sqlite_backup_path(p);
+            let marker = turso_marker_path(p);
+            if pending.exists() && !marker.exists() {
+                let rows = extract_sqlite_rows(&pending).await?;
+                let count = rows.len();
+                for memory in &rows {
+                    me.save(memory).await?;
+                }
+                std::fs::write(&marker, b"migrated from sqlite\n").ok();
+                info!(count, backup = %pending.display(), "migrated memory.db sqlite → turso");
+            } else if is_new {
+                // Brand-new Turso db with no legacy file: still mark it
+                // Turso-native so a future run never mistakes it for SQLite.
+                std::fs::write(&marker, b"turso-native\n").ok();
+            }
+        }
+
+        Ok(me)
     }
 
     /// One-time migration: import every memory from a legacy markdown directory
@@ -107,6 +180,7 @@ fn record_from_memory(memory: &Memory) -> MemoryRecord {
         updated_at: memory.updated_at,
         expires_at: memory.expires_at.unwrap_or(0),
         last_used_at: memory.last_used_at.unwrap_or(0),
+        recall_count: memory.recall_count,
     }
 }
 
@@ -127,62 +201,70 @@ fn memory_from_record(record: MemoryRecord) -> Memory {
         updated_at: record.updated_at,
         expires_at: nonzero(record.expires_at),
         last_used_at: nonzero(record.last_used_at),
+        recall_count: record.recall_count,
     }
 }
 
 #[async_trait]
 impl MemoryRepository for MemoryDb {
     async fn save(&self, memory: &Memory) -> anyhow::Result<()> {
-        let mut db = self.inner.lock().await;
-        let r = record_from_memory(memory);
-        // Overwrite on id collision (save is create-or-replace), mirroring the
-        // markdown store's filename-keyed overwrite.
-        if let Ok(mut existing) = MemoryRecord::get_by_id(&mut *db, &r.id).await {
-            existing
-                .update()
-                .kind(r.kind)
-                .content(r.content)
-                .status(r.status)
-                .confidence(r.confidence)
-                .importance(r.importance)
-                .pinned(r.pinned)
-                .scope_type(r.scope_type)
-                .scope_key(r.scope_key)
-                .source(r.source)
-                .source_message_id(r.source_message_id)
-                .updated_at(r.updated_at)
-                .expires_at(r.expires_at)
-                .last_used_at(r.last_used_at)
-                .exec(&mut *db)
-                .await?;
-            return Ok(());
-        }
-        toasty::create!(MemoryRecord {
-            id: r.id,
-            kind: r.kind,
-            content: r.content,
-            status: r.status,
-            confidence: r.confidence,
-            importance: r.importance,
-            pinned: r.pinned,
-            scope_type: r.scope_type,
-            scope_key: r.scope_key,
-            source: r.source,
-            source_message_id: r.source_message_id,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
-            expires_at: r.expires_at,
-            last_used_at: r.last_used_at,
+        // MVCC: retry the whole transaction on a commit conflict. Each attempt
+        // re-checks out its own pooled connection.
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let r = record_from_memory(memory);
+            // Overwrite on id collision (save is create-or-replace), mirroring
+            // the markdown store's filename-keyed overwrite.
+            if let Ok(mut existing) = MemoryRecord::get_by_id(&mut conn, &r.id).await {
+                existing
+                    .update()
+                    .kind(r.kind)
+                    .content(r.content)
+                    .status(r.status)
+                    .confidence(r.confidence)
+                    .importance(r.importance)
+                    .pinned(r.pinned)
+                    .scope_type(r.scope_type)
+                    .scope_key(r.scope_key)
+                    .source(r.source)
+                    .source_message_id(r.source_message_id)
+                    .updated_at(r.updated_at)
+                    .expires_at(r.expires_at)
+                    .last_used_at(r.last_used_at)
+                    .recall_count(r.recall_count)
+                    .exec(&mut conn)
+                    .await?;
+                return Ok(());
+            }
+            toasty::create!(MemoryRecord {
+                id: r.id,
+                kind: r.kind,
+                content: r.content,
+                status: r.status,
+                confidence: r.confidence,
+                importance: r.importance,
+                pinned: r.pinned,
+                scope_type: r.scope_type,
+                scope_key: r.scope_key,
+                source: r.source,
+                source_message_id: r.source_message_id,
+                created_at: r.created_at,
+                updated_at: r.updated_at,
+                expires_at: r.expires_at,
+                last_used_at: r.last_used_at,
+                recall_count: r.recall_count,
+            })
+            .exec(&mut conn)
+            .await?;
+            Ok(())
         })
-        .exec(&mut *db)
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn list(&self) -> anyhow::Result<Vec<Memory>> {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let mut db = self.inner.lock().await;
-        let rows = toasty::query!(MemoryRecord).exec(&mut *db).await?;
+        let mut conn = self.inner.connection().await?;
+        let rows = toasty::query!(MemoryRecord).exec(&mut conn).await?;
         let mut memories: Vec<Memory> = rows
             .into_iter()
             .map(memory_from_record)
@@ -196,12 +278,90 @@ impl MemoryRepository for MemoryDb {
     /// sees expired and any-status rows, so governance can still operate on
     /// them.
     async fn get(&self, id: &str) -> anyhow::Result<Option<Memory>> {
-        let mut db = self.inner.lock().await;
-        Ok(MemoryRecord::get_by_id(&mut *db, id)
+        let mut conn = self.inner.connection().await?;
+        Ok(MemoryRecord::get_by_id(&mut conn, id)
             .await
             .ok()
             .map(memory_from_record))
     }
+}
+
+/// Bring an existing `memory_records` table up to the current `MemoryRecord`
+/// shape by adding any columns it lacks, in place — an additive `ALTER TABLE ADD
+/// COLUMN` so existing rows take the default and **no data is lost**. Idempotent:
+/// a column already present is skipped (so this is safe to run on every connect).
+///
+/// This is the in-place alternative to the "delete the db after a schema change"
+/// reset that toasty's non-idempotent `push_schema` would otherwise force.
+/// Toasty's typed API has no raw-DDL path, so the migration is run with a direct
+/// `turso` handle, opened and dropped here — before toasty's pool connects — so
+/// the two never contend for the file.
+///
+/// Every column listed here MUST be `NOT NULL` with a `DEFAULT` (or be nullable),
+/// or `ALTER TABLE ADD COLUMN` fails on a non-empty table.
+async fn ensure_columns(path: &Path) -> anyhow::Result<()> {
+    const EXPECTED: &[(&str, &str)] = &[(
+        "recall_count",
+        "\"recall_count\" integer NOT NULL DEFAULT 0",
+    )];
+
+    let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+        .build()
+        .await
+        .with_context(|| format!("opening {} for column migration", path.display()))?;
+    let conn = db.connect()?;
+    // Match the engine mode the file was written in (the driver enables MVCC
+    // under concurrent_writes); harmless if it was not.
+    conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+
+    // Existing column names: PRAGMA table_info returns (cid, name, type, …) — the
+    // name is column index 1.
+    let mut existing = std::collections::HashSet::new();
+    let mut rows = conn
+        .query("PRAGMA table_info(\"memory_records\")", ())
+        .await
+        .context("reading memory_records columns")?;
+    while let Some(row) = rows.next().await? {
+        if let turso::Value::Text(name) = row.get_value(1)? {
+            existing.insert(name);
+        }
+    }
+    // No columns → the table doesn't exist yet; leave it to toasty's push_schema.
+    if existing.is_empty() {
+        return Ok(());
+    }
+
+    for (name, ddl) in EXPECTED {
+        if !existing.contains(*name) {
+            conn.execute(
+                &format!("ALTER TABLE \"memory_records\" ADD COLUMN {ddl}"),
+                (),
+            )
+            .await
+            .with_context(|| format!("adding column `{name}` to memory_records"))?;
+            info!(
+                column = name,
+                "migrated memory.db: added missing column in place"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Read every memory row from a legacy SQLite db file (opened with toasty's
+/// SQLite driver), faithfully — including expired/any-status rows — so the
+/// migration preserves the full store, not just what `list` would surface.
+async fn extract_sqlite_rows(backup: &Path) -> anyhow::Result<Vec<Memory>> {
+    let url = format!("sqlite:{}", backup.display());
+    let db = toasty::Db::builder()
+        .models(toasty::models!(MemoryRecord))
+        .connect(&url)
+        .await
+        .with_context(|| format!("opening legacy sqlite db at {}", backup.display()))?;
+    let mut conn = db.connection().await?;
+    let rows = toasty::query!(MemoryRecord).exec(&mut conn).await?;
+    Ok(rows.into_iter().map(memory_from_record).collect())
+    // `db` drops here, releasing the backup file.
 }
 
 #[cfg(test)]
@@ -209,15 +369,142 @@ mod tests {
     use super::*;
     use crate::domain::memory::{MemoryConfidence, MemoryContext, MemoryKind, MemoryStatus};
 
-    fn sqlite_url(name: &str) -> String {
+    fn turso_url(name: &str) -> String {
         let path = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_file(&path);
-        format!("sqlite:{}", path.display())
+        crate::infra::persistence::reset_test_db(&path);
+        format!("turso:{}", path.display())
+    }
+
+    /// A legacy SQLite `memory.db` written by the old rusqlite backend (same
+    /// `MemoryRecord` schema) must be migrated into Turso on first connect,
+    /// preserving its rows, leaving a `.sqlite-backup`, and never re-migrating.
+    #[tokio::test]
+    async fn migrates_legacy_sqlite_file_into_turso() {
+        let path = std::env::temp_dir().join("shion_memory_db_migrate.db");
+        crate::infra::persistence::reset_test_db(&path);
+
+        // 1. Seed a legacy SQLite file with two memories via the SQLite driver.
+        {
+            let sdb = toasty::Db::builder()
+                .models(toasty::models!(MemoryRecord))
+                .connect(&format!("sqlite:{}", path.display()))
+                .await
+                .unwrap();
+            sdb.push_schema().await.unwrap();
+            let mut conn = sdb.connection().await.unwrap();
+            for r in [
+                record_from_memory(&Memory::new(MemoryKind::Project, "written in Rust")),
+                record_from_memory(&Memory::new(MemoryKind::Fact, "likes coffee")),
+            ] {
+                toasty::create!(MemoryRecord {
+                    id: r.id,
+                    kind: r.kind,
+                    content: r.content,
+                    status: r.status,
+                    confidence: r.confidence,
+                    importance: r.importance,
+                    pinned: r.pinned,
+                    scope_type: r.scope_type,
+                    scope_key: r.scope_key,
+                    source: r.source,
+                    source_message_id: r.source_message_id,
+                    created_at: r.created_at,
+                    updated_at: r.updated_at,
+                    expires_at: r.expires_at,
+                    last_used_at: r.last_used_at,
+                    recall_count: r.recall_count,
+                })
+                .exec(&mut conn)
+                .await
+                .unwrap();
+            }
+        }
+
+        // 2. Connect over Turso: the rows migrate, backup + marker appear.
+        let db = MemoryDb::connect(&format!("turso:{}", path.display()))
+            .await
+            .unwrap();
+        let mut contents: Vec<String> = db
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        contents.sort();
+        assert_eq!(contents, vec!["likes coffee", "written in Rust"]);
+        assert!(sqlite_backup_path(&path).exists(), "sqlite backup kept");
+        assert!(turso_marker_path(&path).exists(), "turso marker written");
+
+        // 3. Add a row, reconnect: no re-migration (still 3, not 5).
+        db.save(&Memory::new(MemoryKind::Fact, "third"))
+            .await
+            .unwrap();
+        drop(db);
+        let db2 = MemoryDb::connect(&format!("turso:{}", path.display()))
+            .await
+            .unwrap();
+        assert_eq!(db2.list().await.unwrap().len(), 3, "must not re-migrate");
+    }
+
+    /// An existing memory.db created before `recall_count` existed must gain the
+    /// column **in place** on connect — additive ALTER, no data loss — rather
+    /// than force a destructive reset.
+    #[tokio::test]
+    async fn adds_missing_recall_count_column_in_place() {
+        let path = std::env::temp_dir().join("shion_memory_db_addcol.db");
+        crate::infra::persistence::reset_test_db(&path);
+
+        // 1. Seed a turso file with the OLD 15-column schema (no recall_count)
+        //    and one row, then drop the handle.
+        {
+            let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+            conn.execute(
+                "CREATE TABLE \"memory_records\" (\
+                 \"id\" TEXT NOT NULL, \"kind\" TEXT NOT NULL, \"content\" TEXT NOT NULL, \
+                 \"status\" TEXT NOT NULL, \"confidence\" TEXT NOT NULL, \"importance\" BIGINT NOT NULL, \
+                 \"pinned\" BOOLEAN NOT NULL, \"scope_type\" TEXT NOT NULL, \"scope_key\" TEXT NOT NULL, \
+                 \"source\" TEXT NOT NULL, \"source_message_id\" TEXT NOT NULL, \"created_at\" BIGINT NOT NULL, \
+                 \"updated_at\" BIGINT NOT NULL, \"expires_at\" BIGINT NOT NULL, \"last_used_at\" BIGINT NOT NULL, \
+                 PRIMARY KEY (\"id\"))",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO \"memory_records\" VALUES \
+                 ('mem-old', 'fact', 'a pre-migration memory', 'active', 'confirmed', 50, 0, \
+                 'global', '', '', '', 100, 100, 0, 0)",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        // Mark it turso-native so connect() does not stage it as a sqlite backup.
+        std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
+
+        // 2. Connect via MemoryDb: ensure_columns adds recall_count in place.
+        let db = MemoryDb::connect(&format!("turso:{}", path.display()))
+            .await
+            .unwrap();
+        let rows = db.list().await.unwrap();
+        assert_eq!(rows.len(), 1, "the pre-migration row survives");
+        assert_eq!(rows[0].content, "a pre-migration memory");
+        assert_eq!(rows[0].recall_count, 0, "new column defaults to 0");
+
+        // 3. The added column is fully usable: a recall bump persists.
+        db.mark_used(&[rows[0].id.clone()], 9_000).await.unwrap();
+        assert_eq!(db.get("mem-old").await.unwrap().unwrap().recall_count, 1);
     }
 
     #[tokio::test]
     async fn save_list_roundtrip_and_overwrite() {
-        let db = MemoryDb::connect(&sqlite_url("shion_memory_db_roundtrip.db"))
+        let db = MemoryDb::connect(&turso_url("shion_memory_db_roundtrip.db"))
             .await
             .unwrap();
         let mut m = Memory::new(MemoryKind::Preference, "prefers concise answers");
@@ -246,7 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_hidden_from_list() {
-        let db = MemoryDb::connect(&sqlite_url("shion_memory_db_expired.db"))
+        let db = MemoryDb::connect(&turso_url("shion_memory_db_expired.db"))
             .await
             .unwrap();
         db.save(&Memory::new(MemoryKind::Fact, "live"))
@@ -263,7 +550,7 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_filters_by_eligibility_and_scope() {
-        let db = MemoryDb::connect(&sqlite_url("shion_memory_db_pinned.db"))
+        let db = MemoryDb::connect(&turso_url("shion_memory_db_pinned.db"))
             .await
             .unwrap();
 
@@ -292,8 +579,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recall_returns_in_scope_active_matches_only() {
-        let db = MemoryDb::connect(&sqlite_url("shion_memory_db_recall.db"))
+    async fn recall_returns_in_scope_active_and_candidate_matches() {
+        let db = MemoryDb::connect(&turso_url("shion_memory_db_recall.db"))
             .await
             .unwrap();
 
@@ -308,10 +595,15 @@ mod tests {
         db.save(&Memory::new(MemoryKind::Fact, "the user likes coffee"))
             .await
             .unwrap();
-        // Relevant but a candidate → excluded by status.
-        let mut cand = Memory::new(MemoryKind::Fact, "rust toolchain pinned to nightly");
+        // Relevant candidate → INCLUDED (so it can earn its recall signal for
+        // the dreaming loop), though it ranks below the active hit.
+        let mut cand = Memory::new(MemoryKind::Fact, "the rust toolchain is pinned to nightly");
         cand.status = MemoryStatus::Candidate;
         db.save(&cand).await.unwrap();
+        // Relevant but rejected → excluded by status.
+        let mut rejected = Memory::new(MemoryKind::Fact, "rust borrow checker notes");
+        rejected.status = MemoryStatus::Rejected;
+        db.save(&rejected).await.unwrap();
         // Relevant but scoped to another channel → excluded by scope.
         let mut other = Memory::new(MemoryKind::Fact, "rust edition is 2021");
         other.scope = MemoryScope::Channel {
@@ -325,13 +617,26 @@ mod tests {
             .recall(&ctx, "what language is the rust project in", 5)
             .await
             .unwrap();
-        assert_eq!(hits.len(), 1);
-        assert!(hits[0].memory.content.contains("written in Rust"));
+        // Active + candidate both recalled; rejected and out-of-scope excluded.
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits.iter()
+                .any(|h| h.memory.content.contains("written in Rust"))
+        );
+        assert!(
+            hits.iter()
+                .any(|h| h.memory.status == MemoryStatus::Candidate)
+        );
+        assert!(
+            !hits
+                .iter()
+                .any(|h| h.memory.status == MemoryStatus::Rejected)
+        );
     }
 
     #[tokio::test]
     async fn mark_used_sets_last_used_without_touching_updated_at() {
-        let db = MemoryDb::connect(&sqlite_url("shion_memory_db_mark_used.db"))
+        let db = MemoryDb::connect(&turso_url("shion_memory_db_mark_used.db"))
             .await
             .unwrap();
         let mut m = Memory::new(MemoryKind::Fact, "recalled at least once");
@@ -339,9 +644,11 @@ mod tests {
         db.save(&m).await.unwrap();
 
         db.mark_used(&[m.id.clone()], 9_000).await.unwrap();
+        db.mark_used(&[m.id.clone()], 9_100).await.unwrap();
 
         let after = db.get(&m.id).await.unwrap().unwrap();
-        assert_eq!(after.last_used_at, Some(9_000));
+        assert_eq!(after.last_used_at, Some(9_100));
+        assert_eq!(after.recall_count, 2, "each recall bumps the count");
         assert_eq!(after.updated_at, 500, "recall must not bump updated_at");
     }
 
@@ -355,7 +662,7 @@ mod tests {
             .await
             .unwrap();
 
-        let db = MemoryDb::connect(&sqlite_url("shion_memory_db_import.db"))
+        let db = MemoryDb::connect(&turso_url("shion_memory_db_import.db"))
             .await
             .unwrap();
         assert_eq!(db.import_legacy_markdown(&dir).await.unwrap(), 1);

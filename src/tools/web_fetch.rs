@@ -66,13 +66,15 @@ impl Tool for WebFetchTool {
             .header(reqwest::header::USER_AGENT, USER_AGENT)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("request to {} failed: {e}", args.url))?;
+            .map_err(|e| {
+                crate::tools::http::transport_error(e, format!("request to {} failed", args.url))
+            })?;
 
         let status = resp.status();
         let body = resp
             .text()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to read body: {e}"))?;
+            .map_err(|e| crate::tools::http::transport_error(e, "failed to read body"))?;
 
         let mut text = strip_html(&body);
         truncate_to_char_boundary(&mut text, MAX_BYTES);

@@ -1,6 +1,9 @@
 use clap::{Parser, Subcommand};
 
-use super::{chat, doctor, gateway, inspect, logs, memory, model, pair, service, wechat, workday};
+use super::{
+    chat, doctor, dream, gateway, inspect, logs, memory, model, pair, service, upgrade, wechat,
+    workday,
+};
 
 #[derive(Parser)]
 #[command(name = "shion", version, about = "Personal agent framework")]
@@ -20,6 +23,13 @@ enum Commands {
     Gateway {
         #[command(subcommand)]
         action: Option<GatewayAction>,
+    },
+    /// Pull the latest source, rebuild + reinstall the binary, and restart the
+    /// gateway so the new build goes live (shion's analog of `hermes update`)
+    Upgrade {
+        /// Rebuild and reinstall, but don't restart the gateway
+        #[arg(long)]
+        no_restart: bool,
     },
     /// Inspect scheduled reminders (recurring crons and one-shots)
     Cron {
@@ -45,6 +55,13 @@ enum Commands {
     Memory {
         #[command(subcommand)]
         action: MemoryAction,
+    },
+    /// Run (or preview) usage-driven memory consolidation: promote well-recalled
+    /// candidates to active, archive ones that never earned a recall
+    Dream {
+        /// Apply the cycle (mutate the store). Without it, this is a dry run.
+        #[arg(long)]
+        apply: bool,
     },
     /// Inspect registered skills
     Skill {
@@ -211,15 +228,13 @@ enum SessionAction {
 
 #[derive(Subcommand)]
 enum GatewayAction {
-    /// Install and start the gateway under launchd (auto-restart on crash,
-    /// start at login)
+    /// macOS only: install and start the gateway under launchd
     Start,
-    /// Stop the gateway and remove it from launchd
+    /// macOS only: stop the gateway and remove it from launchd
     Stop,
-    /// Restart the gateway under launchd (regenerates the plist, so a
-    /// reinstalled binary is picked up)
+    /// macOS only: restart the launchd gateway
     Restart,
-    /// Show launchd state for the gateway
+    /// macOS only: show launchd state for the gateway
     Status,
 }
 
@@ -243,6 +258,7 @@ pub async fn run() -> anyhow::Result<()> {
             Some(GatewayAction::Restart) => service::restart(),
             Some(GatewayAction::Status) => service::status(),
         },
+        Commands::Upgrade { no_restart } => upgrade::run(no_restart),
         Commands::Cron { action } => match action {
             CronAction::List => inspect::cron_list(&db).await,
         },
@@ -268,6 +284,9 @@ pub async fn run() -> anyhow::Result<()> {
                 MemoryAction::Pin { id } => memory::pin(&url, &id).await,
                 MemoryAction::Report => memory::report(&url).await,
             }
+        }
+        Commands::Dream { apply } => {
+            dream::run(&crate::config::default_memory_db_url(), apply).await
         }
         Commands::Skill { action } => match action {
             SkillAction::List => inspect::skill_list(&db).await,
@@ -302,6 +321,7 @@ pub async fn run() -> anyhow::Result<()> {
 /// then prune. Exactly one of the two must be given (clap enforces mutual
 /// exclusion, but not presence).
 async fn run_prune(db: &str, before: Option<String>, keep: Option<usize>) -> anyhow::Result<()> {
+    crate::cli::gateway_client::refuse_if_gateway_running("run prune").await?;
     let cutoff = match (before, keep) {
         (Some(date), None) => parse_local_date(&date)?,
         (None, Some(keep)) => match inspect::run_keep_cutoff(db, keep).await? {

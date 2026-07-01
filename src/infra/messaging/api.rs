@@ -27,7 +27,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::{
     Json, Router,
-    extract::{Path, Query, Request, State},
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::{StatusCode, header::AUTHORIZATION},
     middleware::{self, Next},
     response::{
@@ -36,7 +36,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -46,13 +46,19 @@ use crate::{
     config::ApiConfig,
     domain::{
         gateway::MessageHandler,
-        memory::{MemoryRepository, MemoryStatus, parse_memory_status},
-        repository::{MessageRepository, SessionRepository},
+        memory::{
+            DreamVerdict, MemoryRepository, MemoryStatus, dream_score, dream_verdict,
+            parse_memory_status,
+        },
+        pairing::{PairingRepository, PairingStatus},
+        reminder::ReminderRepository,
+        repository::{MessageRepository, SessionRepository, SkillRepository},
         run::RunRepository,
         task::TaskRepository,
     },
     services::tool_registry::{SessionContext, with_session},
 };
+use std::net::SocketAddr;
 
 /// Everything the HTTP handlers need, cheaply cloned per request (all `Arc`).
 #[derive(Clone)]
@@ -64,6 +70,9 @@ struct AppState {
     tasks: Arc<dyn TaskRepository>,
     memories: Arc<dyn MemoryRepository>,
     runs: Arc<dyn RunRepository>,
+    reminders: Arc<dyn ReminderRepository>,
+    skills: Arc<dyn SkillRepository>,
+    pairings: Arc<dyn PairingRepository>,
     /// Channel names enabled on this gateway (for `/api/status`).
     channels: Arc<Vec<String>>,
     /// Resolved config `home_chat` fallback, if any (for `/api/status`).
@@ -87,6 +96,9 @@ impl ApiChannel {
         tasks: Arc<dyn TaskRepository>,
         memories: Arc<dyn MemoryRepository>,
         runs: Arc<dyn RunRepository>,
+        reminders: Arc<dyn ReminderRepository>,
+        skills: Arc<dyn SkillRepository>,
+        pairings: Arc<dyn PairingRepository>,
         channels: Vec<String>,
         home: Option<String>,
     ) -> Self {
@@ -101,6 +113,9 @@ impl ApiChannel {
                 tasks,
                 memories,
                 runs,
+                reminders,
+                skills,
+                pairings,
                 channels: Arc::new(channels),
                 home,
             },
@@ -121,14 +136,33 @@ impl Channel for ApiChannel {
     ) -> anyhow::Result<()> {
         let addr = format!("{}:{}", self.bind, self.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        info!(%addr, "api channel listening");
+        // With an ephemeral bind (port 0, the loopback-only default) the real
+        // port is only known after bind — read it back and advertise it.
+        let local = listener.local_addr()?;
+        info!(addr = %local, "api channel listening");
+        // Publish how to reach this gateway so the local `shion` CLI can route
+        // to it instead of opening the db (which Turso's exclusive lock forbids
+        // while the gateway holds it). Removed again on graceful shutdown.
+        crate::infra::rendezvous::write(&crate::infra::rendezvous::GatewayInfo {
+            pid: std::process::id(),
+            bind: self.bind.clone(),
+            port: local.port(),
+            key: self.state.api_key.as_ref().clone(),
+        });
         let app = build_router(self.state.clone());
         let graceful = async move {
             let _ = shutdown.changed().await;
         };
-        axum::serve(listener, app)
-            .with_graceful_shutdown(graceful)
-            .await?;
+        // `into_make_service_with_connect_info` so handlers can see the peer
+        // address — the trusted-chat path is gated to loopback callers.
+        let result = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(graceful)
+        .await;
+        crate::infra::rendezvous::clear();
+        result?;
         info!("api channel stopped");
         Ok(())
     }
@@ -147,6 +181,10 @@ fn build_router(state: AppState) -> Router {
         .route("/api/memories", get(list_memories))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
+        .route("/api/reminders", get(list_reminders))
+        .route("/api/skills", get(list_skills))
+        .route("/api/pairings", get(list_pairings))
+        .route("/api/dream", get(dream_preview))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
@@ -230,6 +268,7 @@ async fn list_models() -> impl IntoResponse {
 
 async fn chat_completions(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
@@ -241,13 +280,19 @@ async fn chat_completions(
         req.model.clone()
     };
 
-    // Synchronous: drive the turn directly and await the reply. A detached
-    // (non-interactive) context auto-denies any approval-needing tool call.
-    let reply = with_session(
-        SessionContext::detached(&session_id),
-        state.handler.handle(&session_id, input),
-    )
-    .await?;
+    // A **trusted** turn — `shion chat` routed over the gateway's loopback api
+    // channel — auto-approves side-effecting tools (the CLI user is the host
+    // operator). Gated to loopback callers so a publicly-bound api can never
+    // reach it; everyone else gets the detached (auto-deny) context.
+    let trusted = peer.ip().is_loopback() && headers.contains_key("x-shion-trusted");
+    let ctx = if trusted {
+        SessionContext::trusted(&session_id)
+    } else {
+        SessionContext::detached(&session_id)
+    };
+
+    // Synchronous: drive the turn directly and await the reply.
+    let reply = with_session(ctx, state.handler.handle(&session_id, input)).await?;
 
     let id = format!("chatcmpl-{}", uuid::Uuid::now_v7());
     let created = now();
@@ -363,17 +408,16 @@ async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
 
 async fn list_sessions(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     // Summaries only — never dump every transcript in a list view.
-    let sessions: Vec<Value> = state
+    let sessions: Vec<SessionSummary> = state
         .sessions
         .list()
         .await?
         .into_iter()
-        .map(|s| {
-            json!({
-                "id": s.id,
-                "created_at": s.created_at,
-                "messages": s.messages.len(),
-            })
+        .map(|s| SessionSummary {
+            created_at: s.created_at,
+            messages: s.messages.len(),
+            user_turns: s.user_turns(),
+            id: s.id,
         })
         .collect();
     Ok(Json(json!({ "sessions": sessions })))
@@ -388,26 +432,9 @@ async fn session_messages(
 }
 
 async fn list_tasks(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let tasks: Vec<Value> = state
-        .tasks
-        .list_open()
-        .await?
-        .into_iter()
-        .map(|t| {
-            json!({
-                "id": t.id,
-                "title": t.title,
-                "note": t.note,
-                "status": t.status.as_str(),
-                "waiting_on": t.waiting_on,
-                "due_at": t.due_at,
-                "board": t.board,
-                "source": t.source,
-                "created_at": t.created_at,
-                "completed_at": t.completed_at,
-            })
-        })
-        .collect();
+    // `Task` serializes verbatim (snake_case status), so the CLI deserializes it
+    // straight back into the domain type and reuses its existing renderer.
+    let tasks = state.tasks.list_open().await?;
     Ok(Json(json!({ "tasks": tasks })))
 }
 
@@ -439,23 +466,7 @@ async fn list_runs(
     Query(params): Query<RunsQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
-    let runs: Vec<Value> = state
-        .runs
-        .list(limit)
-        .await?
-        .into_iter()
-        .map(|r| {
-            json!({
-                "id": r.id,
-                "session_id": r.session_id,
-                "input": r.input,
-                "plan": r.plan,
-                "status": r.status.as_str(),
-                "started_at": r.started_at,
-                "ended_at": r.ended_at,
-            })
-        })
-        .collect();
+    let runs = state.runs.list(limit).await?;
     Ok(Json(json!({ "runs": runs })))
 }
 
@@ -470,37 +481,109 @@ async fn get_run(
         )
             .into_response());
     };
-    let steps: Vec<Value> = state
-        .runs
-        .steps(&id)
+    // `Run` and `RunStep` serialize verbatim; the CLI reuses its run renderer.
+    let steps = state.runs.steps(&id).await?;
+    Ok(Json(json!({ "run": run, "steps": steps })).into_response())
+}
+
+// ---- control-plane read endpoints (CLI ↔ gateway) --------------------------
+
+/// Pending reminders (backs `shion cron list`), soonest first.
+async fn list_reminders(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let mut pending = state.reminders.list_pending().await?;
+    pending.sort_by_key(|r| r.run_at);
+    Ok(Json(json!({ "reminders": pending })))
+}
+
+/// Registered skills (backs `shion skill list`), by name.
+async fn list_skills(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let mut skills = state.skills.list().await?;
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Json(json!({ "skills": skills })))
+}
+
+/// Pairings (backs `shion pair list`). A hash-free view — the salted code hash
+/// and per-row salt are never serialized off the host.
+async fn list_pairings(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let now = now();
+    let pairings: Vec<PairingView> = state
+        .pairings
+        .list()
         .await?
         .into_iter()
-        .map(|s| {
-            json!({
-                "seq": s.seq,
-                "tool_name": s.tool_name,
-                "args": s.args,
-                "result": s.result,
-                "error": s.error,
-                "ok": s.ok,
-                "started_at": s.started_at,
-                "ended_at": s.ended_at,
-            })
+        .map(|p| {
+            let status = match p.status {
+                PairingStatus::Approved => "approved",
+                PairingStatus::Pending if p.is_expired(now) => "expired",
+                PairingStatus::Pending => "pending",
+            };
+            PairingView {
+                id: p.id,
+                status: status.to_string(),
+                created_at: p.created_at,
+            }
         })
         .collect();
-    Ok(Json(json!({
-        "id": run.id,
-        "session_id": run.session_id,
-        "input": run.input,
-        "plan": run.plan,
-        "status": run.status.as_str(),
-        "final_output": run.final_output,
-        "error": run.error,
-        "started_at": run.started_at,
-        "ended_at": run.ended_at,
-        "steps": steps,
-    }))
-    .into_response())
+    Ok(Json(json!({ "pairings": pairings })))
+}
+
+/// The dreaming dry-run classification (backs `shion dream`, no `--apply`):
+/// which candidates would promote / archive, with their scores. Read-only.
+async fn dream_preview(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let now = now();
+    let memories = state.memories.list().await?;
+    let mut promote: Vec<DreamItem> = Vec::new();
+    let mut archive: Vec<DreamItem> = Vec::new();
+    for m in &memories {
+        let item = DreamItem {
+            id: m.id.clone(),
+            recall_count: m.recall_count,
+            score: dream_score(m, now),
+            content: m.content.clone(),
+        };
+        match dream_verdict(m, now) {
+            DreamVerdict::Promote => promote.push(item),
+            DreamVerdict::Archive => archive.push(item),
+            DreamVerdict::Keep => {}
+        }
+    }
+    promote.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(Json(json!({ "promote": promote, "archive": archive })))
+}
+
+// ---- shared control-plane view types ---------------------------------------
+// Serialized by the endpoints above and deserialized by the CLI gateway client
+// (`cli::gateway_client`), so they live here as the single source of truth.
+
+/// A session list row (full transcripts are never dumped in a list view).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub created_at: i64,
+    pub messages: usize,
+    pub user_turns: usize,
+}
+
+/// A pairing row without the salted code hash / salt (never leaves the host).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingView {
+    pub id: String,
+    /// `pending` | `approved` | `expired`.
+    pub status: String,
+    pub created_at: i64,
+}
+
+/// One candidate in the dreaming preview, with the score that drove its verdict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DreamItem {
+    pub id: String,
+    pub recall_count: i64,
+    pub score: f64,
+    pub content: String,
 }
 
 /// Unix seconds, for OpenAI `created` fields.

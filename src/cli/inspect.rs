@@ -4,13 +4,17 @@
 //! runtime. They are the operator's view into what the gateway will act on.
 
 use crate::{
+    cli::gateway_client::{GatewayClient, refuse_if_gateway_running},
     domain::{
         reminder::ReminderRepository,
         repository::{SessionRepository, SkillRepository},
         run::RunRepository,
         task::{TaskRepository, TaskStatus},
     },
-    infra::persistence::{db::Db, kanban::KanbanDb},
+    infra::{
+        messaging::api::SessionSummary,
+        persistence::{db::Db, kanban::KanbanDb},
+    },
 };
 
 fn local_time(unix: i64) -> String {
@@ -22,8 +26,10 @@ fn local_time(unix: i64) -> String {
 /// List pending reminders with their schedules (recurring ones show the cron
 /// expression, one-shots are marked as such).
 pub async fn cron_list(db_url: &str) -> anyhow::Result<()> {
-    let db = Db::connect(db_url).await?;
-    let mut pending = ReminderRepository::list_pending(&db).await?;
+    let mut pending = match GatewayClient::try_connect().await {
+        Some(gw) => gw.reminders().await?,
+        None => ReminderRepository::list_pending(&Db::connect(db_url).await?).await?,
+    };
     pending.sort_by_key(|r| r.run_at);
 
     if pending.is_empty() {
@@ -53,8 +59,10 @@ pub async fn cron_list(db_url: &str) -> anyhow::Result<()> {
 
 /// List open tasks grouped by status (inbox first — it needs triage).
 pub async fn task_list(kanban_url: &str) -> anyhow::Result<()> {
-    let db = KanbanDb::connect(kanban_url).await?;
-    let open = TaskRepository::list_open(&db).await?;
+    let open = match GatewayClient::try_connect().await {
+        Some(gw) => gw.tasks().await?,
+        None => TaskRepository::list_open(&KanbanDb::connect(kanban_url).await?).await?,
+    };
 
     if open.is_empty() {
         println!("No open tasks.");
@@ -98,8 +106,10 @@ fn oneline(s: &str, n: usize) -> String {
 /// List recent runs (most recent first), one per line: id, status, time, plan,
 /// and a snippet of the input. The run ledger (roadmap §7).
 pub async fn run_list(db_url: &str, limit: usize) -> anyhow::Result<()> {
-    let db = Db::connect(db_url).await?;
-    let runs = RunRepository::list(&db, limit).await?;
+    let runs = match GatewayClient::try_connect().await {
+        Some(gw) => gw.runs(limit).await?,
+        None => RunRepository::list(&Db::connect(db_url).await?, limit).await?,
+    };
 
     if runs.is_empty() {
         println!("No runs recorded.");
@@ -120,8 +130,20 @@ pub async fn run_list(db_url: &str, limit: usize) -> anyhow::Result<()> {
 
 /// Show one run in full: its input, plan, outcome, and every tool step in order.
 pub async fn run_inspect(db_url: &str, id: &str) -> anyhow::Result<()> {
-    let db = Db::connect(db_url).await?;
-    let Some(run) = RunRepository::get(&db, id).await? else {
+    let fetched = match GatewayClient::try_connect().await {
+        Some(gw) => gw.run(id).await?,
+        None => {
+            let db = Db::connect(db_url).await?;
+            match RunRepository::get(&db, id).await? {
+                Some(run) => {
+                    let steps = RunRepository::steps(&db, &run.id).await?;
+                    Some((run, steps))
+                }
+                None => None,
+            }
+        }
+    };
+    let Some((run, steps)) = fetched else {
         println!("No run with id `{id}`.");
         return Ok(());
     };
@@ -144,7 +166,6 @@ pub async fn run_inspect(db_url: &str, id: &str) -> anyhow::Result<()> {
         println!("output  {}", oneline(&run.final_output, 200));
     }
 
-    let steps = RunRepository::steps(&db, &run.id).await?;
     if steps.is_empty() {
         println!("\n(no tool steps)");
         return Ok(());
@@ -194,8 +215,10 @@ pub async fn run_keep_cutoff(db_url: &str, keep: usize) -> anyhow::Result<Option
 
 /// List registered skills (name, protected flag, and a one-line description).
 pub async fn skill_list(db_url: &str) -> anyhow::Result<()> {
-    let db = Db::connect(db_url).await?;
-    let mut skills = SkillRepository::list(&db).await?;
+    let mut skills = match GatewayClient::try_connect().await {
+        Some(gw) => gw.skills().await?,
+        None => SkillRepository::list(&Db::connect(db_url).await?).await?,
+    };
     if skills.is_empty() {
         println!("No skills registered.");
         return Ok(());
@@ -210,8 +233,19 @@ pub async fn skill_list(db_url: &str) -> anyhow::Result<()> {
 
 /// List stored sessions with creation time and message counts.
 pub async fn session_list(db_url: &str) -> anyhow::Result<()> {
-    let db = Db::connect(db_url).await?;
-    let sessions = SessionRepository::list(&db).await?;
+    let sessions: Vec<SessionSummary> = match GatewayClient::try_connect().await {
+        Some(gw) => gw.sessions().await?,
+        None => SessionRepository::list(&Db::connect(db_url).await?)
+            .await?
+            .into_iter()
+            .map(|s| SessionSummary {
+                created_at: s.created_at,
+                messages: s.messages.len(),
+                user_turns: s.user_turns(),
+                id: s.id,
+            })
+            .collect(),
+    };
 
     if sessions.is_empty() {
         println!("No sessions.");
@@ -222,8 +256,8 @@ pub async fn session_list(db_url: &str) -> anyhow::Result<()> {
             "{}  created {}  {} messages ({} user turns)",
             s.id,
             local_time(s.created_at),
-            s.messages.len(),
-            s.user_turns()
+            s.messages,
+            s.user_turns
         );
     }
     Ok(())
@@ -232,6 +266,7 @@ pub async fn session_list(db_url: &str) -> anyhow::Result<()> {
 /// Delete every session with zero messages. An operator action — run it by
 /// hand or from an external scheduler (launchd/cron), e.g. daily at 4am.
 pub async fn session_clean(db_url: &str) -> anyhow::Result<()> {
+    refuse_if_gateway_running("session clean").await?;
     let db = Db::connect(db_url).await?;
     let removed = SessionRepository::delete_empty_sessions(&db).await?;
     println!("Removed {removed} empty session(s).");

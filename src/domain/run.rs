@@ -1,8 +1,7 @@
 //! The run ledger — an execution/audit record of every agent turn
 //! (docs/personal-agent-roadmap.md §7). One [`Run`] per user turn, with one
-//! [`RunStep`] per tool invocation (captured at the single choke point both the
-//! LLM function-calling path and the keyword-routed path funnel through,
-//! `services::tool_registry::execute_isolated`).
+//! [`RunStep`] per tool invocation (captured at the single choke point every
+//! tool call funnels through, `services::tool_registry::execute_isolated`).
 //!
 //! Runs are execution state bound to a session, so they live in `shion.db`
 //! (disposable dev state) alongside sessions/messages — not in the durable
@@ -36,7 +35,8 @@ pub fn truncate(s: &str, cap: usize) -> String {
     out
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     /// The turn is in flight (set at start; an in-flight crash leaves it here).
     Running,
@@ -67,7 +67,7 @@ pub fn parse_run_status(s: &str) -> anyhow::Result<RunStatus> {
 
 /// One agent turn: the user input, a short outcome summary, the final reply,
 /// and the status. Steps (tool calls) hang off it by `run_id`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Run {
     pub id: String,
     pub session_id: String,
@@ -110,7 +110,7 @@ impl Run {
 /// (truncated), except that each tool may redact its own args before they reach
 /// the ledger (see [`crate::domain::tool::Tool::redact_args`]) — `shell` scrubs
 /// secret-looking substrings, `file` drops write bodies.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunStep {
     pub run_id: String,
     /// Monotonic order within the run (assigned by the run's shared counter).

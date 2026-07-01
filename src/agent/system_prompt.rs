@@ -444,6 +444,7 @@ mod tests {
             aux_model: None,
             max_turns: DEFAULT_MAX_TURNS,
             max_tool_result_bytes: crate::config::DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_history_messages: crate::config::DEFAULT_MAX_HISTORY_MESSAGES,
         }
     }
 

@@ -1,5 +1,47 @@
 use async_trait::async_trait;
 
+/// A failure's retry-safety, classified at its source (where the typed cause is
+/// still intact — e.g. a `reqwest::Error`, before it is flattened to a string)
+/// and carried on the error via [`TransientError`]. The retry layer
+/// (`services::tool_registry`) reads this in preference to sniffing the error's
+/// Display text. Mirrors the buckets that layer acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryHint {
+    /// The request provably never reached the server (connection refused, DNS
+    /// failure). Safe to retry for any tool — no side effect can have landed.
+    Connection,
+    /// Landed-or-not is ambiguous (timeout, 5xx, rate-limit). Retry only an
+    /// idempotent tool, so a side effect is never applied twice.
+    Ambiguous,
+}
+
+/// An error that classifies its own retry-safety via a [`RetryHint`]. A tool
+/// builds one at the failure's source (see `tools::http`) so the retry layer
+/// decides from a typed signal rather than a heuristic string match; anything
+/// that doesn't classify itself falls back to that heuristic.
+#[derive(Debug)]
+pub struct TransientError {
+    pub hint: RetryHint,
+    pub message: String,
+}
+
+impl TransientError {
+    pub fn new(hint: RetryHint, message: impl Into<String>) -> Self {
+        Self {
+            hint,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for TransientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TransientError {}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;

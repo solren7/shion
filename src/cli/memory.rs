@@ -4,6 +4,7 @@
 //! host-side operator view: it lists and searches across *all* scopes, so you
 //! can triage candidates the reviewer captured and promote/pin the durable ones.
 
+use crate::cli::gateway_client::{GatewayClient, refuse_if_gateway_running};
 use crate::domain::memory::{Memory, MemoryConfidence, MemoryRepository, MemoryStatus};
 use crate::infra::memory::memory_db::MemoryDb;
 
@@ -11,13 +12,22 @@ async fn store(url: &str) -> anyhow::Result<MemoryDb> {
     MemoryDb::connect(url).await
 }
 
+/// Load every memory — from a running gateway (which holds the db lock) if one
+/// is up, else straight from the db. The CLI's list/search/report all filter
+/// this set client-side, so one loader serves all three.
+async fn load_all(url: &str) -> anyhow::Result<Vec<Memory>> {
+    match GatewayClient::try_connect().await {
+        Some(gw) => gw.memories().await,
+        None => store(url).await?.list().await,
+    }
+}
+
 /// List stored memories, optionally filtered by status.
 pub async fn list(url: &str, status: Option<String>) -> anyhow::Result<()> {
-    let db = store(url).await?;
     let filter = status
         .as_deref()
         .map(crate::domain::memory::parse_memory_status);
-    let mut memories = db.list().await?;
+    let mut memories = load_all(url).await?;
     if let Some(status) = filter {
         memories.retain(|m| m.status == status);
     }
@@ -40,10 +50,8 @@ pub async fn list(url: &str, status: Option<String>) -> anyhow::Result<()> {
 
 /// Substring search across all scopes (operator view — no scope enforcement).
 pub async fn search(url: &str, query: &str) -> anyhow::Result<()> {
-    let db = store(url).await?;
     let needle = query.to_lowercase();
-    let hits: Vec<Memory> = db
-        .list()
+    let hits: Vec<Memory> = load_all(url)
         .await?
         .into_iter()
         .filter(|m| m.content.to_lowercase().contains(&needle))
@@ -60,6 +68,7 @@ pub async fn search(url: &str, query: &str) -> anyhow::Result<()> {
 
 /// Promote a candidate to an active, confirmed memory.
 pub async fn promote(url: &str, id: &str) -> anyhow::Result<()> {
+    refuse_if_gateway_running("memory promote").await?;
     mutate(url, id, |m| {
         m.status = MemoryStatus::Active;
         m.confidence = MemoryConfidence::Confirmed;
@@ -71,6 +80,7 @@ pub async fn promote(url: &str, id: &str) -> anyhow::Result<()> {
 
 /// Reject a candidate (won't surface in recall or injection).
 pub async fn reject(url: &str, id: &str) -> anyhow::Result<()> {
+    refuse_if_gateway_running("memory reject").await?;
     mutate(url, id, |m| m.status = MemoryStatus::Rejected).await?;
     println!("Rejected {id}.");
     Ok(())
@@ -79,6 +89,7 @@ pub async fn reject(url: &str, id: &str) -> anyhow::Result<()> {
 /// Pin a memory into the L1 per-turn profile (the manual, explicit path —
 /// automated extraction never pins). Raises confidence so it actually surfaces.
 pub async fn pin(url: &str, id: &str) -> anyhow::Result<()> {
+    refuse_if_gateway_running("memory pin").await?;
     mutate(url, id, |m| {
         m.pinned = true;
         m.status = MemoryStatus::Active;
@@ -96,11 +107,10 @@ pub async fn pin(url: &str, id: &str) -> anyhow::Result<()> {
 /// triage, the pinned L1 set, low-confidence actives, long-unused actives, and
 /// expired memories. Read-only; suggests `promote`/`reject`/`archive`/`pin`.
 ///
-/// Note: there is no recall-count signal yet (only `last_used_at`), so "high
-/// frequency hits" can't be reported — "long unused" is the recency proxy.
+/// Recall counts (the dreaming usage signal) are shown per line; `shion dream`
+/// previews which candidates that signal would promote or archive.
 pub async fn report(url: &str) -> anyhow::Result<()> {
-    let db = store(url).await?;
-    let memories = db.list().await?;
+    let memories = load_all(url).await?;
     if memories.is_empty() {
         println!("(no memories)");
         return Ok(());
@@ -211,6 +221,9 @@ fn line(m: &Memory) -> String {
         pin,
         m.content
     );
+    if m.recall_count > 0 {
+        s.push_str(&format!("  (recalls={})", m.recall_count));
+    }
     if !m.source.is_empty() {
         s.push_str(&format!("  (from {})", m.source));
     }

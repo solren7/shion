@@ -1,8 +1,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use toasty_driver_turso::Turso;
 use tracing::info;
+
+use crate::infra::persistence::{
+    DEFAULT_POOL_SIZE, stage_sqlite_backup, turso_marker_path, with_write_retry,
+};
 
 use crate::domain::{
     home::HomeRepository,
@@ -33,9 +37,11 @@ struct SessionRecord {
 
 #[derive(Debug, toasty::Model)]
 struct MessageRecord {
+    // UUIDv7 string key (time-ordered) rather than `#[auto]` autoincrement:
+    // Turso's MVCC concurrent-write mode rejects AUTOINCREMENT. Assigned at
+    // insert (`MessageRepository::save`).
     #[key]
-    #[auto]
-    id: u64,
+    id: String,
 
     #[index]
     session_id: String,
@@ -133,9 +139,10 @@ struct RunRecord {
 /// `seq` orders steps within a run.
 #[derive(Debug, toasty::Model)]
 struct RunStepRecord {
+    // UUIDv7 string key (see `MessageRecord`): MVCC rejects AUTOINCREMENT.
+    // Assigned at insert (`RunRepository::append_step`).
     #[key]
-    #[auto]
-    id: u64,
+    id: String,
 
     #[index]
     run_id: String,
@@ -155,17 +162,43 @@ const HOME_SETTING_KEY: &str = "home_chat";
 
 // ── Db ───────────────────────────────────────────────────────────────────────
 
+/// The disposable session/run/pairing store, over the Turso engine with a
+/// per-operation connection pool: `inner` is a plain `Arc<toasty::Db>` (no outer
+/// `Mutex`), so every method checks out a pooled `Connection` and independent
+/// reads/writes run concurrently. Concurrently-written tables (the run ledger)
+/// use [`with_write_retry`] for MVCC commit conflicts.
 pub struct Db {
-    inner: Arc<Mutex<toasty::Db>>,
+    inner: Arc<toasty::Db>,
 }
 
 impl Db {
     pub async fn connect(url: &str) -> anyhow::Result<Self> {
-        let is_new = url
-            .strip_prefix("sqlite:")
-            .map(|path| !std::path::Path::new(path).exists())
-            .unwrap_or(true);
+        // `url` is `turso:<path>` (or `turso::memory:`). The bare path is what the
+        // engine and the migration probe operate on.
+        let path = url
+            .strip_prefix("turso:")
+            .filter(|p| *p != ":memory:")
+            .map(std::path::PathBuf::from);
 
+        // shion.db is disposable (sessions, messages, runs, pairings, settings).
+        // A legacy SQLite file can't be reopened under Turso's MVCC mode, so move
+        // it aside to a `.sqlite-backup` (kept as a safety net) and start fresh.
+        // Durable personal data lives in memory.db / kanban.db, which migrate
+        // their rows instead of resetting.
+        if let Some(p) = &path {
+            if let Some(dir) = p.parent() {
+                std::fs::create_dir_all(dir).ok();
+            }
+            stage_sqlite_backup(p)?;
+        }
+
+        let is_new = path.as_deref().map(|p| !p.exists()).unwrap_or(true);
+
+        // MVCC concurrent-writes on (UUID keys throughout, so no AUTOINCREMENT).
+        let driver = match &path {
+            Some(p) => Turso::file(p).concurrent_writes(),
+            None => Turso::in_memory().concurrent_writes(),
+        };
         let db = toasty::Db::builder()
             .models(toasty::models!(
                 SessionRecord,
@@ -179,15 +212,21 @@ impl Db {
                 RunRecord,
                 RunStepRecord
             ))
-            .connect(url)
+            .max_pool_size(DEFAULT_POOL_SIZE)
+            .build(driver)
             .await?;
 
         if is_new {
             db.push_schema().await?;
+            // Mark the file Turso-native so a future run never mistakes it for a
+            // legacy SQLite file to stage aside.
+            if let Some(p) = &path {
+                std::fs::write(turso_marker_path(p), b"turso-native\n").ok();
+            }
         }
 
         Ok(Self {
-            inner: Arc::new(Mutex::new(db)),
+            inner: Arc::new(db),
         })
     }
 }
@@ -197,44 +236,47 @@ impl Db {
 #[async_trait]
 impl SkillRepository for Db {
     async fn find(&self, name: &str) -> anyhow::Result<Option<Skill>> {
-        let mut db = self.inner.lock().await;
-        match SkillRecord::get_by_name(&mut *db, name).await {
+        let mut conn = self.inner.connection().await?;
+        match SkillRecord::get_by_name(&mut conn, name).await {
             Ok(record) => Ok(Some(skill_from_record(record))),
             Err(_) => Ok(None),
         }
     }
 
     async fn list(&self) -> anyhow::Result<Vec<Skill>> {
-        let mut db = self.inner.lock().await;
-        let mut rows = toasty::query!(SkillRecord).exec(&mut *db).await?;
+        let mut conn = self.inner.connection().await?;
+        let mut rows = toasty::query!(SkillRecord).exec(&mut conn).await?;
         rows.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(rows.into_iter().map(skill_from_record).collect())
     }
 
     async fn save(&self, skill: &Skill) -> anyhow::Result<()> {
-        let mut db = self.inner.lock().await;
-        match SkillRecord::get_by_name(&mut *db, &skill.name).await {
-            Ok(mut record) => {
-                record
-                    .update()
-                    .description(skill.description.clone())
-                    .instructions(skill.instructions.clone())
-                    .protected(skill.protected)
-                    .exec(&mut *db)
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            match SkillRecord::get_by_name(&mut conn, &skill.name).await {
+                Ok(mut record) => {
+                    record
+                        .update()
+                        .description(skill.description.clone())
+                        .instructions(skill.instructions.clone())
+                        .protected(skill.protected)
+                        .exec(&mut conn)
+                        .await?;
+                }
+                Err(_) => {
+                    toasty::create!(SkillRecord {
+                        name: skill.name.clone(),
+                        description: skill.description.clone(),
+                        instructions: skill.instructions.clone(),
+                        protected: skill.protected,
+                    })
+                    .exec(&mut conn)
                     .await?;
+                }
             }
-            Err(_) => {
-                toasty::create!(SkillRecord {
-                    name: skill.name.clone(),
-                    description: skill.description.clone(),
-                    instructions: skill.instructions.clone(),
-                    protected: skill.protected,
-                })
-                .exec(&mut *db)
-                .await?;
-            }
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -243,46 +285,79 @@ impl SkillRepository for Db {
 #[async_trait]
 impl SessionRepository for Db {
     async fn find(&self, id: &str) -> anyhow::Result<Option<Session>> {
-        let mut db = self.inner.lock().await;
-        match SessionRecord::get_by_id(&mut *db, id).await {
-            Ok(record) => Ok(Some(session_from_record(&mut db, record).await?)),
+        let mut conn = self.inner.connection().await?;
+        match SessionRecord::get_by_id(&mut conn, id).await {
+            Ok(record) => Ok(Some(session_from_record(&mut conn, record).await?)),
             Err(_) => Ok(None),
         }
     }
 
+    async fn find_windowed(&self, id: &str, limit: usize) -> anyhow::Result<Option<Session>> {
+        // `limit == 0` means "no window" — fall back to the full load.
+        if limit == 0 {
+            return SessionRepository::find(self, id).await;
+        }
+        let mut conn = self.inner.connection().await?;
+        let Ok(record) = SessionRecord::get_by_id(&mut conn, id).await else {
+            return Ok(None);
+        };
+        // Pull the most recent `limit` messages via the `session_id` index
+        // (ORDER BY ... DESC LIMIT pushes both down to SQL), then restore
+        // chronological order for the caller.
+        let rows = toasty::query!(
+            MessageRecord FILTER .session_id == #id ORDER BY .timestamp DESC LIMIT #limit
+        )
+        .exec(&mut conn)
+        .await?;
+        let mut messages: Vec<Message> = rows
+            .into_iter()
+            .map(|r| Message {
+                role: parse_role(&r.role),
+                content: r.content,
+                timestamp: r.timestamp,
+            })
+            .collect();
+        messages.sort_by_key(|m| m.timestamp);
+        Ok(Some(Session {
+            id: record.id,
+            messages,
+            created_at: record.created_at,
+        }))
+    }
+
     async fn list(&self) -> anyhow::Result<Vec<Session>> {
-        let mut db = self.inner.lock().await;
-        let mut rows = toasty::query!(SessionRecord).exec(&mut *db).await?;
+        let mut conn = self.inner.connection().await?;
+        let mut rows = toasty::query!(SessionRecord).exec(&mut conn).await?;
         rows.sort_by_key(|r| r.created_at);
 
         let mut sessions = Vec::with_capacity(rows.len());
         for record in rows {
-            sessions.push(session_from_record(&mut db, record).await?);
+            sessions.push(session_from_record(&mut conn, record).await?);
         }
         Ok(sessions)
     }
 
     async fn save(&self, session: &Session) -> anyhow::Result<()> {
-        let mut db = self.inner.lock().await;
+        let mut conn = self.inner.connection().await?;
         // INSERT OR IGNORE semantics via error handling on duplicate key.
         let _ = toasty::create!(SessionRecord {
             id: session.id.clone(),
             created_at: session.created_at,
         })
-        .exec(&mut *db)
+        .exec(&mut conn)
         .await;
         Ok(())
     }
 
     async fn delete_empty_sessions(&self) -> anyhow::Result<usize> {
-        let mut db = self.inner.lock().await;
-        let rows = toasty::query!(SessionRecord).exec(&mut *db).await?;
+        let mut conn = self.inner.connection().await?;
+        let rows = toasty::query!(SessionRecord).exec(&mut conn).await?;
 
         let mut removed = 0usize;
         for record in rows {
-            let msgs = record.messages().exec(&mut *db).await?;
+            let msgs = record.messages().exec(&mut conn).await?;
             if msgs.is_empty() {
-                record.delete().exec(&mut *db).await?;
+                record.delete().exec(&mut conn).await?;
                 removed += 1;
             }
         }
@@ -294,12 +369,12 @@ impl SessionRepository for Db {
     }
 
     async fn rotate(&self, session_id: &str) -> anyhow::Result<Option<String>> {
-        let mut db = self.inner.lock().await;
+        let mut conn = self.inner.connection().await?;
         // Nothing to archive if the session is absent or already empty.
-        let Ok(live) = SessionRecord::get_by_id(&mut *db, session_id).await else {
+        let Ok(live) = SessionRecord::get_by_id(&mut conn, session_id).await else {
             return Ok(None);
         };
-        let msgs = live.messages().exec(&mut *db).await?;
+        let msgs = live.messages().exec(&mut conn).await?;
         if msgs.is_empty() {
             return Ok(None);
         }
@@ -312,18 +387,19 @@ impl SessionRepository for Db {
             id: archived_id.clone(),
             created_at: live.created_at,
         })
-        .exec(&mut *db)
+        .exec(&mut conn)
         .await?;
-        let archive = SessionRecord::get_by_id(&mut *db, &archived_id).await?;
+        let archive = SessionRecord::get_by_id(&mut conn, &archived_id).await?;
         for msg in msgs {
             toasty::create!(in archive.messages() {
+                id: uuid::Uuid::now_v7().to_string(),
                 role: msg.role.clone(),
                 content: msg.content.clone(),
                 timestamp: msg.timestamp,
             })
-            .exec(&mut *db)
+            .exec(&mut conn)
             .await?;
-            msg.delete().exec(&mut *db).await?;
+            msg.delete().exec(&mut conn).await?;
         }
         Ok(Some(archived_id))
     }
@@ -334,9 +410,9 @@ impl SessionRepository for Db {
 #[async_trait]
 impl MessageRepository for Db {
     async fn list_by_session(&self, session_id: &str) -> anyhow::Result<Vec<Message>> {
-        let mut db = self.inner.lock().await;
-        let record = SessionRecord::get_by_id(&mut *db, session_id).await?;
-        let rows = record.messages().exec(&mut *db).await?;
+        let mut conn = self.inner.connection().await?;
+        let record = SessionRecord::get_by_id(&mut conn, session_id).await?;
+        let rows = record.messages().exec(&mut conn).await?;
         let mut messages: Vec<Message> = rows
             .into_iter()
             .map(|r| Message {
@@ -349,18 +425,38 @@ impl MessageRepository for Db {
         Ok(messages)
     }
 
-    async fn save(&self, session_id: &str, message: &Message) -> anyhow::Result<()> {
-        let mut db = self.inner.lock().await;
-        let session = SessionRecord::get_by_id(&mut *db, session_id).await?;
-        let role = format!("{:?}", message.role).to_lowercase();
-        toasty::create!(in session.messages() {
-            role: role,
-            content: message.content.clone(),
-            timestamp: message.timestamp,
-        })
-        .exec(&mut *db)
+    async fn count_user_turns(&self, session_id: &str) -> anyhow::Result<usize> {
+        let mut conn = self.inner.connection().await?;
+        // COUNT(*) pushed down to SQL (via the `session_id` index), so the
+        // transcript is never materialized just to size the review cadence.
+        let role = format!("{:?}", Role::User).to_lowercase();
+        let n = toasty::query!(
+            MessageRecord FILTER .session_id == #session_id AND .role == #role
+        )
+        .count()
+        .exec(&mut conn)
         .await?;
-        Ok(())
+        Ok(n as usize)
+    }
+
+    async fn save(&self, session_id: &str, message: &Message) -> anyhow::Result<()> {
+        // Concurrent across sessions (the gateway runs a turn per chat), so retry
+        // on an MVCC commit conflict.
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let session = SessionRecord::get_by_id(&mut conn, session_id).await?;
+            let role = format!("{:?}", message.role).to_lowercase();
+            toasty::create!(in session.messages() {
+                id: uuid::Uuid::now_v7().to_string(),
+                role: role,
+                content: message.content.clone(),
+                timestamp: message.timestamp,
+            })
+            .exec(&mut conn)
+            .await?;
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -369,23 +465,26 @@ impl MessageRepository for Db {
 #[async_trait]
 impl ReminderRepository for Db {
     async fn save(&self, reminder: &Reminder) -> anyhow::Result<()> {
-        let mut db = self.inner.lock().await;
-        toasty::create!(ReminderRecord {
-            id: reminder.id.clone(),
-            message: reminder.message.clone(),
-            run_at: reminder.run_at,
-            status: reminder.status.as_str().to_string(),
-            schedule: reminder.schedule.clone(),
-            created_at: reminder.created_at,
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            toasty::create!(ReminderRecord {
+                id: reminder.id.clone(),
+                message: reminder.message.clone(),
+                run_at: reminder.run_at,
+                status: reminder.status.as_str().to_string(),
+                schedule: reminder.schedule.clone(),
+                created_at: reminder.created_at,
+            })
+            .exec(&mut conn)
+            .await?;
+            Ok(())
         })
-        .exec(&mut *db)
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn list_pending(&self) -> anyhow::Result<Vec<Reminder>> {
-        let mut db = self.inner.lock().await;
-        let rows = toasty::query!(ReminderRecord).exec(&mut *db).await?;
+        let mut conn = self.inner.connection().await?;
+        let rows = toasty::query!(ReminderRecord).exec(&mut conn).await?;
         let pending = rows
             .into_iter()
             .filter(|r| r.status == "pending")
@@ -395,21 +494,27 @@ impl ReminderRepository for Db {
     }
 
     async fn set_status(&self, id: &str, status: ReminderStatus) -> anyhow::Result<()> {
-        let mut db = self.inner.lock().await;
-        let mut record = ReminderRecord::get_by_id(&mut *db, id).await?;
-        record
-            .update()
-            .status(status.as_str().to_string())
-            .exec(&mut *db)
-            .await?;
-        Ok(())
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let mut record = ReminderRecord::get_by_id(&mut conn, id).await?;
+            record
+                .update()
+                .status(status.as_str().to_string())
+                .exec(&mut conn)
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn reschedule(&self, id: &str, next_run_at: i64) -> anyhow::Result<()> {
-        let mut db = self.inner.lock().await;
-        let mut record = ReminderRecord::get_by_id(&mut *db, id).await?;
-        record.update().run_at(next_run_at).exec(&mut *db).await?;
-        Ok(())
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let mut record = ReminderRecord::get_by_id(&mut conn, id).await?;
+            record.update().run_at(next_run_at).exec(&mut conn).await?;
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -418,8 +523,8 @@ impl ReminderRepository for Db {
 #[async_trait]
 impl SessionTodoRepository for Db {
     async fn get(&self, session_id: &str) -> anyhow::Result<Vec<TodoItem>> {
-        let mut db = self.inner.lock().await;
-        match SessionTodoRecord::get_by_session_id(&mut *db, session_id).await {
+        let mut conn = self.inner.connection().await?;
+        match SessionTodoRecord::get_by_session_id(&mut conn, session_id).await {
             Ok(record) => Ok(serde_json::from_str(&record.items).unwrap_or_default()),
             Err(_) => Ok(Vec::new()),
         }
@@ -428,35 +533,41 @@ impl SessionTodoRepository for Db {
     async fn set(&self, session_id: &str, items: &[TodoItem]) -> anyhow::Result<()> {
         let json = serde_json::to_string(items)?;
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let mut db = self.inner.lock().await;
-        match SessionTodoRecord::get_by_session_id(&mut *db, session_id).await {
-            Ok(mut record) => {
-                record
-                    .update()
-                    .items(json)
-                    .updated_at(now)
-                    .exec(&mut *db)
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            match SessionTodoRecord::get_by_session_id(&mut conn, session_id).await {
+                Ok(mut record) => {
+                    record
+                        .update()
+                        .items(json.clone())
+                        .updated_at(now)
+                        .exec(&mut conn)
+                        .await?;
+                }
+                Err(_) => {
+                    toasty::create!(SessionTodoRecord {
+                        session_id: session_id.to_string(),
+                        items: json.clone(),
+                        updated_at: now,
+                    })
+                    .exec(&mut conn)
                     .await?;
+                }
             }
-            Err(_) => {
-                toasty::create!(SessionTodoRecord {
-                    session_id: session_id.to_string(),
-                    items: json,
-                    updated_at: now,
-                })
-                .exec(&mut *db)
-                .await?;
-            }
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     async fn clear(&self, session_id: &str) -> anyhow::Result<()> {
-        let mut db = self.inner.lock().await;
-        if let Ok(record) = SessionTodoRecord::get_by_session_id(&mut *db, session_id).await {
-            record.delete().exec(&mut *db).await?;
-        }
-        Ok(())
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            if let Ok(record) = SessionTodoRecord::get_by_session_id(&mut conn, session_id).await {
+                record.delete().exec(&mut conn).await?;
+            }
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -465,23 +576,29 @@ impl SessionTodoRepository for Db {
 #[async_trait]
 impl PairingRepository for Db {
     async fn upsert(&self, request: &PairingRequest) -> anyhow::Result<()> {
-        let mut db = self.inner.lock().await;
-        if let Ok(record) = PairingRecord::get_by_id(&mut *db, &request.id).await {
-            record.delete().exec(&mut *db).await?;
-        }
-        toasty::create!(PairingRecord {
-            id: request.id.clone(),
-            platform: request.platform.clone(),
-            sender_id: request.sender_id.clone(),
-            chat_id: request.chat_id.clone(),
-            code_hash: request.code_hash.clone(),
-            salt: request.salt.clone(),
-            status: request.status.as_str().to_string(),
-            created_at: request.created_at,
+        // delete-if-exists + create: the delete is conditional on the row being
+        // present, so a conflict-retry of the whole closure re-reads cleanly
+        // (an already-deleted row is simply skipped on the next attempt).
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            if let Ok(record) = PairingRecord::get_by_id(&mut conn, &request.id).await {
+                record.delete().exec(&mut conn).await?;
+            }
+            toasty::create!(PairingRecord {
+                id: request.id.clone(),
+                platform: request.platform.clone(),
+                sender_id: request.sender_id.clone(),
+                chat_id: request.chat_id.clone(),
+                code_hash: request.code_hash.clone(),
+                salt: request.salt.clone(),
+                status: request.status.as_str().to_string(),
+                created_at: request.created_at,
+            })
+            .exec(&mut conn)
+            .await?;
+            Ok(())
         })
-        .exec(&mut *db)
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn find(
@@ -489,18 +606,18 @@ impl PairingRepository for Db {
         platform: &str,
         sender_id: &str,
     ) -> anyhow::Result<Option<PairingRequest>> {
-        let mut db = self.inner.lock().await;
+        let mut conn = self.inner.connection().await?;
         let id = format!("{platform}:{sender_id}");
-        match PairingRecord::get_by_id(&mut *db, &id).await {
+        match PairingRecord::get_by_id(&mut conn, &id).await {
             Ok(record) => Ok(Some(pairing_from_record(record))),
             Err(_) => Ok(None),
         }
     }
 
     async fn count_active_pending(&self, platform: &str) -> anyhow::Result<usize> {
-        let mut db = self.inner.lock().await;
+        let mut conn = self.inner.connection().await?;
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let rows = toasty::query!(PairingRecord).exec(&mut *db).await?;
+        let rows = toasty::query!(PairingRecord).exec(&mut conn).await?;
         Ok(rows
             .iter()
             .filter(|r| {
@@ -513,11 +630,11 @@ impl PairingRepository for Db {
 
     async fn approve_code(&self, code: &str) -> anyhow::Result<ApproveOutcome> {
         const LOCK_ID: &str = "approve";
-        let mut db = self.inner.lock().await;
+        let mut conn = self.inner.connection().await?;
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
 
         // Honor an active lockout before testing the code.
-        let lock = LockoutRecord::get_by_id(&mut *db, LOCK_ID).await.ok();
+        let lock = LockoutRecord::get_by_id(&mut conn, LOCK_ID).await.ok();
         if let Some(l) = &lock
             && l.locked_until > now
         {
@@ -526,7 +643,7 @@ impl PairingRepository for Db {
             });
         }
 
-        let rows = toasty::query!(PairingRecord).exec(&mut *db).await?;
+        let rows = toasty::query!(PairingRecord).exec(&mut conn).await?;
         let matched = rows.into_iter().find(|r| {
             r.status == "pending"
                 && now - r.created_at <= PAIRING_CODE_TTL_SECS
@@ -538,14 +655,14 @@ impl PairingRepository for Db {
                 record
                     .update()
                     .status(PairingStatus::Approved.as_str().to_string())
-                    .exec(&mut *db)
+                    .exec(&mut conn)
                     .await?;
                 // Success clears the failure counter.
                 if let Some(mut l) = lock {
                     l.update()
                         .failed_count(0)
                         .locked_until(0)
-                        .exec(&mut *db)
+                        .exec(&mut conn)
                         .await?;
                 }
                 Ok(ApproveOutcome::Approved(pairing_from_record(record)))
@@ -562,7 +679,7 @@ impl PairingRepository for Db {
                         l.update()
                             .failed_count(count)
                             .locked_until(locked_until)
-                            .exec(&mut *db)
+                            .exec(&mut conn)
                             .await?;
                     }
                     None => {
@@ -571,7 +688,7 @@ impl PairingRepository for Db {
                             failed_count: count,
                             locked_until,
                         })
-                        .exec(&mut *db)
+                        .exec(&mut conn)
                         .await?;
                     }
                 }
@@ -587,21 +704,24 @@ impl PairingRepository for Db {
     }
 
     async fn list(&self) -> anyhow::Result<Vec<PairingRequest>> {
-        let mut db = self.inner.lock().await;
-        let mut rows = toasty::query!(PairingRecord).exec(&mut *db).await?;
+        let mut conn = self.inner.connection().await?;
+        let mut rows = toasty::query!(PairingRecord).exec(&mut conn).await?;
         rows.sort_by_key(|r| r.created_at);
         Ok(rows.into_iter().map(pairing_from_record).collect())
     }
 
     async fn revoke(&self, id: &str) -> anyhow::Result<bool> {
-        let mut db = self.inner.lock().await;
-        match PairingRecord::get_by_id(&mut *db, id).await {
-            Ok(record) => {
-                record.delete().exec(&mut *db).await?;
-                Ok(true)
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            match PairingRecord::get_by_id(&mut conn, id).await {
+                Ok(record) => {
+                    record.delete().exec(&mut conn).await?;
+                    Ok(true)
+                }
+                Err(_) => Ok(false),
             }
-            Err(_) => Ok(false),
-        }
+        })
+        .await
     }
 }
 
@@ -610,33 +730,36 @@ impl PairingRepository for Db {
 #[async_trait]
 impl HomeRepository for Db {
     async fn get(&self) -> anyhow::Result<Option<String>> {
-        let mut db = self.inner.lock().await;
-        match SettingRecord::get_by_id(&mut *db, HOME_SETTING_KEY).await {
+        let mut conn = self.inner.connection().await?;
+        match SettingRecord::get_by_id(&mut conn, HOME_SETTING_KEY).await {
             Ok(record) => Ok(Some(record.value).filter(|v| !v.is_empty())),
             Err(_) => Ok(None),
         }
     }
 
     async fn set(&self, session_id: &str) -> anyhow::Result<()> {
-        let mut db = self.inner.lock().await;
-        match SettingRecord::get_by_id(&mut *db, HOME_SETTING_KEY).await {
-            Ok(mut record) => {
-                record
-                    .update()
-                    .value(session_id.to_string())
-                    .exec(&mut *db)
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            match SettingRecord::get_by_id(&mut conn, HOME_SETTING_KEY).await {
+                Ok(mut record) => {
+                    record
+                        .update()
+                        .value(session_id.to_string())
+                        .exec(&mut conn)
+                        .await?;
+                }
+                Err(_) => {
+                    toasty::create!(SettingRecord {
+                        id: HOME_SETTING_KEY.to_string(),
+                        value: session_id.to_string(),
+                    })
+                    .exec(&mut conn)
                     .await?;
+                }
             }
-            Err(_) => {
-                toasty::create!(SettingRecord {
-                    id: HOME_SETTING_KEY.to_string(),
-                    value: session_id.to_string(),
-                })
-                .exec(&mut *db)
-                .await?;
-            }
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -645,132 +768,135 @@ impl HomeRepository for Db {
 #[async_trait]
 impl RunRepository for Db {
     async fn start(&self, run: &Run) -> anyhow::Result<()> {
-        let mut db = self.inner.lock().await;
-        toasty::create!(RunRecord {
-            id: run.id.clone(),
-            session_id: run.session_id.clone(),
-            input: run.input.clone(),
-            plan: run.plan.clone(),
-            status: run.status.as_str().to_string(),
-            final_output: run.final_output.clone(),
-            error: run.error.clone(),
-            started_at: run.started_at,
-            ended_at: run.ended_at.unwrap_or(0),
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            toasty::create!(RunRecord {
+                id: run.id.clone(),
+                session_id: run.session_id.clone(),
+                input: run.input.clone(),
+                plan: run.plan.clone(),
+                status: run.status.as_str().to_string(),
+                final_output: run.final_output.clone(),
+                error: run.error.clone(),
+                started_at: run.started_at,
+                ended_at: run.ended_at.unwrap_or(0),
+            })
+            .exec(&mut conn)
+            .await?;
+            Ok(())
         })
-        .exec(&mut *db)
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn append_step(&self, step: &RunStep) -> anyhow::Result<()> {
-        let mut db = self.inner.lock().await;
-        toasty::create!(RunStepRecord {
-            run_id: step.run_id.clone(),
-            seq: step.seq,
-            tool_name: step.tool_name.clone(),
-            args: step.args.clone(),
-            result: step.result.clone(),
-            error: step.error.clone(),
-            ok: step.ok,
-            started_at: step.started_at,
-            ended_at: step.ended_at,
+        // A round's tool calls run concurrently (`run_agent_loop`), so several
+        // steps of the same run can be appended at once — retry on MVCC conflict.
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            toasty::create!(RunStepRecord {
+                id: uuid::Uuid::now_v7().to_string(),
+                run_id: step.run_id.clone(),
+                seq: step.seq,
+                tool_name: step.tool_name.clone(),
+                args: step.args.clone(),
+                result: step.result.clone(),
+                error: step.error.clone(),
+                ok: step.ok,
+                started_at: step.started_at,
+                ended_at: step.ended_at,
+            })
+            .exec(&mut conn)
+            .await?;
+            Ok(())
         })
-        .exec(&mut *db)
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn finish(&self, run: &Run) -> anyhow::Result<()> {
-        let mut db = self.inner.lock().await;
-        let mut record = RunRecord::get_by_id(&mut *db, &run.id).await?;
-        record
-            .update()
-            .plan(run.plan.clone())
-            .status(run.status.as_str().to_string())
-            .final_output(run.final_output.clone())
-            .error(run.error.clone())
-            .ended_at(run.ended_at.unwrap_or(0))
-            .exec(&mut *db)
-            .await?;
-        Ok(())
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let mut record = RunRecord::get_by_id(&mut conn, &run.id).await?;
+            record
+                .update()
+                .plan(run.plan.clone())
+                .status(run.status.as_str().to_string())
+                .final_output(run.final_output.clone())
+                .error(run.error.clone())
+                .ended_at(run.ended_at.unwrap_or(0))
+                .exec(&mut conn)
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn list(&self, limit: usize) -> anyhow::Result<Vec<Run>> {
-        let mut db = self.inner.lock().await;
-        let rows = toasty::query!(RunRecord).exec(&mut *db).await?;
-        let mut runs: Vec<Run> = rows
-            .into_iter()
-            .map(run_from_record)
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        runs.sort_by(|a, b| b.started_at.cmp(&a.started_at)); // most recent first
-        runs.truncate(limit);
-        Ok(runs)
+        let mut conn = self.inner.connection().await?;
+        // Most-recent-first ordering and the cap are pushed down to SQL, so a
+        // large ledger doesn't get fully materialized just to take the head.
+        let rows = toasty::query!(RunRecord ORDER BY .started_at DESC LIMIT #limit)
+            .exec(&mut conn)
+            .await?;
+        rows.into_iter().map(run_from_record).collect()
     }
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<Run>> {
-        let mut db = self.inner.lock().await;
-        match RunRecord::get_by_id(&mut *db, id).await {
+        let mut conn = self.inner.connection().await?;
+        match RunRecord::get_by_id(&mut conn, id).await {
             Ok(record) => Ok(Some(run_from_record(record)?)),
             Err(_) => Ok(None),
         }
     }
 
     async fn steps(&self, run_id: &str) -> anyhow::Result<Vec<RunStep>> {
-        let mut db = self.inner.lock().await;
-        let rows = toasty::query!(RunStepRecord).exec(&mut *db).await?;
-        let mut steps: Vec<RunStep> = rows
-            .into_iter()
-            .filter(|r| r.run_id == run_id)
-            .map(step_from_record)
-            .collect();
+        let mut conn = self.inner.connection().await?;
+        // Use the `run_id` index instead of scanning the whole step table.
+        let rows = toasty::query!(RunStepRecord FILTER .run_id == #run_id)
+            .exec(&mut conn)
+            .await?;
+        let mut steps: Vec<RunStep> = rows.into_iter().map(step_from_record).collect();
         steps.sort_by_key(|s| s.seq);
         Ok(steps)
     }
 
     async fn prune(&self, cutoff: i64) -> anyhow::Result<usize> {
-        let mut db = self.inner.lock().await;
-        // Collect the ids to drop first, then delete those runs and any step
-        // whose `run_id` points at one of them.
-        let runs = toasty::query!(RunRecord).exec(&mut *db).await?;
-        let stale: std::collections::HashSet<String> = runs
-            .into_iter()
-            .filter(|r| r.started_at < cutoff)
-            .map(|r| r.id)
-            .collect();
-        if stale.is_empty() {
-            return Ok(0);
-        }
-        let steps = toasty::query!(RunStepRecord).exec(&mut *db).await?;
-        for step in steps {
-            if stale.contains(&step.run_id) {
-                step.delete().exec(&mut *db).await?;
+        let mut conn = self.inner.connection().await?;
+        // Select the stale runs with the cutoff pushed down to SQL, then drop
+        // each run's steps via the `run_id` index — no full step-table scan.
+        let stale = toasty::query!(RunRecord FILTER .started_at < #cutoff)
+            .exec(&mut conn)
+            .await?;
+        let count = stale.len();
+        for run in stale {
+            let run_id = run.id.clone();
+            let steps = toasty::query!(RunStepRecord FILTER .run_id == #run_id)
+                .exec(&mut conn)
+                .await?;
+            for step in steps {
+                step.delete().exec(&mut conn).await?;
             }
+            run.delete().exec(&mut conn).await?;
         }
-        let runs = toasty::query!(RunRecord).exec(&mut *db).await?;
-        for run in runs {
-            if stale.contains(&run.id) {
-                run.delete().exec(&mut *db).await?;
-            }
-        }
-        Ok(stale.len())
+        Ok(count)
     }
 
     async fn reconcile_interrupted(&self, now: i64) -> anyhow::Result<usize> {
-        let mut db = self.inner.lock().await;
+        let mut conn = self.inner.connection().await?;
         let running = RunStatus::Running.as_str();
-        let rows = toasty::query!(RunRecord).exec(&mut *db).await?;
+        // Only the still-"running" rows are touched — filter pushed to SQL.
+        let rows = toasty::query!(RunRecord FILTER .status == #running)
+            .exec(&mut conn)
+            .await?;
         let mut reconciled = 0;
         for mut record in rows {
-            if record.status == running {
-                record
-                    .update()
-                    .status(RunStatus::Failed.as_str().to_string())
-                    .error(INTERRUPTED_ERROR.to_string())
-                    .ended_at(now)
-                    .exec(&mut *db)
-                    .await?;
-                reconciled += 1;
-            }
+            record
+                .update()
+                .status(RunStatus::Failed.as_str().to_string())
+                .error(INTERRUPTED_ERROR.to_string())
+                .ended_at(now)
+                .exec(&mut conn)
+                .await?;
+            reconciled += 1;
         }
         Ok(reconciled)
     }
@@ -816,12 +942,12 @@ fn parse_role(s: &str) -> Role {
 }
 
 async fn session_from_record(
-    db: &mut toasty::Db,
+    conn: &mut toasty::Connection,
     record: SessionRecord,
 ) -> anyhow::Result<Session> {
     let id = record.id.clone();
     let created_at = record.created_at;
-    let rows = record.messages().exec(db).await?;
+    let rows = record.messages().exec(conn).await?;
     let mut messages: Vec<Message> = rows
         .into_iter()
         .map(|r| Message {
@@ -878,8 +1004,8 @@ mod tests {
 
     fn sqlite_url(name: &str) -> String {
         let path = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_file(&path);
-        format!("sqlite:{}", path.display())
+        crate::infra::persistence::reset_test_db(&path);
+        format!("turso:{}", path.display())
     }
 
     #[tokio::test]
@@ -1402,5 +1528,90 @@ mod tests {
 
         let rows = SkillRepository::list(&db).await.unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn find_windowed_returns_recent_messages_in_order() {
+        let db = Db::connect(&sqlite_url("shion_find_windowed_test.db"))
+            .await
+            .unwrap();
+        let sid = "telegram:win";
+        SessionRepository::save(&db, &Session::new(sid))
+            .await
+            .unwrap();
+        // Six messages with explicit, increasing timestamps (the constructor's
+        // second-precision clock would otherwise collide on a fast loop).
+        for i in 0..6i64 {
+            let msg = Message {
+                role: if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                content: format!("m{i}"),
+                timestamp: 1_000 + i,
+            };
+            MessageRepository::save(&db, sid, &msg).await.unwrap();
+        }
+
+        // Window of 3 keeps the three most recent, still chronological.
+        let windowed = SessionRepository::find_windowed(&db, sid, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        let contents: Vec<_> = windowed.messages.iter().map(|m| &m.content).collect();
+        assert_eq!(contents, ["m3", "m4", "m5"]);
+
+        // limit == 0 loads the whole transcript (same as `find`).
+        let full = SessionRepository::find_windowed(&db, sid, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(full.messages.len(), 6);
+
+        // A window larger than the transcript returns everything.
+        let all = SessionRepository::find_windowed(&db, sid, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(all.messages.len(), 6);
+
+        assert!(
+            SessionRepository::find_windowed(&db, "nope", 3)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn count_user_turns_counts_only_user_messages() {
+        let db = Db::connect(&sqlite_url("shion_count_user_turns_test.db"))
+            .await
+            .unwrap();
+        let sid = "cli:count";
+        SessionRepository::save(&db, &Session::new(sid))
+            .await
+            .unwrap();
+        assert_eq!(
+            MessageRepository::count_user_turns(&db, sid).await.unwrap(),
+            0
+        );
+
+        MessageRepository::save(&db, sid, &Message::user("q1"))
+            .await
+            .unwrap();
+        MessageRepository::save(&db, sid, &Message::assistant("a1"))
+            .await
+            .unwrap();
+        MessageRepository::save(&db, sid, &Message::user("q2"))
+            .await
+            .unwrap();
+
+        // Two user turns, regardless of the assistant reply in between.
+        assert_eq!(
+            MessageRepository::count_user_turns(&db, sid).await.unwrap(),
+            2
+        );
     }
 }

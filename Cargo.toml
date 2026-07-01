@@ -6,7 +6,12 @@ edition = "2024"
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 tokio = { version = "1.52.0", features = ["full"] }
-toasty = { version = "0.7.0", features = ["sqlite"] }
+toasty = { version = "0.7.0", features = ["sqlite", "turso"] }
+toasty-driver-turso = "0.7.0"
+# Direct handle to the same Turso engine toasty uses, for the one thing toasty's
+# typed API can't do: run a raw `ALTER TABLE ADD COLUMN` to migrate an existing
+# memory.db in place (additive, no data loss). See `memory_db::ensure_columns`.
+turso = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -24,6 +29,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { version = "0.3", features = ["formatting", "macros"] }
 uuid = { version = "1.23.3", features = ["v4", "v7"] }
 sha2 = "0.10"
+# Decode the Codex OAuth access-token JWT to read its `exp` / account-id claims
+# (no signature verification — we only inspect the payload). See `infra/codex.rs`.
+base64 = "0.22"
+# Codex provider: a custom `rig` HTTP backend re-stamps the bearer per request,
+# so we touch `http`/`bytes` types directly (versions matched to rig + reqwest).
+http = "1"
+bytes = "1"
 croner = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rustyline = "15"

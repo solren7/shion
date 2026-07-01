@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
+    agent::system_prompt::{PINNED_MEMORY_BUDGET, render_pinned_memory_block},
     domain::{
         memory::{
             Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryQuery, MemoryRepository,
@@ -58,6 +59,25 @@ impl MemoryTool {
         Self { memories }
     }
 
+    /// A Hermes-style usage line for the L1 pinned profile — the one memory
+    /// surface with a real, finite budget (it is injected verbatim every turn).
+    /// Surfacing "how full is it" nudges the model to keep pinned compact and
+    /// curate before adding. Returns `None` when nothing is pinned (no pressure
+    /// to report). Best-effort: a load failure just omits the line.
+    async fn pinned_usage_line(&self) -> Option<String> {
+        let pinned = self.memories.pinned(&ctx()).await.ok()?;
+        let used = render_pinned_memory_block(&pinned)
+            .map(|b| b.len())
+            .unwrap_or(0);
+        if used == 0 {
+            return None;
+        }
+        let pct = (used * 100) / PINNED_MEMORY_BUDGET;
+        Some(format!(
+            "L1 pinned profile: {used}/{PINNED_MEMORY_BUDGET} chars ({pct}%) used."
+        ))
+    }
+
     /// Load a memory by id or return a helpful error.
     async fn require(&self, id: &Option<String>) -> anyhow::Result<Memory> {
         let id = id
@@ -84,7 +104,11 @@ impl Tool for MemoryTool {
          action=\"update\" changes a memory by id (status / pinned / importance / kind / \
          content); action=\"promote\" marks a candidate active; action=\"reject\" / \
          \"archive\" retire one. Pin a memory (update pinned=true) only when the user \
-         confirms it as durable profile context."
+         confirms it as durable profile context. \
+         Write each memory as a declarative fact, not an instruction (\"User prefers \
+         concise replies\" ✓, \"Always reply concisely\" ✗), and prioritize what reduces \
+         future steering. Do not save anything that will be stale within a week — task \
+         progress, completed-work logs, PR/issue numbers, or commit SHAs do not belong here."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -137,14 +161,24 @@ impl Tool for MemoryTool {
                     memory.expires_at = Some(now + days * 86_400);
                 }
                 self.memories.save(&memory).await?;
-                Ok(format!("Saved memory {}.", memory.id))
+                let mut out = format!("Saved memory {}.", memory.id);
+                if let Some(usage) = self.pinned_usage_line().await {
+                    out.push('\n');
+                    out.push_str(&usage);
+                }
+                Ok(out)
             }
             "list" => {
                 let mut memories = self.memories.list().await?;
                 if let Some(status) = args.status.as_deref().map(parse_memory_status) {
                     memories.retain(|m| m.status == status);
                 }
-                Ok(render(&memories))
+                let mut out = render(&memories);
+                if let Some(usage) = self.pinned_usage_line().await {
+                    out.push_str("\n\n");
+                    out.push_str(&usage);
+                }
+                Ok(out)
             }
             "search" => {
                 let text = args

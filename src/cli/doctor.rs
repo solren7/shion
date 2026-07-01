@@ -13,7 +13,7 @@
 //! error message names the missing credential).
 
 use crate::config::{
-    self, ApiKeys, FileConfig, Provider, ShionEnv, api_config, feishu_config,
+    self, FileConfig, Provider, Secrets, ShionEnv, api_config, feishu_config,
     homeassistant_channel_config, homeassistant_config, telegram_config, wechat_config,
     wechat_cred_path,
 };
@@ -60,14 +60,23 @@ fn model_health() {
                 .model
                 .or(file.model)
                 .unwrap_or_else(|| provider.default_model().to_string());
-            let has_key = ApiKeys::load().key(provider).is_some();
-            let mark = if has_key { OK } else { BAD };
             println!("\nmodel: {} / {}", provider.name(), model);
-            println!(
-                "  {mark} {} {}",
-                provider.api_key_var(),
-                if has_key { "set" } else { "MISSING" }
-            );
+            if provider.uses_api_key() {
+                let has_key = Secrets::load().key(provider).is_some();
+                let mark = if has_key { OK } else { BAD };
+                println!(
+                    "  {mark} {} {}",
+                    provider.api_key_var(),
+                    if has_key { "set" } else { "MISSING" }
+                );
+            } else {
+                // Codex authenticates from ~/.codex/auth.json — validate that
+                // login rather than looking for an env key.
+                match crate::infra::codex::CodexAuth::load() {
+                    Ok(_) => println!("  {OK} Codex OAuth (~/.codex/auth.json)"),
+                    Err(e) => println!("  {BAD} Codex auth: {e}"),
+                }
+            }
         }
         Err(e) => println!("\nmodel: {BAD} {e}"),
     }
@@ -107,7 +116,18 @@ fn channel_health() {
     line!("feishu", feishu_config());
     line!("telegram", telegram_config());
     line!("homeassistant", homeassistant_channel_config());
-    line!("api", api_config());
+    // The api channel is always on (it's how the CLI reaches a running gateway);
+    // `enabled` only widens it from loopback-only to externally reachable.
+    match api_config() {
+        Ok(cfg) if cfg.port != 0 => {
+            println!(
+                "  {OK} {:<14} enabled (external {}:{})",
+                "api", cfg.bind, cfg.port
+            )
+        }
+        Ok(_) => println!("  {OK} {:<14} on (loopback-only, CLI)", "api"),
+        Err(e) => println!("  {BAD} {:<14} {e}", "api"),
+    }
 
     // WeChat resolves with no credential check (login is QR-based, creds in a
     // separate file), so verify the file ourselves.

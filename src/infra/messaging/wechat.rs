@@ -29,7 +29,10 @@
 //! `PairingGuard` is the only admission control.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -111,17 +114,59 @@ pub fn render_qr_png(content: &str) -> anyhow::Result<Vec<u8>> {
 pub struct WeChatQrLogin {
     cred_path: PathBuf,
     ready: Arc<Notify>,
+    poll_bot: Arc<WeChatBot>,
+    provisioning: Arc<AtomicBool>,
 }
 
 impl WeChatQrLogin {
-    pub fn new(cred_path: PathBuf, ready: Arc<Notify>) -> Self {
-        Self { cred_path, ready }
+    pub fn new(
+        cred_path: PathBuf,
+        ready: Arc<Notify>,
+        poll_bot: Arc<WeChatBot>,
+        provisioning: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            cred_path,
+            ready,
+            poll_bot,
+            provisioning,
+        }
+    }
+}
+
+struct ProvisioningGuard {
+    active: Arc<AtomicBool>,
+    ready: Arc<Notify>,
+}
+
+impl Drop for ProvisioningGuard {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::SeqCst);
+        self.ready.notify_waiters();
     }
 }
 
 #[async_trait]
 impl WeChatLogin for WeChatQrLogin {
     async fn run(&self, sink: Arc<dyn ReplySink>) -> anyhow::Result<String> {
+        if self
+            .provisioning
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            anyhow::bail!("wechat login already in progress");
+        }
+        let _provisioning = ProvisioningGuard {
+            active: self.provisioning.clone(),
+            ready: self.ready.clone(),
+        };
+        self.ready.notify_waiters();
+
+        // Stop the shared polling bot before starting a manual QR login. The
+        // wechatbot crate force-starts its own QR login on session expiry; this
+        // nudges the outer channel loop to reload the credentials written here.
+        self.poll_bot.stop().await;
+
         // A throwaway bot just for login: it writes creds to the shared path,
         // which the channel's serve loop is waiting on. Its QR callback ships
         // the code to the chat as a photo.
@@ -151,10 +196,9 @@ impl WeChatLogin for WeChatQrLogin {
             ..Default::default()
         });
 
-        // `login(false)` reuses stored creds if present (returns at once), else
-        // runs the QR flow. Either way, on success creds are on disk.
+        // Explicit login should re-provision even when stale creds exist.
         let creds = bot
-            .login(false)
+            .login(true)
             .await
             .map_err(|e| anyhow::anyhow!("wechat login: {e}"))?;
         // Wake the channel's serve loop so it starts polling immediately.
@@ -207,6 +251,7 @@ pub struct WeChatChannel {
     guard: Arc<PairingGuard>,
     cred_path: PathBuf,
     ready: Arc<Notify>,
+    provisioning: Arc<AtomicBool>,
 }
 
 impl WeChatChannel {
@@ -215,6 +260,7 @@ impl WeChatChannel {
         config: &WeChatConfig,
         cred_path: PathBuf,
         ready: Arc<Notify>,
+        provisioning: Arc<AtomicBool>,
         pairings: Arc<dyn PairingRepository>,
     ) -> Self {
         Self {
@@ -226,6 +272,7 @@ impl WeChatChannel {
             )),
             cred_path,
             ready,
+            provisioning,
         }
     }
 
@@ -292,11 +339,15 @@ impl Channel for WeChatChannel {
         loop {
             // Wait until credentials exist. They may be provisioned later via
             // `/wechat login` (which pulses `ready`) or `shion wechat login`.
-            while !self.cred_path.exists() {
-                info!(
-                    "wechat channel: waiting for credentials — run `/wechat login` from chat \
-                     or `shion wechat login` on the host"
-                );
+            while !self.cred_path.exists() || self.provisioning.load(Ordering::SeqCst) {
+                if self.provisioning.load(Ordering::SeqCst) {
+                    info!("wechat channel: waiting for manual QR login to finish");
+                } else {
+                    info!(
+                        "wechat channel: waiting for credentials — run `/wechat login` from chat \
+                         or `shion wechat login` on the host"
+                    );
+                }
                 tokio::select! {
                     _ = shutdown.changed() => return Ok(()),
                     _ = self.ready.notified() => {}
@@ -318,6 +369,11 @@ impl Channel for WeChatChannel {
             // cancels the in-flight poll cleanly.
             tokio::select! {
                 _ = shutdown.changed() => return Ok(()),
+                _ = self.ready.notified() => {
+                    if self.provisioning.load(Ordering::SeqCst) {
+                        self.bot.stop().await;
+                    }
+                }
                 result = self.bot.run() => {
                     if let Err(error) = result {
                         error!(%error, "wechat poll loop stopped; will retry");

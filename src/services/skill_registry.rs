@@ -5,10 +5,6 @@ use tracing::{debug, warn};
 
 use crate::domain::skill::Skill;
 
-/// How deep to recurse when discovering `SKILL.md` files (plugin trees nest
-/// skills several levels down, e.g. `plugins/<mp>/plugins/<p>/skills/<name>/`).
-const MAX_SCAN_DEPTH: usize = 8;
-
 /// Discovers and holds skills loaded from a directory of `<name>/SKILL.md` files.
 pub struct SkillRegistry {
     skills: Vec<Skill>,
@@ -17,14 +13,6 @@ pub struct SkillRegistry {
 impl SkillRegistry {
     pub fn new(skills: Vec<Skill>) -> Self {
         Self { skills }
-    }
-
-    /// Scan a single `dir` for `*/SKILL.md` files and parse each into a [`Skill`].
-    /// A missing directory yields an empty registry (skills are optional).
-    pub fn load_from_dir(dir: &Path) -> Self {
-        let mut skills = Self::scan_dir(dir);
-        skills.sort_by(|a, b| a.name.cmp(&b.name));
-        Self::new(skills)
     }
 
     /// Load skills from multiple directories (e.g. shion's own `skills/`, the
@@ -70,10 +58,6 @@ impl SkillRegistry {
         skills
     }
 
-    pub fn len(&self) -> usize {
-        self.skills.len()
-    }
-
     /// A capped `- name: description` catalog for the system prompt: lists up to
     /// `max` skills, noting how many more exist (use the `skill` tool to list all).
     pub fn catalog_capped(&self, max: usize) -> String {
@@ -91,10 +75,6 @@ impl SkillRegistry {
             "{shown}\n- …and {} more — call the `skill` tool with action=list to see all.",
             self.skills.len() - max
         )
-    }
-
-    pub fn list(&self) -> &[Skill] {
-        &self.skills
     }
 
     pub fn get(&self, name: &str) -> Option<&Skill> {
@@ -130,8 +110,8 @@ mod tests {
         )
         .unwrap();
 
-        let reg = SkillRegistry::load_from_dir(&dir);
-        assert_eq!(reg.list().len(), 1);
+        let reg = SkillRegistry::load_from_dirs(std::slice::from_ref(&dir));
+        assert_eq!(reg.catalog().lines().count(), 1);
         assert_eq!(reg.get("greet").unwrap().description, "Say hello nicely");
         assert!(reg.catalog().contains("greet: Say hello nicely"));
 
@@ -140,7 +120,7 @@ mod tests {
 
     #[test]
     fn missing_directory_is_empty() {
-        let reg = SkillRegistry::load_from_dir(Path::new("/nonexistent/shion/skills"));
+        let reg = SkillRegistry::load_from_dirs(&[PathBuf::from("/nonexistent/shion/skills")]);
         assert!(reg.is_empty());
     }
 
@@ -160,7 +140,7 @@ mod tests {
         }
 
         let reg = SkillRegistry::load_from_dirs(&[local.clone(), global.clone()]);
-        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.catalog().lines().count(), 1);
         assert!(reg.get("dup").unwrap().instructions.contains("LOCAL"));
 
         let _ = std::fs::remove_dir_all(&base);

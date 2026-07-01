@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReminderStatus {
     Pending,
     Fired,
@@ -28,7 +29,7 @@ pub fn parse_reminder_status(s: &str) -> ReminderStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Reminder {
     pub id: String,
     pub message: String,

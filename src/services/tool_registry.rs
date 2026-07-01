@@ -7,7 +7,7 @@ use tracing::{Instrument, info, info_span, warn};
 use crate::domain::{
     gateway::ReplySink,
     run::{RunRepository, RunStep, STEP_FIELD_CAP, truncate},
-    tool::Tool,
+    tool::{RetryHint, Tool},
 };
 
 /// Ambient context for the turn a tool is executing within: which session it
@@ -28,6 +28,13 @@ pub struct SessionContext {
     /// `Risk::Dangerous` request is denied immediately instead of waiting out
     /// the approval timeout against a sink no one is reading.
     pub interactive: bool,
+    /// Whether approval-needing tool calls should be auto-approved without a
+    /// prompt. Set only for a **trusted** turn — a `shion chat` routed over the
+    /// gateway's loopback api channel, where the CLI user *is* the host
+    /// operator (see `SessionContext::trusted`). The api channel gates this to
+    /// loopback callers, so a publicly-bound api can never reach it. Leave
+    /// `false` everywhere else.
+    pub auto_approve: bool,
 }
 
 impl SessionContext {
@@ -41,6 +48,22 @@ impl SessionContext {
             session_id: session_id.to_string(),
             sink: Arc::new(NoopSink),
             interactive: false,
+            auto_approve: false,
+        }
+    }
+
+    /// A trusted context: like `detached` (no mid-turn prompting), but
+    /// approval-needing tool calls are auto-approved. Used for a `shion chat`
+    /// turn routed over the gateway's **loopback** api channel — the CLI user
+    /// is the host operator, so there is no separate human to prompt. The api
+    /// channel only builds this for loopback callers carrying the trusted
+    /// header; a publicly-bound api keeps using `detached` (auto-deny).
+    pub fn trusted(session_id: &str) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            sink: Arc::new(NoopSink),
+            interactive: false,
+            auto_approve: true,
         }
     }
 }
@@ -72,8 +95,8 @@ pub fn current_session() -> Option<SessionContext> {
 
 /// Ambient run-ledger context for the turn (`domain/run.rs`, roadmap §7). Set by
 /// `AgentRuntime::run_turn` around the turn body so `execute_isolated` — the one
-/// choke point every tool call funnels through (both the LLM function-calling
-/// path and the keyword-routed path) — can record each tool invocation as a
+/// choke point every tool call funnels through (`run_agent_loop` dispatches each
+/// model-requested tool here) — can record each tool invocation as a
 /// `RunStep`. Absent for aux sub-agents and maintenance sweeps, so their tool
 /// use never pollutes the ledger.
 #[derive(Clone)]
@@ -133,9 +156,17 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
+    /// Look up a tool by name for direct dispatch. The in-house tool loop
+    /// (`AgentRuntime::turn_body`) uses this to run a model-requested tool
+    /// through `execute_isolated`, now that shion owns the loop rather than rig.
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.get(name).cloned()
+    }
+
     /// All registered tools, shared via `Arc` (handed to the LLM agent in
-    /// `build_llm`). The registry is now purely this catalog — the LLM owns
-    /// tool dispatch via rig, so there is no keyword-routed execute path.
+    /// `build_llm` so the provider sees their schemas). The registry is purely
+    /// this catalog: `run_agent_loop` looks tools up via `get` and dispatches
+    /// them through `execute_isolated` — there is no keyword-routed execute path.
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
         self.tools.values().cloned().collect()
     }
@@ -208,11 +239,13 @@ const TOOL_RETRY_BACKOFF_MS: [u64; 2] = [250, 750];
 /// to aux sub-agents or sweeps (which have no counter and no tool loop anyway).
 const MAX_TOOL_CALLS_PER_TURN: i64 = 100;
 
-/// How a failed tool call may be retried. Classified from the error *text*
-/// only: tools format their `reqwest` errors into `anyhow!("…: {e}")`, which
-/// drops the typed error so the source chain can't be downcast — heuristic
-/// string matching is all that survives. Deliberately conservative: an error
-/// that matches nothing is [`Retry::No`] (never retried).
+/// How a failed tool call may be retried. Preferred path: a tool classifies its
+/// own failure at the source via [`TransientError`] (the reqwest-backed tools do
+/// this in `tools::http`, where the typed `reqwest::Error` / status is intact),
+/// and [`classify_error`] reads that hint directly. Fallback path: for errors
+/// that carry no hint, classify from the error *text* — a heuristic, since a
+/// flattened `anyhow!("…: {e}")` has dropped the typed source. Deliberately
+/// conservative: an error matching neither is [`Retry::No`] (never retried).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Retry {
     /// Don't retry — terminal (bad arguments, denied, blocked) or unknown.
@@ -255,6 +288,15 @@ const AMBIGUOUS_MARKERS: &[&str] = &[
 ];
 
 fn classify_error(err: &anyhow::Error) -> Retry {
+    // Typed hint first: lossless, set where the failure arose. anyhow walks the
+    // chain, so a `.context(...)`-wrapped `TransientError` is still found.
+    if let Some(te) = err.downcast_ref::<crate::domain::tool::TransientError>() {
+        return match te.hint {
+            RetryHint::Connection => Retry::ConnLevel,
+            RetryHint::Ambiguous => Retry::Ambiguous,
+        };
+    }
+    // Fallback heuristic for errors that didn't classify themselves.
     let msg = format!("{err:#}").to_lowercase();
     if CONN_LEVEL_MARKERS.iter().any(|m| msg.contains(m)) {
         Retry::ConnLevel
@@ -277,8 +319,9 @@ fn should_retry(err: &anyhow::Error, idempotent: bool) -> bool {
 /// Runs a tool on its own tokio task, isolated from the caller. This keeps
 /// tool work off the chat task's thread and — because `JoinHandle` catches
 /// panics — turns a panicking tool into an error reply instead of a process
-/// exit. Used by both invocation paths: the keyword-routed registry above and
-/// the LLM function-calling adapter (`infra::rig_tool::RigTool`).
+/// exit. Called by `AgentRuntime::run_agent_loop` for every model-requested
+/// tool (and by the `infra::rig_tool::RigTool` adapter as a trait-required
+/// fallback for any rig-driven completion — see its note).
 ///
 /// A transient failure (a network blip mid-fetch, Home Assistant not yet up) is
 /// retried with backoff per [`should_retry`]. The run ledger still records a
@@ -297,6 +340,12 @@ pub async fn execute_isolated(tool: Arc<dyn Tool>, input: String) -> anyhow::Res
     let ledger = run.as_ref().map(|r| (r.clone(), r.next_seq()));
     let redacted_args = ledger.as_ref().map(|_| tool.redact_args(&input));
     let started_at = now();
+    // Wall-clock timestamps (`now()`) are integer unix seconds — fine for the
+    // ledger's started/ended fields, but differencing them only yields whole
+    // seconds, so any sub-second tool would log `elapsed_ms = 0`. Measure the
+    // duration off a monotonic `Instant` instead, which keeps sub-second
+    // precision (and is immune to wall-clock jumps).
+    let started_instant = std::time::Instant::now();
     let seq_field = ledger.as_ref().map(|(_, s)| *s).unwrap_or(-1);
 
     // Carry the turn's session context into the spawned task; `tokio::spawn`
@@ -391,7 +440,7 @@ pub async fn execute_isolated(tool: Arc<dyn Tool>, input: String) -> anyhow::Res
             info!(
                 tool = name,
                 seq,
-                elapsed_ms = (ended_at - started_at) * 1000,
+                elapsed_ms = started_instant.elapsed().as_millis() as u64,
                 "tool ok"
             );
         } else {
@@ -620,6 +669,31 @@ mod tests {
             classify_error(&anyhow::anyhow!("invalid arguments: bad json")),
             Retry::No
         );
+    }
+
+    #[test]
+    fn classify_error_prefers_typed_hint_over_text() {
+        use crate::domain::tool::TransientError;
+        use anyhow::Context as _;
+        // A typed hint wins regardless of what the message text would match —
+        // here the text says "invalid" (would be Retry::No via the heuristic).
+        let conn = anyhow::Error::new(TransientError::new(
+            RetryHint::Connection,
+            "invalid: but typed as connection-level",
+        ));
+        assert_eq!(classify_error(&conn), Retry::ConnLevel);
+
+        let amb = anyhow::Error::new(TransientError::new(RetryHint::Ambiguous, "anything"));
+        assert_eq!(classify_error(&amb), Retry::Ambiguous);
+
+        // The hint is still found through an added `.context(...)` layer.
+        let wrapped = Err::<(), _>(anyhow::Error::new(TransientError::new(
+            RetryHint::Connection,
+            "boom",
+        )))
+        .context("while fetching")
+        .unwrap_err();
+        assert_eq!(classify_error(&wrapped), Retry::ConnLevel);
     }
 
     /// A tool that fails its first `fail_times` calls (with `error_msg`) then

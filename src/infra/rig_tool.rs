@@ -9,9 +9,15 @@ use rig::{
 
 use crate::domain::tool::Tool;
 
-/// Adapts a shion [`Tool`] into a `rig` [`ToolDyn`] so the LLM can call it
-/// directly via function calling. The same tool instance is shared (via `Arc`)
-/// with the keyword-routed [`ToolRegistry`](crate::services::tool_registry::ToolRegistry).
+/// Adapts a shion [`Tool`] into a `rig` [`ToolDyn`] so the provider sees the
+/// tool's schema (`name` + `definition`). Execution is driven by shion's own
+/// loop (`AgentRuntime::run_agent_loop` → `execute_isolated`), not by rig: the
+/// main agent runs one completion per round and dispatches the requested tools
+/// itself. `call` below stays as the trait-required fallback for any rig-driven
+/// completion (the tool-less aux `complete()` path registers no tools, so it is
+/// currently never invoked). The same `Tool` instance is shared (via `Arc`)
+/// with the [`ToolRegistry`](crate::services::tool_registry::ToolRegistry) the
+/// loop dispatches against.
 pub struct RigTool(pub Arc<dyn Tool>);
 
 impl ToolDyn for RigTool {
@@ -41,6 +47,10 @@ impl ToolDyn for RigTool {
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + '_>> {
         let tool = self.0.clone();
         Box::pin(async move {
+            // Trait-required, but not on shion's hot path: `run_agent_loop` owns
+            // the loop and dispatches tools itself, so rig only reaches here if it
+            // drives a completion that has tools attached (none today). Kept
+            // functional rather than `unreachable!` so that path stays correct.
             // `args` is the JSON arguments object produced by the model, matching
             // the tool's `parameters_schema`. Pass it through; each tool parses
             // its own arguments (argument-less tools simply ignore it).

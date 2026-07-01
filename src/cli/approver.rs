@@ -31,12 +31,17 @@ fn parse_answer(input: &str) -> Answer {
 ///   rest of the session.
 pub struct CliApprover {
     session_allowed: Mutex<HashSet<String>>,
+    /// Serializes the interactive prompt. A round's tool calls run concurrently
+    /// (`AgentRuntime::run_agent_loop`), so two could prompt at once; without
+    /// this their stdin reads would interleave into one garbled prompt.
+    prompt_gate: tokio::sync::Mutex<()>,
 }
 
 impl CliApprover {
     pub fn new() -> Self {
         Self {
             session_allowed: Mutex::new(HashSet::new()),
+            prompt_gate: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -59,6 +64,17 @@ impl Approver for CliApprover {
         if let Some(key) = &request.scope_key {
             if self.session_allowed.lock().unwrap().contains(key) {
                 println!("✓ auto-approved (session): {}", request.summary);
+                return true;
+            }
+        }
+
+        // Serialize concurrent prompts onto the single TTY (a round's tools run
+        // concurrently) so their stdin reads don't interleave. Held across the
+        // blocking read below.
+        let _guard = self.prompt_gate.lock().await;
+        // A concurrent prompt may have just cached "session" for this scope.
+        if let Some(key) = &request.scope_key {
+            if self.session_allowed.lock().unwrap().contains(key) {
                 return true;
             }
         }

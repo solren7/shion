@@ -190,6 +190,13 @@ pub async fn build(
         sessions: db.clone(),
         messages: db.clone(),
         runs: db.clone(),
+        // The in-house agent loop dispatches model-requested tools against this
+        // same catalog (the LLM was handed clones of the same instances above).
+        tools: Arc::new(tools),
+        max_turns: model_config.max_turns,
+        // Mirror the LLM's history window so the turn loads exactly what the
+        // model will replay (no full-transcript read on long chat sessions).
+        history_window: model_config.max_history_messages,
         reviewer: Some(reviewer.clone()),
         review_interval: env.review_interval.filter(|v| *v > 0).unwrap_or(10),
     };

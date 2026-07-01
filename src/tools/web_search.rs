@@ -68,10 +68,10 @@ impl Tool for WebSearchTool {
             .query(&[("q", args.query.as_str())])
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("search request failed: {e}"))?
+            .map_err(|e| crate::tools::http::transport_error(e, "search request failed"))?
             .text()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to read search results: {e}"))?;
+            .map_err(|e| crate::tools::http::transport_error(e, "failed to read search results"))?;
 
         let results = parse_results(&body);
         if results.is_empty() {
