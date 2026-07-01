@@ -11,24 +11,33 @@ toasty-driver-turso = "0.7.0"
 # Direct handle to the same Turso engine toasty uses, for the one thing toasty's
 # typed API can't do: run a raw `ALTER TABLE ADD COLUMN` to migrate an existing
 # memory.db in place (additive, no data loss). See `memory_db::ensure_columns`.
-turso = "0.6"
+turso = "0.7.0-pre.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-anyhow = "1"
+anyhow = "1.0.103"
 thiserror = "2"
 async-trait = "0.1"
 dotenvy = "0.15"
 envy = "0.4"
-toml = "0.8"
-dirs = "5"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "charset", "query", "json", "multipart"] }
-open-lark = { version = "0.14", default-features = false, features = ["websocket", "im"] }
-rig = { package = "rig-core", version = "0.38" }
+toml = "1.1"
+dirs = "6"
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "charset",
+    "query",
+    "json",
+    "multipart",
+] }
+open-lark = { version = "0.14", default-features = false, features = [
+    "websocket",
+    "im",
+] }
+rig = { package = "rig-core", version = "0.39" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-time = { version = "0.3", features = ["formatting", "macros"] }
-uuid = { version = "1.23.3", features = ["v4", "v7"] }
-sha2 = "0.10"
+time = { version = "0.3.53", features = ["formatting", "macros"] }
+uuid = { version = "1.23.4", features = ["v4", "v7"] }
+sha2 = "0.11"
 # Decode the Codex OAuth access-token JWT to read its `exp` / account-id claims
 # (no signature verification — we only inspect the payload). See `infra/codex.rs`.
 base64 = "0.22"
@@ -38,8 +47,8 @@ http = "1"
 bytes = "1"
 croner = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-rustyline = "15"
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+rustyline = "18.0.1"
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 wechatbot = "=0.3.2"
 qrcode = { version = "0.14.1", default-features = false }
