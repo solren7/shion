@@ -7,7 +7,8 @@
 被动应答、常驻入口、任务/记忆/审计这几条主链路已经成型：
 
 - `AgentRuntime` 负责会话生命周期、消息持久化、run ledger 开关和回复写回。
-- LLM 通过 `rig` 接入，完整多轮历史会送入模型，工具调用循环目前仍由 rig 的 agent loop 驱动。
+- LLM 通过 `rig` 接入，但只承担单次 completion：工具调用循环已收回 `AgentRuntime::run_agent_loop`，自带瞬时错误重试（幂等区分）、软工具调用预算和 `max_turns` 轮次预算。
+- gateway 常驻一个 loopback api channel（OpenAI 兼容 + `/api/*` 只读视图），CLI 在 gateway 持有 db 锁时经它路由，不再直接开 db。
 - 已注册工具包括 `time`、`file`、`shell`、`web_fetch`、`web_search`、`session`、`reminder`、`memory`、`delegate`、`skill`、`task`、`todo`、`homeassistant`。
 - `reminder` 支持一次性提醒和 5 字段 cron 周期提醒，由 gateway 每分钟扫描投递。
 - `gateway` 已具备常驻进程、launchd 安装、维护任务调度、chat 交互式审批和 proactive home channel。
@@ -16,7 +17,7 @@
 - reflective reviewer 已能提取 candidate memories 和 commitments；承诺会进入 task inbox。
 - memory 已有 L1 pinned profile、L2 governance tool、L3 active recall。
 - run ledger 已记录每个 turn 和每次工具调用，CLI 可 `shion run list/inspect`。
-- 已有 operator CLI：`cron`、`session`、`task`、`run`、`memory`、`pair`、`model`、`wechat`、`workday`、`logs`。
+- 已有 operator CLI：`cron`、`session`、`task`、`run`、`memory`、`pair`、`model`、`wechat`、`workday`、`logs`、`doctor`、`dream`、`upgrade`。
 
 总体判断：**shion 已经不是单纯聊天工具，下一阶段缺的是更完整的主动协作闭环**。入口、任务、记忆和审计已经有骨架；价值瓶颈转移到了真实个人上下文、执行控制、权限策略产品化，以及可恢复的长任务。
 
@@ -123,11 +124,13 @@ memory 三层已经落地：
 - L2 memory tool/governance：save/search/list/update/promote/reject/archive/pin。
 - L3 active recall：基于用户当前输入做 token-overlap recall，注入 top memories，并记录 `last_used_at`。
 
+usage-based 治理也已落地：dreaming（`DreamSweep`，默认每晚 3 点，`shion dream [--apply]` 可预览/手动跑）按 recall 使用信号决定 candidate 的去向——常被召回的 promote 到 active，长期没人用的 archive；只动 candidate，pin 仍是手动专属。
+
 下一步是质量升级，而不是再加一个粗糙入口：
 
 - aux recall agent：从候选 hits 中选择、压缩、解释相关 facts。
 - embedding / hybrid search：作为召回信号，不能绕过 scope/status/expiry/confidence 过滤。
-- usage-based promote/archive 建议：基于 recall count、不同 query 数、不同天数、平均分、last_used_at 等信号生成待确认建议。
+- dreaming 的 query-diversity 信号（OpenClaw 的 `minUniqueQueries`）：目前只有 recall 计数，没有按 query 的 provenance。
 - reviewer 防自噬规则继续保持：不能从注入块再提取记忆。
 
 治理原则不变：自动提取只能进 candidate，不能自动 pin；影响长期行为的内容必须可追溯、可拒绝、可归档。
@@ -142,30 +145,32 @@ run ledger 的记录层已经落地：
 - step args 可由工具自行 redaction；`shell` 会擦掉疑似密钥，`file` 会丢掉写入正文。
 - `shion run list [--limit N]` / `shion run inspect <id>` 可查看。
 
+剪枝已有 operator 动作：`shion run prune --before <date>|--keep <N>`。
+
 尚未做：
 
 - `resume` 上一次中断任务。
 - 与 resume 配套的 `recoverable` 字段。
-- run ledger 剪枝策略。
 - 基于 run ledger 的权限审计视图。
 
 `recoverable` 不应提前加成死字段。等真正做 resume 时，再由消费者驱动模型变化。
 
 ## 7. 更强的 planner / orchestrator
 
-当前多步工具循环完全在 rig 的 agent loop 里，shion 只能看到最终结果和工具调用记录，不能稳定控制中间策略。
+架构前提已经完成：工具循环收回了 `AgentRuntime::run_agent_loop`，rig 只承担单次 completion（`LlmClient::begin_turn` / `TurnDriver` 是扩展的 seam）。控制点加在循环的轮与轮之间，不再受 rig 约束。
 
-已落地的第一块是 `todo`：模型可维护当前会话的步骤列表，最多一个 `in_progress`。
+已落地的控制点：
+
+- `todo`：模型可维护当前会话的步骤列表，最多一个 `in_progress`。
+- 工具失败重试（`execute_isolated`）：连接级错误任何工具都重试，歧义错误（超时/5xx/429）只重试声明 `idempotent` 的只读工具，终结错误和 panic 不重试。
+- 预算：`max_turns` 轮次预算（超限强制收尾）+ `MAX_TOOL_CALLS_PER_TURN` 软工具调用预算 + `cap_tool_result` 结果字节上限。
 
 仍缺：
 
-- 澄清问题：信息不足时先问，而不是盲目执行。
-- 工具失败重试：区分瞬时错误、环境错误、不可重试错误。
-- 预算限制：时间、token、工具调用次数、风险等级。
+- 澄清问题：信息不足时先问，而不是盲目执行（新的 `Step` 变体或哨兵工具，循环里识别）。
+- 时间 / token / 风险等级维度的预算。
 - 中途产物保存：长任务先落草稿或 run artifact。
 - 取消/暂停/恢复长任务。
-
-架构前提：要做这些控制点，就需要把工具循环逐步从 rig 收回 `AgentRuntime`，让 rig 只承担单次 completion。这个重写有回归风险，应该由具体消费者驱动，首选从"工具瞬时错误自动重试"或"工具调用次数预算"开始。
 
 ## 8. 本地快捷入口
 
@@ -191,14 +196,14 @@ run ledger 的记录层已经落地：
 - `shion pair list/approve/revoke`
 - `shion logs`
 - `shion workday`
+- `shion doctor`：config health + gateway 存活 + channel/凭证状态 + home channel + 最近失败 run（gateway 状态聚合与 config health 都归它）
+- `shion memory report`：memory quality report（状态/置信分布、待 triage 的堆）
+- `shion run prune`
+- `shion dream`：dreaming 预览/手动执行
 
 还可以补：
 
-- gateway 状态聚合：channels、home channel、maintenance、last error。
 - skill inspect / skill governance。
-- config health：哪些 channel 已启用、哪些凭证缺失、哪些 proactive sweep 正在运行。
-- run ledger prune。
-- memory quality report：候选、长期未用、低置信、高频命中。
 
 目标是让用户随时看懂 shion 当前知道什么、正在做什么、为什么这样做。
 
@@ -219,11 +224,10 @@ run ledger 的记录层已经落地：
 1. 飞书日历只读连接器，与 Feishu channel 共享鉴权。
 2. daily briefing 接入日历，输出今天日程、冲突、空闲时间。
 3. 每周摘要：完成事项、卡住项目、待清理记忆、长期承诺。
-4. planner 控制点第一步：工具瞬时错误自动重试或工具调用次数预算。
-5. run resume：从已有 run ledger 恢复中断任务。
-6. 权限策略配置化：目录、命令前缀、网络域名、channel/session scope。
-7. memory recall 质量升级：aux recall agent，再考虑 embedding/hybrid search。
-8. 本地 unix socket / Raycast / share sheet 入口。
-9. operator health：gateway/config/skill/memory quality/report/prune。
+4. run resume：从已有 run ledger 恢复中断任务。
+5. 权限策略配置化：目录、命令前缀、网络域名、channel/session scope。
+6. memory recall 质量升级：aux recall agent，再考虑 embedding/hybrid search。
+7. 本地 unix socket / Raycast / share sheet 入口（api channel 已可承接一部分：本地脚本可直接打 loopback HTTP）。
+8. skill inspect / skill governance。
 
-已经完成的里程碑：ingress、durable task、commitment extraction、ChatApprover、daily briefing、memory L1/L2/L3、run ledger、recurring reminders、WeChat、Home Assistant。下一阶段不该再补零散工具，而应该把这些骨架接上真实个人上下文，并让执行过程可控、可恢复、可审计。
+已经完成的里程碑：ingress、durable task、commitment extraction、ChatApprover、daily briefing、memory L1/L2/L3 + dreaming、run ledger + prune、recurring reminders、WeChat、Home Assistant、in-house tool loop（重试/预算）、api channel + CLI 路由、operator health（doctor / memory report）。下一阶段不该再补零散工具，而应该把这些骨架接上真实个人上下文，并让执行过程可控、可恢复、可审计。
