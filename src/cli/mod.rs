@@ -11,6 +11,7 @@ mod memory;
 mod model;
 mod pair;
 mod policy;
+mod resume;
 mod service;
 mod upgrade;
 mod wechat;

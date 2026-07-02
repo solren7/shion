@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 
 use super::{
-    chat, doctor, dream, gateway, inspect, logs, memory, model, pair, policy, service, upgrade,
-    wechat, workday,
+    chat, doctor, dream, gateway, inspect, logs, memory, model, pair, policy, resume, service,
+    upgrade, wechat, workday,
 };
 
 #[derive(Parser)]
@@ -179,6 +179,13 @@ enum RunAction {
         /// Run id (as shown by `run list`)
         id: String,
     },
+    /// Resume an interrupted run: re-dispatch its input in the original
+    /// session, primed with the tool steps that had completed
+    Resume {
+        /// Run id (as shown by `run list`); defaults to the most recent
+        /// recoverable run
+        id: Option<String>,
+    },
     /// Prune old runs (and their tool steps) from the ledger. Pass exactly one
     /// of --before or --keep.
     Prune {
@@ -304,6 +311,7 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Run { action } => match action {
             RunAction::List { limit } => inspect::run_list(&db, limit).await,
             RunAction::Inspect { id } => inspect::run_inspect(&db, &id).await,
+            RunAction::Resume { id } => resume::run(&db, &kanban, id).await,
             RunAction::Prune { before, keep } => run_prune(&db, before, keep).await,
         },
         Commands::Memory { action } => {
