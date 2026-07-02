@@ -269,6 +269,16 @@ enum SkillAction {
         /// Skill name
         name: String,
     },
+    /// Show one skill in full: status, provenance, path, history, body
+    Inspect {
+        /// Skill name
+        name: String,
+    },
+    /// Which turns loaded this skill (derived from the run ledger)
+    Audit {
+        /// Skill name
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -367,6 +377,8 @@ pub async fn run() -> anyhow::Result<()> {
             SkillAction::Unprotect { name } => skill::protect(&name, false),
             SkillAction::Enable { name } => skill::set_enabled(&name, true),
             SkillAction::Disable { name } => skill::set_enabled(&name, false),
+            SkillAction::Inspect { name } => skill::inspect(&name),
+            SkillAction::Audit { name } => skill::audit(&db, &name).await,
         },
         Commands::Doctor => doctor::doctor(&db).await,
         Commands::Pair { action } => match action {

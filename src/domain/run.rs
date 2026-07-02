@@ -229,6 +229,27 @@ pub trait RunRepository: Send + Sync {
     /// Clear a run's `recoverable` flag once a resume turn has been dispatched
     /// for it, so the same interruption is never resumed twice.
     async fn mark_resumed(&self, id: &str) -> anyhow::Result<()>;
+
+    /// The most recent steps of one tool across all runs (newest first, capped
+    /// at `limit`). Backs derived audit views — e.g. which turns loaded a given
+    /// skill (`steps_by_tool("skill", …)` + [`step_views_skill`]) — without
+    /// adding usage fields to any model.
+    async fn steps_by_tool(&self, tool_name: &str, limit: usize) -> anyhow::Result<Vec<RunStep>>;
+}
+
+/// Whether a ledger step is the `skill` tool loading `skill_name`'s
+/// instructions (`action=view`). The skill-invocation audit is *derived* from
+/// the ledger — a skill "used" is exactly a skill viewed; no usage counters are
+/// stored anywhere (roadmap §9 / "no dead fields").
+pub fn step_views_skill(step: &RunStep, skill_name: &str) -> bool {
+    if step.tool_name != "skill" {
+        return false;
+    }
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(&step.args) else {
+        return false;
+    };
+    args.get("action").and_then(|v| v.as_str()) == Some("view")
+        && args.get("name").and_then(|v| v.as_str()) == Some(skill_name)
 }
 
 #[cfg(test)]
@@ -301,6 +322,25 @@ mod tests {
         let prompt = resume_prompt(&run, &steps);
         assert!(prompt.contains("elided for length"));
         assert!(prompt.len() < RESUME_DIGEST_CAP + 2000);
+    }
+
+    #[test]
+    fn step_views_skill_matches_only_view_steps_of_that_skill() {
+        let run = interrupted_run();
+        let mut s = step(&run, 0, "skill", true);
+        s.args = r#"{"action":"view","name":"feishu-calendar"}"#.to_string();
+        assert!(step_views_skill(&s, "feishu-calendar"));
+        assert!(!step_views_skill(&s, "other-skill"));
+
+        s.args = r#"{"action":"list"}"#.to_string();
+        assert!(!step_views_skill(&s, "feishu-calendar"));
+
+        let mut shell = step(&run, 1, "shell", true);
+        shell.args = r#"{"action":"view","name":"feishu-calendar"}"#.to_string();
+        assert!(!step_views_skill(&shell, "feishu-calendar"));
+
+        s.args = "not json".to_string();
+        assert!(!step_views_skill(&s, "feishu-calendar"));
     }
 
     #[test]

@@ -880,6 +880,18 @@ impl RunRepository for Db {
         })
         .await
     }
+
+    async fn steps_by_tool(&self, tool_name: &str, limit: usize) -> anyhow::Result<Vec<RunStep>> {
+        let mut conn = self.inner.connection().await?;
+        // Filter, ordering, and cap pushed to SQL (tool_name is unindexed — a
+        // scan bounded by the pruned ledger's size, audit-frequency only).
+        let rows = toasty::query!(
+            RunStepRecord FILTER .tool_name == #tool_name ORDER BY .started_at DESC LIMIT #limit
+        )
+        .exec(&mut conn)
+        .await?;
+        Ok(rows.into_iter().map(step_from_record).collect())
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

@@ -60,12 +60,28 @@ impl FsSkillStore {
         self.root.join(CANDIDATES_DIR)
     }
 
-    fn active_path(&self, name: &str) -> PathBuf {
+    pub fn active_path(&self, name: &str) -> PathBuf {
         self.root.join(name).join("SKILL.md")
     }
 
-    fn candidate_path(&self, name: &str) -> PathBuf {
+    pub fn candidate_path(&self, name: &str) -> PathBuf {
         self.candidates_root().join(name).join("SKILL.md")
+    }
+
+    /// Rolled prior versions of a candidate (file names, oldest first) — the
+    /// lightweight edit history `skill inspect` shows. Only the reviewer path
+    /// rolls history; hand-edited active files are the user's own to version.
+    pub fn candidate_history(&self, name: &str) -> Vec<String> {
+        let dir = self.candidates_root().join(name).join(HISTORY_DIR);
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     /// Active skills (the governed subset the registry loads from this root —

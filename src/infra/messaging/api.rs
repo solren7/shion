@@ -54,7 +54,7 @@ use crate::{
         pairing::{PairingRepository, PairingStatus},
         reminder::ReminderRepository,
         repository::{MessageRepository, SessionRepository, SkillRepository},
-        run::{RunRepository, resume_prompt},
+        run::{RunRepository, RunStep, resume_prompt, step_views_skill},
         task::TaskRepository,
     },
     services::tool_registry::{SessionContext, with_session},
@@ -194,6 +194,7 @@ fn build_router(state: AppState) -> Router {
         .route("/api/runs/{id}/resume", post(resume_run))
         .route("/api/reminders", get(list_reminders))
         .route("/api/skills", get(list_skills))
+        .route("/api/skills/{name}/audit", get(skill_audit))
         .route("/api/pairings", get(list_pairings))
         .route("/api/dream", get(dream_preview))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
@@ -630,6 +631,43 @@ async fn list_skills(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
     Ok(Json(json!({ "skills": skills })))
 }
 
+/// How many `skill`-tool ledger steps one audit request scans, and how many
+/// matches it returns.
+const AUDIT_SCAN_LIMIT: usize = 500;
+const AUDIT_RESULT_CAP: usize = 50;
+
+/// Which turns loaded a skill (backs `shion skill audit` while the gateway
+/// holds the db lock). Derived from the run ledger — a skill "used" is exactly
+/// a `skill view` step; nothing stores usage counters.
+async fn skill_audit(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let steps = state.runs.steps_by_tool("skill", AUDIT_SCAN_LIMIT).await?;
+    let invocations = skill_invocations_from_steps(steps, &name, AUDIT_RESULT_CAP);
+    Ok(Json(json!({ "invocations": invocations })))
+}
+
+/// Filter `skill`-tool steps down to the views of one skill (newest-first in,
+/// newest-first out). Shared by the api handler and the CLI's direct-db path.
+pub fn skill_invocations_from_steps(
+    steps: Vec<RunStep>,
+    name: &str,
+    cap: usize,
+) -> Vec<SkillInvocation> {
+    steps
+        .into_iter()
+        .filter(|s| step_views_skill(s, name))
+        .take(cap)
+        .map(|s| SkillInvocation {
+            run_id: s.run_id,
+            seq: s.seq,
+            started_at: s.started_at,
+            ok: s.ok,
+        })
+        .collect()
+}
+
 /// Pairings (backs `shion pair list`). A hash-free view — the salted code hash
 /// and per-row salt are never serialized off the host.
 async fn list_pairings(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -704,6 +742,15 @@ pub struct PairingView {
     /// `pending` | `approved` | `expired`.
     pub status: String,
     pub created_at: i64,
+}
+
+/// One `skill view` step from the run ledger (backs `shion skill audit`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillInvocation {
+    pub run_id: String,
+    pub seq: i64,
+    pub started_at: i64,
+    pub ok: bool,
 }
 
 /// The result of `POST /api/runs/{id}/resume`, consumed by `shion run resume`.

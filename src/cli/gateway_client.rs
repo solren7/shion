@@ -22,7 +22,9 @@ use crate::domain::{
     run::{Run, RunStep},
     task::Task,
 };
-use crate::infra::messaging::api::{DreamItem, PairingView, ResumeOutcome, SessionSummary};
+use crate::infra::messaging::api::{
+    DreamItem, PairingView, ResumeOutcome, SessionSummary, SkillInvocation,
+};
 use crate::infra::rendezvous::{self, GatewayInfo};
 
 /// How long to wait for the gateway to answer a request (a turn can take a
@@ -156,6 +158,12 @@ impl GatewayClient {
 
     pub async fn reminders(&self) -> anyhow::Result<Vec<Reminder>> {
         self.get_field("/api/reminders", "reminders").await
+    }
+
+    /// Which turns loaded a skill (derived from the run ledger server-side).
+    pub async fn skill_audit(&self, name: &str) -> anyhow::Result<Vec<SkillInvocation>> {
+        self.get_field(&format!("/api/skills/{name}/audit"), "invocations")
+            .await
     }
 
     pub async fn pairings(&self) -> anyhow::Result<Vec<PairingView>> {

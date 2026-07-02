@@ -17,7 +17,7 @@ use crate::{
     },
 };
 
-fn local_time(unix: i64) -> String {
+pub(crate) fn local_time(unix: i64) -> String {
     chrono::DateTime::from_timestamp(unix, 0)
         .map(|dt| dt.with_timezone(&chrono::Local).to_rfc3339())
         .unwrap_or_else(|| unix.to_string())

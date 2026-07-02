@@ -513,6 +513,13 @@ mod tests {
         async fn mark_resumed(&self, _id: &str) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn steps_by_tool(
+            &self,
+            _tool_name: &str,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<RunStep>> {
+            Ok(Vec::new())
+        }
     }
 
     struct EchoTool;
