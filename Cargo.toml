@@ -11,7 +11,10 @@ toasty-driver-turso = "0.7.0"
 # Direct handle to the same Turso engine toasty uses, for the one thing toasty's
 # typed API can't do: run a raw `ALTER TABLE ADD COLUMN` to migrate an existing
 # memory.db in place (additive, no data loss). See `memory_db::ensure_columns`.
-turso = "0.7.0-pre.14"
+# Must stay on the same major as toasty-driver-turso's pin (`turso = "0.6"`):
+# a second turso version both duplicates the engine over the same db files and
+# drags in a second `#[global_allocator]` (mimalloc), which fails to link.
+turso = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1.0.103"
