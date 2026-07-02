@@ -131,6 +131,7 @@ struct RunRecord {
     status: String, // "running" | "done" | "failed"
     final_output: String,
     error: String,
+    recoverable: bool,
     started_at: i64,
     ended_at: i64,
 }
@@ -778,6 +779,7 @@ impl RunRepository for Db {
                 status: run.status.as_str().to_string(),
                 final_output: run.final_output.clone(),
                 error: run.error.clone(),
+                recoverable: run.recoverable,
                 started_at: run.started_at,
                 ended_at: run.ended_at.unwrap_or(0),
             })
@@ -893,12 +895,23 @@ impl RunRepository for Db {
                 .update()
                 .status(RunStatus::Failed.as_str().to_string())
                 .error(INTERRUPTED_ERROR.to_string())
+                .recoverable(true)
                 .ended_at(now)
                 .exec(&mut conn)
                 .await?;
             reconciled += 1;
         }
         Ok(reconciled)
+    }
+
+    async fn mark_resumed(&self, id: &str) -> anyhow::Result<()> {
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let mut record = RunRecord::get_by_id(&mut conn, id).await?;
+            record.update().recoverable(false).exec(&mut conn).await?;
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -913,6 +926,7 @@ fn run_from_record(record: RunRecord) -> anyhow::Result<Run> {
         status: parse_run_status(&record.status)?,
         final_output: record.final_output,
         error: record.error,
+        recoverable: record.recoverable,
         started_at: record.started_at,
         ended_at: (record.ended_at != 0).then_some(record.ended_at),
     })
@@ -1079,6 +1093,7 @@ mod tests {
             status: RunStatus::Done,
             final_output: String::new(),
             error: String::new(),
+            recoverable: false,
             started_at,
             ended_at: Some(started_at + 1),
         };
@@ -1146,10 +1161,12 @@ mod tests {
         assert_eq!(stuck.status, RunStatus::Failed);
         assert_eq!(stuck.error, INTERRUPTED_ERROR);
         assert_eq!(stuck.ended_at, Some(1234));
+        assert!(stuck.recoverable, "interrupted run must become resumable");
 
         let done = RunRepository::get(&db, &done.id).await.unwrap().unwrap();
         assert_eq!(done.status, RunStatus::Done);
         assert_eq!(done.final_output, "reply");
+        assert!(!done.recoverable);
 
         // Idempotent: a second pass finds nothing still running.
         assert_eq!(
@@ -1158,6 +1175,11 @@ mod tests {
                 .unwrap(),
             0
         );
+
+        // Resuming clears the flag, so a second resume finds nothing.
+        RunRepository::mark_resumed(&db, &stuck.id).await.unwrap();
+        let stuck = RunRepository::get(&db, &stuck.id).await.unwrap().unwrap();
+        assert!(!stuck.recoverable);
     }
 
     #[tokio::test]

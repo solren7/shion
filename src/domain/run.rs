@@ -8,8 +8,9 @@
 //! kanban/memory files. Every ledger write is best-effort: it must never fail a
 //! turn or a tool call (same contract as memory `mark_used`).
 //!
-//! Deliberately omitted in v1: a `recoverable` flag. `resume` is deferred, and
-//! the roadmap's governance principle is "no fields without a consumer" (§6).
+//! `recoverable` marks the resumable set (§6): set by `reconcile_interrupted`
+//! when a crash leaves a run mid-flight, cleared by `mark_resumed` once a
+//! resume turn has been dispatched — so `shion run resume` is at-most-once.
 
 use async_trait::async_trait;
 
@@ -82,6 +83,12 @@ pub struct Run {
     pub final_output: String,
     /// Failure reason. Empty unless `status == Failed`.
     pub error: String,
+    /// The run was interrupted mid-flight (process died) and can be resumed:
+    /// set by [`RunRepository::reconcile_interrupted`], cleared by
+    /// [`RunRepository::mark_resumed`]. Only interruption produces a resumable
+    /// run — an ordinary `Failed` has no half-done steps worth handing over.
+    #[serde(default)]
+    pub recoverable: bool,
     pub started_at: i64,
     pub ended_at: Option<i64>,
 }
@@ -100,6 +107,7 @@ impl Run {
             status: RunStatus::Running,
             final_output: String::new(),
             error: String::new(),
+            recoverable: false,
             started_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             ended_at: None,
         }
@@ -147,12 +155,16 @@ pub trait RunRepository: Send + Sync {
     async fn prune(&self, cutoff: i64) -> anyhow::Result<usize>;
 
     /// Flip every run still `Running` to `Failed`/[`INTERRUPTED_ERROR`], stamping
-    /// `ended_at = now`; return how many were reconciled. Called once at process
-    /// startup: a run is `Running` only while in flight, so any left over is the
-    /// residue of a crashed earlier process — leaving it would make `run list`
-    /// lie. Also the first building block toward resume (§6): it names the set of
-    /// interrupted runs a future `resume` could pick up.
+    /// `ended_at = now` and `recoverable = true`; return how many were
+    /// reconciled. Called once at process startup: a run is `Running` only while
+    /// in flight, so any left over is the residue of a crashed earlier process —
+    /// leaving it would make `run list` lie. The runs it marks are the set
+    /// `resume` picks from (§6).
     async fn reconcile_interrupted(&self, now: i64) -> anyhow::Result<usize>;
+
+    /// Clear a run's `recoverable` flag once a resume turn has been dispatched
+    /// for it, so the same interruption is never resumed twice.
+    async fn mark_resumed(&self, id: &str) -> anyhow::Result<()>;
 }
 
 #[cfg(test)]

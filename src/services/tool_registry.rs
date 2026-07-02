@@ -510,6 +510,9 @@ mod tests {
         async fn reconcile_interrupted(&self, _now: i64) -> anyhow::Result<usize> {
             Ok(0)
         }
+        async fn mark_resumed(&self, _id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     struct EchoTool;

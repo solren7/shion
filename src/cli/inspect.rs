@@ -117,9 +117,10 @@ pub async fn run_list(db_url: &str, limit: usize) -> anyhow::Result<()> {
     }
     for r in runs {
         println!(
-            "{}  [{}]  {}  {}  {}",
+            "{}  [{}]{}  {}  {}  {}",
             r.id,
             r.status.as_str(),
+            if r.recoverable { " ⟲" } else { "" },
             local_time(r.started_at),
             if r.plan.is_empty() { "-" } else { &r.plan },
             oneline(&r.input, 60),
@@ -161,6 +162,9 @@ pub async fn run_inspect(db_url: &str, id: &str) -> anyhow::Result<()> {
     println!("input   {}", oneline(&run.input, 200));
     if !run.error.is_empty() {
         println!("error   {}", run.error);
+    }
+    if run.recoverable {
+        println!("resume  recoverable — `shion run resume {}`", run.id);
     }
     if !run.final_output.is_empty() {
         println!("output  {}", oneline(&run.final_output, 200));
