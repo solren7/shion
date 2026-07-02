@@ -553,6 +553,7 @@ async fn dream_preview(State(state): State<AppState>) -> Result<Json<Value>, Api
         let item = DreamItem {
             id: m.id.clone(),
             recall_count: m.recall_count,
+            unique_queries: m.recall_query_hashes.len(),
             score: dream_score(m, now),
             content: m.content.clone(),
         };
@@ -597,6 +598,10 @@ pub struct PairingView {
 pub struct DreamItem {
     pub id: String,
     pub recall_count: i64,
+    /// Distinct recall-query fingerprints (the diversity half of the promote
+    /// gate). `default` so a payload from an older gateway still parses.
+    #[serde(default)]
+    pub unique_queries: usize,
     pub score: f64,
     pub content: String,
 }

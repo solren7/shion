@@ -222,7 +222,11 @@ fn line(m: &Memory) -> String {
         m.content
     );
     if m.recall_count > 0 {
-        s.push_str(&format!("  (recalls={})", m.recall_count));
+        s.push_str(&format!(
+            "  (recalls={} queries={})",
+            m.recall_count,
+            m.recall_query_hashes.len()
+        ));
     }
     if !m.source.is_empty() {
         s.push_str(&format!("  (from {})", m.source));

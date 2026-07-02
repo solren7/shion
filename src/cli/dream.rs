@@ -68,6 +68,7 @@ async fn classify_local(url: &str, now: i64) -> anyhow::Result<(Vec<DreamItem>, 
         let item = DreamItem {
             id: m.id.clone(),
             recall_count: m.recall_count,
+            unique_queries: m.recall_query_hashes.len(),
             score: dream_score(m, now),
             content: m.content.clone(),
         };
@@ -92,8 +93,8 @@ fn report_bucket(label: &str, items: &[DreamItem]) {
     println!("\n{label}: {}", items.len());
     for m in items.iter().take(20) {
         println!(
-            "  {}  [recalls={} score={:.2}]  {}",
-            m.id, m.recall_count, m.score, m.content
+            "  {}  [recalls={} queries={} score={:.2}]  {}",
+            m.id, m.recall_count, m.unique_queries, m.score, m.content
         );
     }
     if items.len() > 20 {

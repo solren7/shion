@@ -49,6 +49,9 @@ struct MemoryRecord {
     expires_at: i64,
     last_used_at: i64,
     recall_count: i64,
+    // Comma-separated distinct query fingerprints (hex, so commas never occur
+    // inside a value); domain type is `Vec<String>`.
+    recall_query_hashes: String,
 }
 
 /// Connection to the memory database. Holds only `MemoryRecord`.
@@ -181,6 +184,7 @@ fn record_from_memory(memory: &Memory) -> MemoryRecord {
         expires_at: memory.expires_at.unwrap_or(0),
         last_used_at: memory.last_used_at.unwrap_or(0),
         recall_count: memory.recall_count,
+        recall_query_hashes: memory.recall_query_hashes.join(","),
     }
 }
 
@@ -202,6 +206,12 @@ fn memory_from_record(record: MemoryRecord) -> Memory {
         expires_at: nonzero(record.expires_at),
         last_used_at: nonzero(record.last_used_at),
         recall_count: record.recall_count,
+        recall_query_hashes: record
+            .recall_query_hashes
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
     }
 }
 
@@ -232,6 +242,7 @@ impl MemoryRepository for MemoryDb {
                     .expires_at(r.expires_at)
                     .last_used_at(r.last_used_at)
                     .recall_count(r.recall_count)
+                    .recall_query_hashes(r.recall_query_hashes)
                     .exec(&mut conn)
                     .await?;
                 return Ok(());
@@ -253,6 +264,7 @@ impl MemoryRepository for MemoryDb {
                 expires_at: r.expires_at,
                 last_used_at: r.last_used_at,
                 recall_count: r.recall_count,
+                recall_query_hashes: r.recall_query_hashes,
             })
             .exec(&mut conn)
             .await?;
@@ -300,10 +312,16 @@ impl MemoryRepository for MemoryDb {
 /// Every column listed here MUST be `NOT NULL` with a `DEFAULT` (or be nullable),
 /// or `ALTER TABLE ADD COLUMN` fails on a non-empty table.
 async fn ensure_columns(path: &Path) -> anyhow::Result<()> {
-    const EXPECTED: &[(&str, &str)] = &[(
-        "recall_count",
-        "\"recall_count\" integer NOT NULL DEFAULT 0",
-    )];
+    const EXPECTED: &[(&str, &str)] = &[
+        (
+            "recall_count",
+            "\"recall_count\" integer NOT NULL DEFAULT 0",
+        ),
+        (
+            "recall_query_hashes",
+            "\"recall_query_hashes\" text NOT NULL DEFAULT ''",
+        ),
+    ];
 
     let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
         .build()
@@ -413,6 +431,7 @@ mod tests {
                     expires_at: r.expires_at,
                     last_used_at: r.last_used_at,
                     recall_count: r.recall_count,
+                    recall_query_hashes: r.recall_query_hashes,
                 })
                 .exec(&mut conn)
                 .await
@@ -447,11 +466,12 @@ mod tests {
         assert_eq!(db2.list().await.unwrap().len(), 3, "must not re-migrate");
     }
 
-    /// An existing memory.db created before `recall_count` existed must gain the
-    /// column **in place** on connect — additive ALTER, no data loss — rather
-    /// than force a destructive reset.
+    /// An existing memory.db created before `recall_count` /
+    /// `recall_query_hashes` existed must gain the columns **in place** on
+    /// connect — additive ALTER, no data loss — rather than force a
+    /// destructive reset.
     #[tokio::test]
-    async fn adds_missing_recall_count_column_in_place() {
+    async fn adds_missing_recall_columns_in_place() {
         let path = std::env::temp_dir().join("shion_memory_db_addcol.db");
         crate::infra::persistence::reset_test_db(&path);
 
@@ -488,7 +508,7 @@ mod tests {
         // Mark it turso-native so connect() does not stage it as a sqlite backup.
         std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
 
-        // 2. Connect via MemoryDb: ensure_columns adds recall_count in place.
+        // 2. Connect via MemoryDb: ensure_columns adds both columns in place.
         let db = MemoryDb::connect(&format!("turso:{}", path.display()))
             .await
             .unwrap();
@@ -496,10 +516,15 @@ mod tests {
         assert_eq!(rows.len(), 1, "the pre-migration row survives");
         assert_eq!(rows[0].content, "a pre-migration memory");
         assert_eq!(rows[0].recall_count, 0, "new column defaults to 0");
+        assert!(rows[0].recall_query_hashes.is_empty(), "defaults to empty");
 
-        // 3. The added column is fully usable: a recall bump persists.
-        db.mark_used(&[rows[0].id.clone()], 9_000).await.unwrap();
-        assert_eq!(db.get("mem-old").await.unwrap().unwrap().recall_count, 1);
+        // 3. The added columns are fully usable: a recall bump persists.
+        db.mark_used(&[rows[0].id.clone()], 9_000, "q-hash")
+            .await
+            .unwrap();
+        let after = db.get("mem-old").await.unwrap().unwrap();
+        assert_eq!(after.recall_count, 1);
+        assert_eq!(after.recall_query_hashes, vec!["q-hash".to_string()]);
     }
 
     #[tokio::test]
@@ -643,13 +668,26 @@ mod tests {
         m.updated_at = 500;
         db.save(&m).await.unwrap();
 
-        db.mark_used(&[m.id.clone()], 9_000).await.unwrap();
-        db.mark_used(&[m.id.clone()], 9_100).await.unwrap();
+        db.mark_used(&[m.id.clone()], 9_000, "hash-a")
+            .await
+            .unwrap();
+        db.mark_used(&[m.id.clone()], 9_100, "hash-a")
+            .await
+            .unwrap();
+        db.mark_used(&[m.id.clone()], 9_200, "hash-b")
+            .await
+            .unwrap();
+        db.mark_used(&[m.id.clone()], 9_300, "").await.unwrap();
 
         let after = db.get(&m.id).await.unwrap().unwrap();
-        assert_eq!(after.last_used_at, Some(9_100));
-        assert_eq!(after.recall_count, 2, "each recall bumps the count");
+        assert_eq!(after.last_used_at, Some(9_300));
+        assert_eq!(after.recall_count, 4, "each recall bumps the count");
         assert_eq!(after.updated_at, 500, "recall must not bump updated_at");
+        assert_eq!(
+            after.recall_query_hashes,
+            vec!["hash-a".to_string(), "hash-b".to_string()],
+            "fingerprints dedup; an empty hash is never recorded"
+        );
     }
 
     #[tokio::test]

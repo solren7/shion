@@ -20,7 +20,7 @@ use crate::{
     config::{ModelConfig, Provider},
     domain::{
         llm::{LlmClient, Step, ToolCallReq, ToolOutcome, TurnDriver},
-        memory::{MemoryContext, MemoryRepository},
+        memory::{MemoryContext, MemoryRepository, recall_query_hash},
         message::{Message, Role},
         session::Session,
         tool::Tool,
@@ -153,14 +153,16 @@ where
                         preamble.push_str(&block);
                     }
                     // Record the recall usage signal off the reply path: it only
-                    // touches `last_used_at`, so it must not add latency or fail
-                    // the answer. Spawned best-effort, warn on error.
+                    // touches usage fields, so it must not add latency or fail
+                    // the answer. Spawned best-effort, warn on error. The query
+                    // fingerprint feeds the dreaming diversity gate.
                     let ids: Vec<String> = hits.iter().map(|h| h.memory.id.clone()).collect();
                     if !ids.is_empty() {
                         let repo = memories.clone();
+                        let query_hash = recall_query_hash(&prompt);
                         tokio::spawn(async move {
                             let now = time::OffsetDateTime::now_utc().unix_timestamp();
-                            if let Err(error) = repo.mark_used(&ids, now).await {
+                            if let Err(error) = repo.mark_used(&ids, now, &query_hash).await {
                                 tracing::warn!(%error, "failed to record recall usage");
                             }
                         });

@@ -154,7 +154,7 @@ impl DreamSweep {
                     match self.memories.save(&memory).await {
                         Ok(()) => {
                             summary.memories_promoted += 1;
-                            info!(id = %memory.id, recalls = memory.recall_count, "dream: promoted candidate to active");
+                            info!(id = %memory.id, recalls = memory.recall_count, queries = memory.recall_query_hashes.len(), "dream: promoted candidate to active");
                         }
                         Err(error) => {
                             warn!(%error, id = %memory.id, "dream: promote failed (skipped)")
@@ -1138,6 +1138,8 @@ mod tests {
         m.recall_count = recall_count;
         if recall_count > 0 {
             m.last_used_at = Some(now - 86_400);
+            // Diverse queries, so the count is the deciding signal under test.
+            m.recall_query_hashes = (0..recall_count).map(|i| format!("hash-{i}")).collect();
         }
         m
     }

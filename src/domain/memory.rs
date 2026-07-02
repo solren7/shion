@@ -51,6 +51,15 @@ pub struct Memory {
     /// `DreamSweep`; one that never does is eventually archived. See
     /// [`dream_verdict`].
     pub recall_count: i64,
+    /// Distinct fingerprints of the queries that recalled this memory (see
+    /// [`recall_query_hash`]), capped at [`RECALL_QUERY_HASHES_CAP`]. The
+    /// query-diversity half of the dreaming signal (OpenClaw's
+    /// `minUniqueQueries`): a raw `recall_count` can be pumped by one repeated
+    /// question, but promotion also requires being recalled by
+    /// [`DREAM_MIN_UNIQUE_QUERIES`] lexically-distinct queries.
+    /// `#[serde(default)]` so a payload from an older gateway still parses.
+    #[serde(default)]
+    pub recall_query_hashes: Vec<String>,
 }
 
 /// Default ranking weight for a new memory.
@@ -81,6 +90,7 @@ impl Memory {
             expires_at: None,
             last_used_at: None,
             recall_count: 0,
+            recall_query_hashes: Vec::new(),
         }
     }
 
@@ -460,6 +470,32 @@ fn is_cjk(ch: char) -> bool {
     )
 }
 
+/// Fingerprint a recall query for the dreaming query-diversity signal: the
+/// message's [`recall_terms`] (already normalized: lowercased, stopwords
+/// dropped) sorted and hashed, first 16 hex chars of the SHA-256. Reordering or
+/// re-punctuating the same question yields the same fingerprint; only a change
+/// in substantive terms counts as a new query. Lexical, not semantic — a full
+/// rephrasing with different words counts as distinct, which slightly
+/// overstates diversity; acceptable until the embedding phase.
+///
+/// Returns an empty string when the text yields no terms (no signal — callers
+/// must not record it).
+pub fn recall_query_hash(text: &str) -> String {
+    let mut terms: Vec<String> = recall_terms(text).into_iter().collect();
+    if terms.is_empty() {
+        return String::new();
+    }
+    terms.sort();
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for term in &terms {
+        hasher.update(term.as_bytes());
+        hasher.update([0x1f]); // separator so ["ab","c"] != ["a","bc"]
+    }
+    let digest = hasher.finalize();
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
 /// Score a memory for L3 recall against the query's extracted terms. Returns
 /// `None` when there is no lexical overlap (the memory is excluded); otherwise a
 /// positive score: shared-term count plus the same importance/confidence/recency
@@ -623,17 +659,26 @@ pub trait MemoryRepository: Send + Sync {
         Ok(scored)
     }
 
-    /// Record that memories surfaced in recall: bump `recall_count` and stamp
-    /// `last_used_at`, never touching `updated_at` so the recency-decay signal
-    /// stays tied to real edits. `recall_count` is the dreaming system's
-    /// usage signal — the more a memory is actually recalled, the stronger its
-    /// case for promotion (see [`dream_verdict`]). Best-effort: ids that no
-    /// longer resolve are skipped.
-    async fn mark_used(&self, ids: &[String], now: i64) -> anyhow::Result<()> {
+    /// Record that memories surfaced in recall: bump `recall_count`, stamp
+    /// `last_used_at`, and accumulate the query's fingerprint (see
+    /// [`recall_query_hash`]) into `recall_query_hashes` — never touching
+    /// `updated_at` so the recency-decay signal stays tied to real edits.
+    /// Count + distinct-query fingerprints are the dreaming system's usage
+    /// signal (see [`dream_verdict`]). An empty `query_hash` (a query with no
+    /// terms) still counts the recall but records no fingerprint; a fingerprint
+    /// already present, or one past [`RECALL_QUERY_HASHES_CAP`], is dropped.
+    /// Best-effort: ids that no longer resolve are skipped.
+    async fn mark_used(&self, ids: &[String], now: i64, query_hash: &str) -> anyhow::Result<()> {
         for id in ids {
             if let Some(mut memory) = self.get(id).await? {
                 memory.recall_count += 1;
                 memory.last_used_at = Some(now);
+                if !query_hash.is_empty()
+                    && memory.recall_query_hashes.len() < RECALL_QUERY_HASHES_CAP
+                    && !memory.recall_query_hashes.iter().any(|h| h == query_hash)
+                {
+                    memory.recall_query_hashes.push(query_hash.to_string());
+                }
                 self.save(&memory).await?;
             }
         }
@@ -661,6 +706,13 @@ pub enum DreamVerdict {
 /// Minimum recalls a candidate must have earned to be promoted (OpenClaw's
 /// `minRecallCount`, default 3).
 pub const DREAM_MIN_RECALL_COUNT: i64 = 3;
+/// Minimum distinct query fingerprints a candidate must have been recalled by
+/// to be promoted (OpenClaw's `minUniqueQueries`) — so one repeated question
+/// cannot pump a candidate to active on count alone.
+pub const DREAM_MIN_UNIQUE_QUERIES: usize = 2;
+/// Cap on stored distinct query fingerprints per memory. Diversity is proven
+/// well before this; appending forever would only widen the row.
+pub const RECALL_QUERY_HASHES_CAP: usize = 8;
 /// A candidate older than this (days) with no recalls is archived — the
 /// "forget the flotsam" half of dreaming.
 pub const DREAM_FORGET_AGE_DAYS: i64 = 30;
@@ -670,9 +722,9 @@ pub const DREAM_PROMOTE_MIN_SCORE: f64 = 1.0;
 
 /// Dreaming score for a candidate: dominated by recall frequency, nudged by
 /// recency and importance. Explainable and embedding-free, matching the rest of
-/// shion's ranking. Higher = stronger case for promotion. (Query-diversity —
-/// OpenClaw's `minUniqueQueries` — is deliberately omitted: shion tracks a recall
-/// *count*, not per-query provenance, so diversity is deferred to a later phase.)
+/// shion's ranking. Higher = stronger case for promotion. (Query-diversity is
+/// a separate hard gate in [`dream_verdict`], not a score component — a
+/// diversity-failing candidate must not promote no matter how high it scores.)
 pub fn dream_score(memory: &Memory, now: i64) -> f64 {
     let mut score = memory.recall_count as f64; // each recall = 1.0, the core signal
     score += memory.importance as f64 / 100.0; // 0..~1
@@ -694,6 +746,7 @@ pub fn dream_verdict(memory: &Memory, now: i64) -> DreamVerdict {
     }
     let age_days = (now - memory.created_at).max(0) as f64 / 86_400.0;
     if memory.recall_count >= DREAM_MIN_RECALL_COUNT
+        && memory.recall_query_hashes.len() >= DREAM_MIN_UNIQUE_QUERIES
         && dream_score(memory, now) >= DREAM_PROMOTE_MIN_SCORE
     {
         DreamVerdict::Promote
@@ -843,6 +896,11 @@ mod tests {
         m.recall_count = recall_count;
         if recall_count > 0 {
             m.last_used_at = Some(now - 86_400); // used yesterday
+            // Recalled by as many distinct queries as recalls (the diverse,
+            // promotion-friendly shape); diversity-gate tests override this.
+            m.recall_query_hashes = (0..recall_count.min(RECALL_QUERY_HASHES_CAP as i64))
+                .map(|i| format!("hash-{i}"))
+                .collect();
         }
         m
     }
@@ -852,6 +910,37 @@ mod tests {
         let now = 10_000 * 86_400;
         let m = candidate(DREAM_MIN_RECALL_COUNT, 5, now);
         assert_eq!(dream_verdict(&m, now), DreamVerdict::Promote);
+    }
+
+    #[test]
+    fn dream_keeps_candidate_pumped_by_one_repeated_query() {
+        let now = 10_000 * 86_400;
+        // Plenty of recalls, but all from the same question: count alone must
+        // not promote (the minUniqueQueries gate).
+        let mut m = candidate(10, 5, now);
+        m.recall_query_hashes = vec!["same-hash".into()];
+        assert_eq!(dream_verdict(&m, now), DreamVerdict::Keep);
+        // Pre-upgrade rows (counts accumulated before fingerprints existed)
+        // look the same — empty hashes — and stay put until diversity accrues.
+        m.recall_query_hashes.clear();
+        assert_eq!(dream_verdict(&m, now), DreamVerdict::Keep);
+        // A second distinct query unlocks promotion.
+        m.recall_query_hashes = vec!["hash-a".into(), "hash-b".into()];
+        assert_eq!(dream_verdict(&m, now), DreamVerdict::Promote);
+    }
+
+    #[test]
+    fn recall_query_hash_is_order_and_punctuation_invariant() {
+        let a = recall_query_hash("rust project language");
+        let b = recall_query_hash("Language — PROJECT... rust?!");
+        assert_eq!(a.len(), 16);
+        assert_eq!(a, b, "same terms, any order/punctuation → same fingerprint");
+        let c = recall_query_hash("does shion support telegram");
+        assert_ne!(a, c, "different substantive terms → different fingerprint");
+        assert!(
+            recall_query_hash("— …!").is_empty(),
+            "no extractable terms → empty (never recorded)"
+        );
     }
 
     #[test]
