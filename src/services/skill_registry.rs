@@ -58,14 +58,21 @@ impl SkillRegistry {
         skills
     }
 
+    /// The skills the model may use: everything not `disabled`. Disabled
+    /// skills stay loaded (so `get` can explain their state) but never enter
+    /// the catalog the model sees.
+    fn enabled(&self) -> impl Iterator<Item = &Skill> {
+        self.skills.iter().filter(|s| !s.disabled)
+    }
+
     /// A capped `- name: description` catalog for the system prompt: lists up to
     /// `max` skills, noting how many more exist (use the `skill` tool to list all).
     pub fn catalog_capped(&self, max: usize) -> String {
-        if self.skills.len() <= max {
+        let enabled: Vec<&Skill> = self.enabled().collect();
+        if enabled.len() <= max {
             return self.catalog();
         }
-        let shown = self
-            .skills
+        let shown = enabled
             .iter()
             .take(max)
             .map(|s| format!("- {}: {}", s.name, s.description))
@@ -73,22 +80,24 @@ impl SkillRegistry {
             .join("\n");
         format!(
             "{shown}\n- …and {} more — call the `skill` tool with action=list to see all.",
-            self.skills.len() - max
+            enabled.len() - max
         )
     }
 
+    /// Look up by name, including disabled skills — the `skill` tool answers a
+    /// `view` on a disabled skill with its state rather than "not found".
     pub fn get(&self, name: &str) -> Option<&Skill> {
         self.skills.iter().find(|s| s.name == name)
     }
 
+    /// No usable (enabled) skills — gates the system-prompt catalog note.
     pub fn is_empty(&self) -> bool {
-        self.skills.is_empty()
+        self.enabled().next().is_none()
     }
 
     /// A `- name: description` catalog for injection into the system prompt.
     pub fn catalog(&self) -> String {
-        self.skills
-            .iter()
+        self.enabled()
             .map(|s| format!("- {}: {}", s.name, s.description))
             .collect::<Vec<_>>()
             .join("\n")
@@ -122,6 +131,45 @@ mod tests {
     fn missing_directory_is_empty() {
         let reg = SkillRegistry::load_from_dirs(&[PathBuf::from("/nonexistent/shion/skills")]);
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn disabled_skills_are_hidden_from_the_catalog_but_still_resolvable() {
+        let dir = std::env::temp_dir().join("shion_skill_disabled_test");
+        for (name, disabled) in [("alive", false), ("paused", true)] {
+            let d = dir.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: d\ndisabled: {disabled}\n---\nbody"
+                ),
+            )
+            .unwrap();
+        }
+
+        let reg = SkillRegistry::load_from_dirs(std::slice::from_ref(&dir));
+        assert!(reg.catalog().contains("alive"));
+        assert!(!reg.catalog().contains("paused"));
+        assert!(!reg.is_empty());
+        // Still resolvable so the `skill` tool can explain its state.
+        assert!(reg.get("paused").unwrap().disabled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn all_disabled_counts_as_empty() {
+        let reg = SkillRegistry::new(vec![Skill {
+            name: "paused".into(),
+            description: "d".into(),
+            instructions: "b".into(),
+            protected: false,
+            disabled: true,
+            source: "user".into(),
+        }]);
+        assert!(reg.is_empty());
+        assert!(reg.catalog().is_empty());
     }
 
     #[test]

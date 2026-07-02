@@ -73,6 +73,12 @@ impl Tool for SkillTool {
                     .name
                     .ok_or_else(|| anyhow::anyhow!("`name` is required for action=view"))?;
                 match self.registry.get(&name) {
+                    // A clear terminal answer, not an error: the model should
+                    // move on, not retry other spellings.
+                    Some(skill) if skill.disabled => Ok(format!(
+                        "skill `{}` is disabled by the operator and cannot be used.",
+                        skill.name
+                    )),
                     Some(skill) => Ok(format!(
                         "# Skill: {}\n{}\n\n{}",
                         skill.name, skill.description, skill.instructions
@@ -120,6 +126,25 @@ mod tests {
             .await
             .unwrap();
         assert!(view.contains("Greet the user warmly."));
+    }
+
+    #[tokio::test]
+    async fn view_disabled_skill_reports_state_without_instructions() {
+        let tool = SkillTool::new(Arc::new(SkillRegistry::new(vec![Skill {
+            name: "paused".to_string(),
+            description: "d".to_string(),
+            instructions: "secret steps".to_string(),
+            protected: false,
+            disabled: true,
+            source: "user".to_string(),
+        }])));
+
+        let view = tool
+            .execute(json!({ "action": "view", "name": "paused" }).to_string())
+            .await
+            .unwrap();
+        assert!(view.contains("disabled by the operator"));
+        assert!(!view.contains("secret steps"));
     }
 
     #[tokio::test]
