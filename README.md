@@ -133,7 +133,39 @@ allow_from = ["wxid_xxx"]
 enabled = true
 watch_domains = ["binary_sensor", "lock"]
 cooldown_seconds = 30
+
+# Permission policy: auto-allow / hard-deny side-effecting actions instead of
+# prompting for each one. Deny beats allow; anything unmatched falls back to
+# `default_normal` (ask). Read-only actions (web fetches, file reads) are
+# deny-only: a deny rule can block them, nothing ever prompts for them.
+[policy]
+default_normal = "ask"       # ask | deny | allow — fallback for unmatched Normal actions
+
+[[policy.rule]]              # let cargo/git run without prompting…
+category = "shell"           # shell | file | network | homeassistant
+match = "prefix"             # prefix | suffix | exact | contains
+value = "cargo "
+effect = "allow"
+
+[[policy.rule]]              # …but never talk to the internal network
+category = "network"
+match = "suffix"             # network matches the URL host, on dot boundaries
+value = "internal.corp"
+effect = "deny"
+
+[[policy.rule]]              # and keep key material unreadable even in-workspace
+category = "file"
+match = "contains"
+value = ".ssh"
+access = "read"              # file rules can scope to read | write
+effect = "deny"
 ```
+
+Verify with `shion policy list` (resolved rules) and
+`shion policy check <category> <target>` (dry-run one action, shows the
+matching rule). Rules can also scope to channels
+(`channels = ["telegram"]`), and an allow rule only covers
+`Risk::Dangerous` actions when it sets `include_dangerous = true`.
 
 | Provider | API key env var |
 |---|---|

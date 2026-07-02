@@ -60,21 +60,18 @@
 
 ## 3. 权限策略产品化
 
-目前已有两层基础：
+**已落地**（设计与缺口分析见 `.scratch/permission-policy/PRD.md`）：
 
-- CLI 场景用 `CliApprover` 交互确认。
-- gateway 场景用 `ChatApprover`，`Risk::Safe` 自动放行，`Risk::Normal` / `Risk::Dangerous` 通过聊天 `/approve`、`/approve session`、`/deny` 决策。
+- 独立 policy 层：`domain/policy.rs` 纯规则引擎 + `agent/policy_approver.rs` 装饰器（包在 `CliApprover`/`ChatApprover` 外层），config.toml `[policy]` + `[[policy.rule]]` 配置。
+- 规则维度：category（shell 命令前缀 / file 目录+读写 / network 域名 / homeassistant 服务）、matcher、channel scope、`include_dangerous`、`default_normal` 兜底。deny 永远压过 allow；无 session（sweep/aux）时 Allow 不无人值守生效。
+- 读操作 deny-only：`web_fetch` 和 `file` 读以 `Risk::Safe` 过策略，deny 规则可封域名/路径（exfiltration 防线），未命中不打扰、不升级。
+- 操作面：`shion policy list` / `shion policy check`（dry-run 并指出命中规则）、doctor `policy:` 段。
+- 分层不变式：policy 在各工具 hardline 地板之上，只能收紧不能放松；策略判定进 tracing 日志，deny 结果以工具错误进 run ledger。
 
-这已经替代了早期的一刀切 `DenyApprover`，但还不是完整产品能力。下一步应该把权限从"临时审批"升级为可配置策略：
+剩余缺口：
 
-- 特定目录允许自动读写。
-- 特定命令前缀允许自动执行。
-- 网络访问按域名授权。
-- gateway 模式默认拒绝危险动作，但允许用户配置放行的安全动作。
-- 不同 channel / session 可以有不同权限。
-- 所有写入动作和外部副作用必须进入 run ledger。
-
-落点可以是独立 policy 层，而不是散在各工具里的 if/else。
+- `unattended = true` 规则标志：给无人值守 sweep（briefing-via-skill 拉外部数据）一条显式 opt-in 的窄放行通道——挂起到消费者出现（PRD issue 04）。
+- 审批交互里提示"可以把这个动作加进 policy"（从临时审批到规则的引导路径）。
 
 ## 4. 任务与承诺模型
 
