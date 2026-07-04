@@ -6,6 +6,7 @@ use serde_json::json;
 
 use crate::{
     domain::{
+        approval::{ApprovalRequest, Approver},
         repository::SkillRepository,
         skill::{SOURCE_LEARNED, Skill},
         tool::Tool,
@@ -23,21 +24,34 @@ struct SkillArgs {
     description: Option<String>,
     #[serde(default)]
     instructions: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
 }
 
-/// Lets the model discover, load, and author skills (progressive disclosure):
-/// `list` returns the catalog; `view` returns a skill's full instruction body,
-/// which the model then follows; `learn` distills a reusable procedure into a
-/// **candidate** skill (the on-demand analog of the reflective reviewer's
-/// passive extraction — same triage ladder).
+/// Lets the model discover, load, author, and install skills (progressive
+/// disclosure): `list` returns the catalog; `view` returns a skill's full
+/// instruction body, which the model then follows; `learn` distills a reusable
+/// procedure into a **candidate** skill (the on-demand analog of the reflective
+/// reviewer's passive extraction — same triage ladder); `install` fetches a
+/// skill from a git repo or a raw SKILL.md URL and — once the operator approves
+/// — installs it **active** (a human is always in the loop for third-party code).
 pub struct SkillTool {
     registry: Arc<SkillRegistry>,
     store: Arc<FsSkillStore>,
+    approver: Arc<dyn Approver>,
 }
 
 impl SkillTool {
-    pub fn new(registry: Arc<SkillRegistry>, store: Arc<FsSkillStore>) -> Self {
-        Self { registry, store }
+    pub fn new(
+        registry: Arc<SkillRegistry>,
+        store: Arc<FsSkillStore>,
+        approver: Arc<dyn Approver>,
+    ) -> Self {
+        Self {
+            registry,
+            store,
+            approver,
+        }
     }
 }
 
@@ -48,12 +62,14 @@ impl Tool for SkillTool {
     }
 
     fn description(&self) -> &'static str {
-        "Discover, load, and author skills (reusable instruction playbooks). \
-         action=\"list\" returns available skills; action=\"view\" returns a \
-         named skill's full instructions, which you should then follow; \
-         action=\"learn\" saves a reusable procedure you just worked out as a \
-         candidate skill for the operator to review. Only learn durable, \
-         reusable know-how (not one-off facts or transient failures)."
+        "Discover, load, author, and install skills (reusable instruction \
+         playbooks). action=\"list\" returns available skills; action=\"view\" \
+         returns a named skill's full instructions, which you should then \
+         follow; action=\"learn\" saves a reusable procedure you just worked out \
+         as a candidate skill for the operator to review (only learn durable, \
+         reusable know-how, not one-off facts); action=\"install\" fetches a \
+         skill the user points you at (a git repo or a SKILL.md URL) and \
+         installs it after the operator approves."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -62,8 +78,8 @@ impl Tool for SkillTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "view", "learn"],
-                    "description": "Whether to list skills, view one, or learn a new one."
+                    "enum": ["list", "view", "learn", "install"],
+                    "description": "Whether to list skills, view one, learn a new one, or install one."
                 },
                 "name": {
                     "type": "string",
@@ -80,6 +96,12 @@ impl Tool for SkillTool {
                     "type": "string",
                     "description": "The full skill body — the step-by-step reusable procedure \
                      (required for action=learn)."
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Where to fetch the skill from (required for action=install): \
+                     `owner/repo`, `owner/repo/subpath`, a GitHub URL, any `*.git`/`git@` URL, \
+                     or a link straight to a raw SKILL.md."
                 }
             },
             "required": ["action"]
@@ -139,17 +161,43 @@ impl Tool for SkillTool {
                 // `save` writes a *candidate* (never an active skill): the same
                 // triage ladder as the reviewer, and it refuses a protected
                 // active skill or a path-escaping name. A candidate is invisible
-                // to the runtime until promoted + `shion gateway restart`, so the
-                // reply must not imply it's usable this turn.
+                // to the runtime until promoted, so the reply must not imply it's
+                // usable this turn.
                 self.store.save(&skill).await?;
                 Ok(format!(
                     "Learned `{name}` as a candidate skill. Review it with \
                      `shion skill inspect {name}`, then `shion skill promote {name}` \
-                     to activate (takes effect after `shion gateway restart`)."
+                     to activate (usable on the agent's next `skill` list once promoted)."
+                ))
+            }
+            "install" => {
+                let source = args
+                    .source
+                    .ok_or_else(|| anyhow::anyhow!("`source` is required for action=install"))?;
+                // Installing third-party code is side-effecting and never
+                // unattended: gate it through the approver (session-scoped, so a
+                // `/approve session` covers a batch). Denied ⇒ nothing written.
+                let request = ApprovalRequest::normal(format!(
+                    "Install skill from `{source}` into the active skill store"
+                ))
+                .with_scope_key("skill:install".to_string());
+                if !self.approver.approve(&request).await {
+                    return Ok("Skill install rejected by user; nothing was installed.".to_string());
+                }
+                let installed = crate::infra::skill_install::install(&self.store, &source).await?;
+                let about = if installed.description.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", installed.description)
+                };
+                Ok(format!(
+                    "Installed `{}` ({} file(s)){about}. It's active now: use \
+                     `skill` view/list to load it (no restart needed).",
+                    installed.name, installed.files
                 ))
             }
             other => Err(anyhow::anyhow!(
-                "unknown action `{other}` (expected list/view/learn)"
+                "unknown action `{other}` (expected list/view/learn/install)"
             )),
         }
     }
@@ -178,14 +226,28 @@ mod tests {
         Arc::new(FsSkillStore::new(root))
     }
 
+    /// A no-op approver — install is the only action that consults it, and the
+    /// non-install tests never reach that path.
+    struct DenyAll;
+    #[async_trait]
+    impl Approver for DenyAll {
+        async fn approve(&self, _request: &ApprovalRequest) -> bool {
+            false
+        }
+    }
+
+    fn approver() -> Arc<dyn Approver> {
+        Arc::new(DenyAll)
+    }
+
     fn tool_with(tag: &str) -> (SkillTool, Arc<FsSkillStore>) {
         let store = store(tag);
-        (SkillTool::new(registry(), store.clone()), store)
+        (SkillTool::new(registry(), store.clone(), approver()), store)
     }
 
     #[tokio::test]
     async fn lists_and_views_skills() {
-        let tool = SkillTool::new(registry(), store("listview"));
+        let tool = SkillTool::new(registry(), store("listview"), approver());
 
         let list = tool
             .execute(json!({ "action": "list" }).to_string())
@@ -212,6 +274,7 @@ mod tests {
                 source: "user".to_string(),
             }])),
             store("disabled"),
+            approver(),
         );
 
         let view = tool
@@ -223,8 +286,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn install_is_refused_when_the_approver_denies() {
+        let (tool, store) = tool_with("install_denied");
+        // DenyAll approver ⇒ short-circuits before any fetch; nothing installed.
+        let out = tool
+            .execute(json!({ "action": "install", "source": "owner/repo" }).to_string())
+            .await
+            .unwrap();
+        assert!(out.contains("rejected"));
+        assert!(store.list_active().is_empty());
+    }
+
+    #[tokio::test]
+    async fn install_requires_a_source() {
+        let (tool, _store) = tool_with("install_nosource");
+        let err = tool
+            .execute(json!({ "action": "install" }).to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("source"));
+    }
+
+    #[tokio::test]
     async fn view_unknown_skill_errors() {
-        let tool = SkillTool::new(registry(), store("unknown"));
+        let tool = SkillTool::new(registry(), store("unknown"), approver());
         let err = tool
             .execute(json!({ "action": "view", "name": "nope" }).to_string())
             .await

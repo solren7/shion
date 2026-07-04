@@ -5,24 +5,57 @@ use tracing::{debug, warn};
 
 use crate::domain::skill::Skill;
 
-/// Discovers and holds skills loaded from a directory of `<name>/SKILL.md` files.
+/// Discovers skills from a set of `<name>/SKILL.md` directories.
+///
+/// When built via [`load_from_dirs`](Self::load_from_dirs) the registry holds
+/// only the directory list and **re-scans on every query**, so a skill
+/// installed, promoted, enabled, or disabled on disk is reflected the next time
+/// the `skill` tool runs — no gateway restart needed (the filesystem is the
+/// source of truth, matching `FsSkillStore` and the `shion skill` CLI). Reads
+/// touch only a handful of small files, so live scanning is cheap. A registry
+/// built via [`new`](Self::new) instead holds a fixed list and never re-scans
+/// (used by tests).
 pub struct SkillRegistry {
-    skills: Vec<Skill>,
+    /// Directories re-scanned on each query. Empty ⇒ this is a static registry
+    /// backed by `static_skills`.
+    dirs: Vec<PathBuf>,
+    /// Fixed skill list, used only when `dirs` is empty.
+    static_skills: Vec<Skill>,
 }
 
 impl SkillRegistry {
+    /// A static registry over a fixed skill list — never re-scans disk.
+    /// Test-only: production builds the live, disk-backed registry via
+    /// [`load_from_dirs`](Self::load_from_dirs).
+    #[cfg(test)]
     pub fn new(skills: Vec<Skill>) -> Self {
-        Self { skills }
+        Self {
+            dirs: Vec::new(),
+            static_skills: skills,
+        }
     }
 
-    /// Load skills from multiple directories (e.g. shion's own `skills/`, the
-    /// project's `.claude/skills/`, and the user's `~/.claude/skills/`). The
-    /// first directory to define a given skill name wins, so workspace-local
+    /// A live registry over multiple directories (e.g. shion's own `skills/`,
+    /// the project's `.claude/skills/`, and the user's `~/.claude/skills/`).
+    /// Each query re-scans these, so on-disk changes appear without a restart.
+    /// The first directory to define a given skill name wins, so workspace-local
     /// skills override globally-shared ones.
     pub fn load_from_dirs(dirs: &[PathBuf]) -> Self {
+        Self {
+            dirs: dirs.to_vec(),
+            static_skills: Vec::new(),
+        }
+    }
+
+    /// The current skills, sorted by name. Live-scans `dirs` when set (first
+    /// directory wins on a name clash), otherwise returns the static list.
+    fn snapshot(&self) -> Vec<Skill> {
+        if self.dirs.is_empty() {
+            return self.static_skills.clone();
+        }
         let mut skills = Vec::new();
         let mut seen = HashSet::new();
-        for dir in dirs {
+        for dir in &self.dirs {
             for skill in Self::scan_dir(dir) {
                 if seen.insert(skill.name.clone()) {
                     skills.push(skill);
@@ -30,7 +63,7 @@ impl SkillRegistry {
             }
         }
         skills.sort_by(|a, b| a.name.cmp(&b.name));
-        Self::new(skills)
+        skills
     }
 
     fn scan_dir(dir: &Path) -> Vec<Skill> {
@@ -58,26 +91,20 @@ impl SkillRegistry {
         skills
     }
 
-    /// The skills the model may use: everything not `disabled`. Disabled
-    /// skills stay loaded (so `get` can explain their state) but never enter
-    /// the catalog the model sees.
-    fn enabled(&self) -> impl Iterator<Item = &Skill> {
-        self.skills.iter().filter(|s| !s.disabled)
-    }
-
     /// A capped `- name: description` catalog for the system prompt: lists up to
     /// `max` skills, noting how many more exist (use the `skill` tool to list all).
     pub fn catalog_capped(&self, max: usize) -> String {
-        let enabled: Vec<&Skill> = self.enabled().collect();
-        if enabled.len() <= max {
-            return self.catalog();
-        }
+        let snapshot = self.snapshot();
+        let enabled: Vec<&Skill> = snapshot.iter().filter(|s| !s.disabled).collect();
         let shown = enabled
             .iter()
             .take(max)
             .map(|s| format!("- {}: {}", s.name, s.description))
             .collect::<Vec<_>>()
             .join("\n");
+        if enabled.len() <= max {
+            return shown;
+        }
         format!(
             "{shown}\n- …and {} more — call the `skill` tool with action=list to see all.",
             enabled.len() - max
@@ -86,18 +113,20 @@ impl SkillRegistry {
 
     /// Look up by name, including disabled skills — the `skill` tool answers a
     /// `view` on a disabled skill with its state rather than "not found".
-    pub fn get(&self, name: &str) -> Option<&Skill> {
-        self.skills.iter().find(|s| s.name == name)
+    pub fn get(&self, name: &str) -> Option<Skill> {
+        self.snapshot().into_iter().find(|s| s.name == name)
     }
 
     /// No usable (enabled) skills — gates the system-prompt catalog note.
     pub fn is_empty(&self) -> bool {
-        self.enabled().next().is_none()
+        !self.snapshot().iter().any(|s| !s.disabled)
     }
 
     /// A `- name: description` catalog for injection into the system prompt.
     pub fn catalog(&self) -> String {
-        self.enabled()
+        self.snapshot()
+            .iter()
+            .filter(|s| !s.disabled)
             .map(|s| format!("- {}: {}", s.name, s.description))
             .collect::<Vec<_>>()
             .join("\n")
@@ -125,6 +154,55 @@ mod tests {
         assert!(reg.catalog().contains("greet: Say hello nicely"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A skill written to disk *after* the registry is built must appear on the
+    /// next query without reconstructing the registry — this is the no-restart
+    /// hot-reload behavior (the bug that made `skill list` miss a freshly
+    /// installed skill while `shion skill list` saw it).
+    #[test]
+    fn rescans_disk_so_new_skills_appear_without_restart() {
+        let dir = std::env::temp_dir().join("shion_skill_hot_reload_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let reg = SkillRegistry::load_from_dirs(std::slice::from_ref(&dir));
+        assert!(reg.is_empty());
+        assert!(reg.get("late").is_none());
+
+        // Install a skill after construction, as an approved `file` write would.
+        let late = dir.join("late");
+        std::fs::create_dir_all(&late).unwrap();
+        std::fs::write(
+            late.join("SKILL.md"),
+            "---\nname: late\ndescription: Arrived after startup\n---\nDo the thing.",
+        )
+        .unwrap();
+
+        // No reconstruction — the same registry now sees it.
+        assert!(!reg.is_empty());
+        assert_eq!(
+            reg.get("late").unwrap().description,
+            "Arrived after startup"
+        );
+        assert!(reg.catalog().contains("late: Arrived after startup"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A registry built from an explicit list (tests) is static — no disk.
+    #[test]
+    fn static_registry_from_new_does_not_scan_disk() {
+        let reg = SkillRegistry::new(vec![Skill {
+            name: "fixed".into(),
+            description: "d".into(),
+            instructions: "b".into(),
+            protected: false,
+            disabled: false,
+            source: "user".into(),
+        }]);
+        assert_eq!(reg.get("fixed").unwrap().instructions, "b");
+        assert!(reg.catalog().contains("fixed"));
     }
 
     #[test]

@@ -2,9 +2,9 @@
 //!
 //! All of these are pure file operations on the governed store, so they work
 //! whether or not the gateway is running (no db lock involved). The runtime
-//! `SkillRegistry` loads at startup, so changes that affect the agent's
-//! catalog (promote / enable / disable) take effect on the next
-//! `shion gateway restart`.
+//! `SkillRegistry` re-scans the skill dirs on every query, so changes that
+//! affect the agent's catalog (install / promote / enable / disable) take
+//! effect on its next `skill` list — no gateway restart.
 
 use crate::{
     cli::{gateway_client::GatewayClient, inspect::local_time},
@@ -18,13 +18,36 @@ fn store() -> FsSkillStore {
     FsSkillStore::new(FsSkillStore::default_root())
 }
 
-const RESTART_HINT: &str = "Takes effect for the agent after `shion gateway restart`.";
+const RELOAD_HINT: &str = "Takes effect on the agent's next `skill` list (no restart needed).";
+
+/// Install a skill from a git repo (`owner/repo[/subpath]`, a GitHub URL, or any
+/// `*.git`/`git@…` URL) or a raw `SKILL.md` URL, straight into the active store.
+/// Pure file+network ops — works while the gateway holds the db lock; the live
+/// registry means the running agent sees it on its next `skill` list, no restart.
+pub async fn install(source: &str) -> anyhow::Result<()> {
+    let installed = crate::infra::skill_install::install(&store(), source).await?;
+    let files = if installed.files == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{} files", installed.files)
+    };
+    println!(
+        "Installed `{}` ({files}) → {}",
+        installed.name,
+        installed.path.display()
+    );
+    if !installed.description.is_empty() {
+        println!("  {}", installed.description);
+    }
+    println!("Active now; the agent picks it up on its next `skill` list (no restart needed).");
+    Ok(())
+}
 
 /// Accept a reviewer candidate: move it into the active store (overwriting the
 /// active skill of the same name, i.e. accepting an update proposal).
 pub fn promote(name: &str) -> anyhow::Result<()> {
     let skill = store().promote(name)?;
-    println!("Promoted `{}` to active. {RESTART_HINT}", skill.name);
+    println!("Promoted `{}` to active. {RELOAD_HINT}", skill.name);
     Ok(())
 }
 
@@ -56,11 +79,11 @@ pub fn set_enabled(name: &str, enabled: bool) -> anyhow::Result<()> {
     let skill = store().set_disabled(name, !enabled)?;
     if skill.disabled {
         println!(
-            "Disabled `{}` — kept on disk, hidden from the agent. {RESTART_HINT}",
+            "Disabled `{}` — kept on disk, hidden from the agent. {RELOAD_HINT}",
             skill.name
         );
     } else {
-        println!("Enabled `{}`. {RESTART_HINT}", skill.name);
+        println!("Enabled `{}`. {RELOAD_HINT}", skill.name);
     }
     Ok(())
 }

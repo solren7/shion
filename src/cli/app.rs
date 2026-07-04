@@ -249,6 +249,13 @@ enum MemoryAction {
 enum SkillAction {
     /// List the governed skill store: active skills, then reviewer candidates
     List,
+    /// Install a skill from a git repo or a raw SKILL.md URL into the active
+    /// store (owner/repo, owner/repo/subpath, a GitHub URL, a *.git/git@ URL,
+    /// or a link straight to a SKILL.md)
+    Install {
+        /// Where to fetch the skill from
+        source: String,
+    },
     /// Accept a reviewer candidate into the active store
     Promote {
         /// Skill name (as shown under `candidates` in `skill list`)
@@ -381,6 +388,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
         Commands::Skill { action } => match action {
             SkillAction::List => inspect::skill_list(),
+            SkillAction::Install { source } => skill::install(&source).await,
             SkillAction::Promote { name } => skill::promote(&name),
             SkillAction::Reject { name } => skill::reject(&name),
             SkillAction::Protect { name } => skill::protect(&name, true),

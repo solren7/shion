@@ -183,6 +183,40 @@ impl FsSkillStore {
         Ok(imported)
     }
 
+    /// Install a skill **directory** (its `SKILL.md` plus any supporting files —
+    /// scripts, `references/`, etc.) as an **active** skill, copying the whole
+    /// tree. This is the install path (operator `shion skill install` + the
+    /// approved `skill` tool `install` action), distinct from `save`, which only
+    /// renders a single-file candidate. Overwrites an existing active skill of
+    /// the same name — unless it's protected, matching the `save` floor.
+    /// Returns the parsed skill and the number of files copied.
+    pub fn install_active_dir(&self, src_dir: &Path) -> anyhow::Result<(Skill, usize)> {
+        let skill = read_skill(&src_dir.join("SKILL.md")).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no valid SKILL.md (with frontmatter) in {}",
+                src_dir.display()
+            )
+        })?;
+        if !valid_skill_name(&skill.name) {
+            anyhow::bail!(
+                "invalid skill name `{}` (letters, digits, `-`/`_`/`.` only)",
+                skill.name
+            );
+        }
+        if self.find_active(&skill.name).is_some_and(|s| s.protected) {
+            anyhow::bail!(
+                "skill `{}` is protected — refusing to overwrite (operator edits only)",
+                skill.name
+            );
+        }
+        let dest = self.root.join(&skill.name);
+        if dest.exists() {
+            fs::remove_dir_all(&dest)?;
+        }
+        let files = copy_dir_all(src_dir, &dest)?;
+        Ok((skill, files))
+    }
+
     /// Write (or overwrite) a candidate proposal, rolling any existing one into
     /// its `.history/` first.
     fn write_candidate(&self, skill: &Skill) -> anyhow::Result<()> {
@@ -235,6 +269,30 @@ impl SkillRepository for FsSkillStore {
 fn read_skill(path: &Path) -> Option<Skill> {
     let content = fs::read_to_string(path).ok()?;
     Skill::parse(&content)
+}
+
+/// Recursively copy `src` into `dst` (created if absent), skipping any nested
+/// `.git` directory (defensive — install stages from a subdir, not a clone
+/// root, but a vendored skill could still carry one). Returns the number of
+/// regular files copied.
+fn copy_dir_all(src: &Path, dst: &Path) -> anyhow::Result<usize> {
+    fs::create_dir_all(dst)?;
+    let mut count = 0;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            count += copy_dir_all(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// Scan `dir` for `<name>/SKILL.md` entries (same shape as the runtime
@@ -393,6 +451,61 @@ mod tests {
         assert!(store.find_active("sync-cal").unwrap().disabled);
         let s = store.set_disabled("sync-cal", false).unwrap();
         assert!(!s.disabled);
+    }
+
+    #[test]
+    fn install_active_dir_copies_the_whole_skill_tree() {
+        let store = store("shion_skillstore_install");
+        // A multi-file skill: SKILL.md plus a supporting script.
+        let src = std::env::temp_dir().join("shion_install_src");
+        let _ = fs::remove_dir_all(&src);
+        fs::create_dir_all(src.join("scripts")).unwrap();
+        fs::write(
+            src.join("SKILL.md"),
+            "---\nname: mediarr\ndescription: media library\n---\nDo media things.",
+        )
+        .unwrap();
+        fs::write(src.join("scripts").join("run.sh"), "echo hi\n").unwrap();
+
+        let (skill, files) = store.install_active_dir(&src).unwrap();
+        assert_eq!(skill.name, "mediarr");
+        assert_eq!(files, 2);
+        // Active + supporting file both landed in the store.
+        assert!(store.find_active("mediarr").is_some());
+        assert!(store.root().join("mediarr/scripts/run.sh").is_file());
+
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn install_refuses_to_overwrite_a_protected_skill() {
+        let store = store("shion_skillstore_install_protected");
+        let src = std::env::temp_dir().join("shion_install_src_prot");
+        let _ = fs::remove_dir_all(&src);
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("SKILL.md"),
+            "---\nname: guarded\ndescription: d\n---\nbody",
+        )
+        .unwrap();
+
+        store.install_active_dir(&src).unwrap();
+        store.set_protected("guarded", true).unwrap();
+        // A second install of the same name is refused while protected.
+        let err = store.install_active_dir(&src).unwrap_err();
+        assert!(err.to_string().contains("protected"));
+
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn install_rejects_a_dir_without_a_valid_manifest() {
+        let store = store("shion_skillstore_install_nomanifest");
+        let src = std::env::temp_dir().join("shion_install_src_empty");
+        let _ = fs::remove_dir_all(&src);
+        fs::create_dir_all(&src).unwrap();
+        assert!(store.install_active_dir(&src).is_err());
+        let _ = fs::remove_dir_all(&src);
     }
 
     #[test]

@@ -178,6 +178,7 @@ pub async fn build(
     tools.register(Arc::new(SkillTool::new(
         skills.clone(),
         skill_store.clone(),
+        approver.clone(),
     )));
 
     // Assemble the tiered system prompt: stable identity + tool-aware guidance
