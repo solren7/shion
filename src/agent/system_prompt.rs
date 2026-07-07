@@ -20,7 +20,9 @@
 //! invalidates the prefix cache mid-day. The model queries the exact
 //! wall-clock moment via the `time` tool when it actually needs it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use chrono::Local;
 
@@ -187,6 +189,18 @@ pub struct SystemPromptBuilder {
     model: String,
     provider: &'static str,
     home: PathBuf,
+    /// Memoized stable+context render, keyed on the mtimes of the files it reads
+    /// (`SOUL.md` + the project instruction files). The gateway is long-lived
+    /// and rebuilds the prompt every turn, but those files change rarely — so we
+    /// re-read them only when an mtime moves, keeping the per-turn hot path off
+    /// several blocking `std::fs` reads while still picking up an in-place edit.
+    cache: Mutex<Option<StableCache>>,
+}
+
+/// The cached stable+context string and the file mtimes it was rendered from.
+struct StableCache {
+    fingerprint: Vec<Option<SystemTime>>,
+    stable_context: String,
 }
 
 impl SystemPromptBuilder {
@@ -199,6 +213,7 @@ impl SystemPromptBuilder {
             model: config.model.clone(),
             provider: config.provider.name(),
             home: shion_home(),
+            cache: Mutex::new(None),
         }
     }
 
@@ -299,9 +314,43 @@ impl SystemPromptBuilder {
         )
     }
 
-    /// Assemble the three tiers into the final system prompt.
+    /// mtimes of every file the stable+context tiers read, in a fixed order, so
+    /// a cached render can be invalidated when any is edited, created, or
+    /// removed. A missing file is `None` (creating it flips `None`→`Some`, so
+    /// adding a higher-priority context file also busts the cache).
+    fn dependency_fingerprint(&self) -> Vec<Option<SystemTime>> {
+        fn mtime(path: &Path) -> Option<SystemTime> {
+            std::fs::metadata(path).and_then(|m| m.modified()).ok()
+        }
+        let mut fp = vec![mtime(&self.home.join("SOUL.md"))];
+        if let Some(root) = &self.workspace_root {
+            for name in CONTEXT_FILES {
+                fp.push(mtime(&root.join(name)));
+            }
+        }
+        fp
+    }
+
+    /// Assemble the three tiers into the final system prompt. The stable+context
+    /// prefix is memoized and re-rendered only when a source file's mtime moves;
+    /// the volatile tier (date/model/provider — no I/O) is rebuilt every call.
     pub fn build(&self) -> String {
-        join(vec![self.stable(), self.context(), self.volatile()])
+        let fingerprint = self.dependency_fingerprint();
+        let stable_context = {
+            let mut cache = self.cache.lock().unwrap();
+            match cache.as_ref() {
+                Some(c) if c.fingerprint == fingerprint => c.stable_context.clone(),
+                _ => {
+                    let rendered = join(vec![self.stable(), self.context()]);
+                    *cache = Some(StableCache {
+                        fingerprint,
+                        stable_context: rendered.clone(),
+                    });
+                    rendered
+                }
+            }
+        };
+        join(vec![stable_context, self.volatile()])
     }
 }
 
@@ -526,5 +575,23 @@ mod tests {
         let p = SystemPromptBuilder::new(&config()).home(home).build();
         assert!(p.contains("You are Nyx, a terse oracle."));
         assert!(!p.contains("You are Shion"));
+    }
+
+    #[test]
+    fn cached_prompt_picks_up_a_newly_created_context_file() {
+        let home = tmp("hot_home");
+        let root = tmp("hot_root");
+        let builder = SystemPromptBuilder::new(&config())
+            .home(home)
+            .workspace_root(Some(root.clone()));
+        // First build: no context file, so none is mentioned (this seeds cache).
+        let first = builder.build();
+        assert!(!first.contains("project instructions"));
+        // Create one out-of-band — the mtime fingerprint (None→Some) must bust
+        // the cache so the next build reflects it, no restart needed.
+        std::fs::write(root.join("AGENTS.md"), "Be terse.").unwrap();
+        let second = builder.build();
+        assert!(second.contains("project instructions from `AGENTS.md`"));
+        assert!(second.contains("Be terse."));
     }
 }
