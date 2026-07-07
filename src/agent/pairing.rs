@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+use tracing::{error, info, warn};
+
 use crate::domain::pairing::{
     MAX_PENDING_PER_PLATFORM, PAIRING_RATE_LIMIT_SECS, PairingRepository, PairingRequest,
     PairingStatus,
@@ -45,6 +47,33 @@ impl PairingGuard {
             platform,
             allow_from,
             pairings,
+        }
+    }
+
+    /// Run the pairing gate and handle a denial in one place: `true` means the
+    /// sender may proceed; `false` means the message was consumed (an unpaired
+    /// sender was sent a pairing code, or the check errored) and the caller
+    /// should skip it. `send_reply` delivers the pairing prompt over the
+    /// channel — the one channel-specific bit (each has its own sender type).
+    /// Consolidates the identical gate/log block the ingress channels repeated.
+    pub async fn admit<F, Fut>(&self, sender_id: &str, chat_id: &str, send_reply: F) -> bool
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        match self.check(sender_id, chat_id).await {
+            Ok(Gate::Allowed) => true,
+            Ok(Gate::Denied { reply }) => {
+                info!(platform = self.platform, sender = %sender_id, "sender unpaired; sent pairing code");
+                if let Err(error) = send_reply(reply).await {
+                    error!(%error, platform = self.platform, chat = %chat_id, "failed to send pairing prompt");
+                }
+                false
+            }
+            Err(error) => {
+                warn!(%error, platform = self.platform, "pairing check failed; dropping message");
+                false
+            }
         }
     }
 
@@ -208,6 +237,44 @@ mod tests {
             Gate::Allowed
         ));
         assert!(repo.rows.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admit_allows_trusted_and_sends_no_reply() {
+        let (guard, _repo) = guard(vec!["42".to_string()]);
+        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sent2 = sent.clone();
+        let admitted = guard
+            .admit("42", "42", move |reply| {
+                let sent2 = sent2.clone();
+                async move {
+                    sent2.lock().unwrap().push(reply);
+                    Ok(())
+                }
+            })
+            .await;
+        assert!(admitted, "an allow_from sender is admitted");
+        assert!(sent.lock().unwrap().is_empty(), "no pairing prompt sent");
+    }
+
+    #[tokio::test]
+    async fn admit_denies_unknown_and_sends_the_pairing_code() {
+        let (guard, _repo) = guard(vec![]);
+        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sent2 = sent.clone();
+        let admitted = guard
+            .admit("7", "7", move |reply| {
+                let sent2 = sent2.clone();
+                async move {
+                    sent2.lock().unwrap().push(reply);
+                    Ok(())
+                }
+            })
+            .await;
+        assert!(!admitted, "an unpaired sender is not admitted");
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "exactly one pairing prompt sent");
+        assert!(sent[0].contains("shion pair approve"), "{}", sent[0]);
     }
 
     #[tokio::test]

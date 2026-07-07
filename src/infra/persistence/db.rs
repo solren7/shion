@@ -6,7 +6,7 @@ use toasty_driver_turso::Turso;
 use tracing::info;
 
 use crate::infra::persistence::{
-    DEFAULT_POOL_SIZE, stage_sqlite_backup, turso_marker_path, with_write_retry,
+    DEFAULT_POOL_SIZE, prepare_turso_path, turso_marker_path, with_write_retry,
 };
 
 use crate::domain::{
@@ -181,26 +181,13 @@ pub struct Db {
 
 impl Db {
     pub async fn connect(url: &str) -> anyhow::Result<Self> {
-        // `url` is `turso:<path>` (or `turso::memory:`). The bare path is what the
-        // engine and the migration probe operate on.
-        let path = url
-            .strip_prefix("turso:")
-            .filter(|p| *p != ":memory:")
-            .map(std::path::PathBuf::from);
-
-        // shion.db is disposable (sessions, messages, runs, pairings, settings).
-        // A legacy SQLite file can't be reopened under Turso's MVCC mode, so move
-        // it aside to a `.sqlite-backup` (kept as a safety net) and start fresh.
-        // Durable personal data lives in memory.db / kanban.db, which migrate
-        // their rows instead of resetting.
-        if let Some(p) = &path {
-            if let Some(dir) = p.parent() {
-                std::fs::create_dir_all(dir).ok();
-            }
-            stage_sqlite_backup(p)?;
-        }
-
-        let is_new = path.as_deref().map(|p| !p.exists()).unwrap_or(true);
+        // `url` is `turso:<path>` (or `turso::memory:`). shion.db is disposable
+        // (sessions, messages, runs, pairings, settings): a legacy SQLite file
+        // can't be reopened under Turso's MVCC mode, so `prepare_turso_path`
+        // stages it aside to a `.sqlite-backup` (kept as a safety net) and we
+        // start fresh. Durable personal data lives in memory.db / kanban.db,
+        // which migrate their rows instead of resetting.
+        let (path, is_new) = prepare_turso_path(url)?;
 
         // MVCC concurrent-writes on (UUID keys throughout, so no AUTOINCREMENT).
         let driver = match &path {

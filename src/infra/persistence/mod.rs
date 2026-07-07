@@ -23,6 +23,27 @@ pub(crate) fn sqlite_backup_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Shared prologue for every Turso-backed `connect(url)`: parse the
+/// `turso:<path>` url to its bare filesystem path (`None` for in-memory), ensure
+/// the parent dir exists, stage any legacy SQLite file aside, and report whether
+/// the live file is new (so the caller knows to `push_schema`). The per-db
+/// migration/model wiring that follows genuinely differs, so only this identical
+/// prologue is shared — the three `connect`s each duplicated it verbatim.
+pub(crate) fn prepare_turso_path(url: &str) -> anyhow::Result<(Option<PathBuf>, bool)> {
+    let path = url
+        .strip_prefix("turso:")
+        .filter(|p| *p != ":memory:")
+        .map(PathBuf::from);
+    if let Some(p) = &path {
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        stage_sqlite_backup(p)?;
+    }
+    let is_new = path.as_deref().map(|p| !p.exists()).unwrap_or(true);
+    Ok((path, is_new))
+}
+
 /// If `path` is a legacy SQLite file (no Turso marker, no backup staged yet),
 /// move it aside to its `.sqlite-backup` so Turso opens a fresh db at `path`.
 /// Idempotent: a no-op once a marker or backup exists, or the file is absent.

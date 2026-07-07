@@ -42,11 +42,7 @@ use tracing::{error, info, warn};
 use wechatbot::{BotOptions, WeChatBot};
 
 use crate::{
-    agent::{
-        gateway::Channel,
-        interaction::GatewayDispatcher,
-        pairing::{Gate, PairingGuard},
-    },
+    agent::{gateway::Channel, interaction::GatewayDispatcher, pairing::PairingGuard},
     config::WeChatConfig,
     domain::{
         gateway::{ReplySink, WeChatLogin},
@@ -296,19 +292,18 @@ impl WeChatChannel {
                 let bot = bot.clone();
                 tokio::spawn(async move {
                     // DM-only: sender and chat are the same iLink user id.
-                    match guard.check(&user_id, &user_id).await {
-                        Ok(Gate::Allowed) => {}
-                        Ok(Gate::Denied { reply }) => {
-                            info!(sender = %user_id, "wechat sender unpaired; sent pairing code");
-                            if let Err(error) = bot.send(&user_id, &reply).await {
-                                error!(%error, "failed to send wechat pairing prompt");
-                            }
-                            return;
-                        }
-                        Err(error) => {
-                            warn!(%error, "pairing check failed; dropping message");
-                            return;
-                        }
+                    let reply_bot = bot.clone();
+                    let reply_user = user_id.clone();
+                    let admitted = guard
+                        .admit(&user_id, &user_id, move |reply| async move {
+                            reply_bot
+                                .send(&reply_user, &reply)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("{e}"))
+                        })
+                        .await;
+                    if !admitted {
+                        return;
                     }
                     let session_id = format!("wechat:{user_id}");
                     info!(user = %user_id, "wechat message received");

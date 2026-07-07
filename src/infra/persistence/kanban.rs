@@ -8,7 +8,7 @@
 //! lifecycle. `KanbanDb` is the only place toasty appears for tasks (mirroring
 //! `Db`'s role for everything else).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -18,7 +18,7 @@ use tracing::info;
 
 use crate::domain::task::{Task, TaskRepository, parse_task_status};
 use crate::infra::persistence::{
-    DEFAULT_POOL_SIZE, sqlite_backup_path, stage_sqlite_backup, turso_marker_path, with_write_retry,
+    DEFAULT_POOL_SIZE, prepare_turso_path, sqlite_backup_path, turso_marker_path, with_write_retry,
 };
 
 // Optional i64 fields use 0 as the "unset" sentinel (same convention as `Db`).
@@ -52,23 +52,11 @@ pub struct KanbanDb {
 
 impl KanbanDb {
     pub async fn connect(url: &str) -> anyhow::Result<Self> {
-        let path = url
-            .strip_prefix("turso:")
-            .filter(|p| *p != ":memory:")
-            .map(PathBuf::from);
-
-        // Durable tasks must survive the engine switch: a legacy SQLite file is
-        // staged aside, its rows extracted, and reloaded into a fresh Turso db.
-        // The original is kept as `.sqlite-backup` and a `.turso` marker prevents
-        // re-migration. Same shape as `MemoryDb::connect`.
-        if let Some(p) = &path {
-            if let Some(dir) = p.parent() {
-                std::fs::create_dir_all(dir).ok();
-            }
-            stage_sqlite_backup(p)?;
-        }
-
-        let is_new = path.as_deref().map(|p| !p.exists()).unwrap_or(true);
+        // Durable tasks must survive the engine switch: `prepare_turso_path`
+        // stages a legacy SQLite file aside (kept as `.sqlite-backup`), and its
+        // rows are extracted and reloaded into a fresh Turso db below, guarded by
+        // a `.turso` marker. Same shape as `MemoryDb::connect`.
+        let (path, is_new) = prepare_turso_path(url)?;
 
         let driver = match &path {
             Some(p) => Turso::file(p).concurrent_writes(),

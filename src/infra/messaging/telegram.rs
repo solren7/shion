@@ -23,14 +23,10 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::{
-    agent::{
-        gateway::Channel,
-        interaction::GatewayDispatcher,
-        pairing::{Gate, PairingGuard},
-    },
+    agent::{gateway::Channel, interaction::GatewayDispatcher, pairing::PairingGuard},
     config::TelegramConfig,
     domain::{gateway::ReplySink, pairing::PairingRepository},
     infra::messaging::reconnect_backoff,
@@ -322,19 +318,16 @@ impl Channel for TelegramChannel {
                 };
                 // Pairing gate: unknown senders get a pairing code instead of
                 // the agent until `shion pair approve` runs on the host.
-                match self.guard.check(&msg.sender_id, &msg.chat_id).await {
-                    Ok(Gate::Allowed) => {}
-                    Ok(Gate::Denied { reply }) => {
-                        info!(sender = %msg.sender_id, "telegram sender unpaired; sent pairing code");
-                        if let Err(error) = self.sender.send_text(&msg.chat_id, &reply).await {
-                            error!(%error, chat = %msg.chat_id, "failed to send pairing prompt");
-                        }
-                        continue;
-                    }
-                    Err(error) => {
-                        warn!(%error, "pairing check failed; dropping message");
-                        continue;
-                    }
+                let sender = self.sender.clone();
+                let chat = msg.chat_id.clone();
+                let admitted = self
+                    .guard
+                    .admit(&msg.sender_id, &msg.chat_id, move |reply| async move {
+                        sender.send_text(&chat, &reply).await
+                    })
+                    .await;
+                if !admitted {
+                    continue;
                 }
                 let session_id = format!("telegram:{}", msg.chat_id);
                 info!(chat = %msg.chat_id, "telegram message received");

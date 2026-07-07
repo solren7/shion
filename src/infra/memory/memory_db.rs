@@ -12,7 +12,7 @@
 //! is not idempotent (a column change means deleting the file). See
 //! `docs/personal-agent-roadmap.md`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -26,7 +26,7 @@ use crate::domain::memory::{
 };
 use crate::infra::memory::md_memory::MdMemoryStore;
 use crate::infra::persistence::{
-    DEFAULT_POOL_SIZE, sqlite_backup_path, stage_sqlite_backup, turso_marker_path, with_write_retry,
+    DEFAULT_POOL_SIZE, prepare_turso_path, sqlite_backup_path, turso_marker_path, with_write_retry,
 };
 
 // Optional i64 fields use 0 as the "unset" sentinel (same convention as `Db`).
@@ -67,28 +67,13 @@ pub struct MemoryDb {
 
 impl MemoryDb {
     pub async fn connect(url: &str) -> anyhow::Result<Self> {
-        // `url` is `turso:<path>`; the bare scheme-less path is what the engine
-        // and the migration probe below operate on. In-memory (no path) skips
-        // migration entirely.
-        let path = url
-            .strip_prefix("turso:")
-            .filter(|p| *p != ":memory:")
-            .map(PathBuf::from);
-
-        // Durable data: memories must survive the engine switch. A file written
-        // by the old rusqlite/SQLite backend is staged aside here, then its rows
-        // are extracted and reloaded into a fresh Turso db after the schema is
-        // pushed (below). The original is kept as a `.sqlite-backup`, and a
-        // `.turso` marker records that the live file is now Turso-native so we
-        // never re-migrate or misread it.
-        if let Some(p) = &path {
-            if let Some(dir) = p.parent() {
-                std::fs::create_dir_all(dir).ok();
-            }
-            stage_sqlite_backup(p)?;
-        }
-
-        let is_new = path.as_deref().map(|p| !p.exists()).unwrap_or(true);
+        // `url` is `turso:<path>`. Durable data: memories must survive the engine
+        // switch. `prepare_turso_path` stages a file written by the old
+        // rusqlite/SQLite backend aside to `.sqlite-backup`; its rows are
+        // extracted and reloaded into a fresh Turso db after the schema is pushed
+        // (below), guarded by a `.turso` marker so we never re-migrate. In-memory
+        // (no path) skips migration entirely.
+        let (path, is_new) = prepare_turso_path(url)?;
 
         // Additive in-place migration for an EXISTING db: toasty's `push_schema`
         // is not idempotent and only runs for new files, so a column added to
