@@ -5,6 +5,7 @@ mod domain;
 mod infra;
 mod services;
 mod tools;
+mod tui;
 
 // Global allocator: mimalloc — installed by turso's default `mimalloc`
 // feature (via toasty-driver-turso), not declared here. Declaring our own
@@ -48,8 +49,43 @@ fn init_tracing() {
     };
     let filter = EnvFilter::try_from_env("SHION_LOG")
         .unwrap_or_else(|_| EnvFilter::new(format!("info,toasty=warn,rig_core=warn{pool_noise}")));
-    let _ = fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
+
+    // The chat TUI owns the terminal (alternate screen): a stderr log line
+    // would tear the display, so route tracing to a file for that mode.
+    // Falls back to stderr if the log file can't be opened.
+    let writer = if will_run_tui() {
+        open_tui_log()
+            .map(|f| fmt::writer::BoxMakeWriter::new(std::sync::Mutex::new(f)))
+            .unwrap_or_else(|| fmt::writer::BoxMakeWriter::new(std::io::stderr))
+    } else {
+        fmt::writer::BoxMakeWriter::new(std::io::stderr)
+    };
+    let _ = fmt().with_env_filter(filter).with_writer(writer).try_init();
+}
+
+/// Whether this invocation will run the full-screen chat TUI (`shion chat` /
+/// `shion session resume` on a TTY without `--plain`) — the same predicate
+/// `cli/app.rs` dispatches on, checked here because the tracing writer must be
+/// chosen before the CLI parses.
+fn will_run_tui() -> bool {
+    use std::io::IsTerminal;
+    let args: Vec<String> = std::env::args().collect();
+    let sub = args.get(1).map(String::as_str);
+    let is_chat = sub == Some("chat")
+        || (sub == Some("session") && args.get(2).map(String::as_str) == Some("resume"));
+    is_chat
+        && !args.iter().any(|a| a == "--plain")
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+}
+
+/// Append-mode log file for TUI sessions (`~/.shion/logs/chat-tui.log`).
+fn open_tui_log() -> Option<std::fs::File> {
+    let dir = config::ensure_shion_home().join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("chat-tui.log"))
+        .ok()
 }

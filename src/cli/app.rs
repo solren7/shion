@@ -14,8 +14,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start an interactive chat session
-    Chat,
+    /// Start an interactive chat session (full-screen TUI on a terminal;
+    /// line-mode REPL when piped or with --plain)
+    Chat {
+        /// Use the line-mode REPL even on a terminal
+        #[arg(long)]
+        plain: bool,
+    },
     /// Run the always-on gateway: maintenance scheduler (and, later,
     /// config-declared ingress channels). Maintenance cron comes from
     /// `schedule` in ~/.shion/config.toml (or SHION_SCHEDULE); default hourly.
@@ -327,11 +332,14 @@ enum PairAction {
 enum SessionAction {
     /// List stored sessions with creation time and message counts
     List,
-    /// Resume an existing session: reopen the chat REPL bound to its id, so its
+    /// Resume an existing session: reopen the chat bound to its id, so its
     /// history is loaded and the conversation continues where it left off
     Resume {
         /// Session id (as shown by `session list`)
         id: String,
+        /// Use the line-mode REPL even on a terminal
+        #[arg(long)]
+        plain: bool,
     },
     /// Delete sessions that contain no messages
     Clean,
@@ -349,6 +357,15 @@ enum GatewayAction {
     Status,
 }
 
+/// Chat opens the full-screen TUI when interactive: a real terminal on both
+/// ends and no `--plain` opt-out. Piped/scripted invocations keep the line
+/// REPL. Must stay in sync with `main.rs::will_run_tui`, which picks the
+/// tracing writer before the CLI parses.
+fn use_tui(plain: bool) -> bool {
+    use std::io::IsTerminal;
+    !plain && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
 pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // The database always lives in the config directory; use SHION_HOME to
@@ -358,7 +375,13 @@ pub async fn run() -> anyhow::Result<()> {
     // dev state) never wipes them.
     let kanban = crate::config::default_kanban_db_url();
     match cli.command {
-        Commands::Chat => chat::run(&db, &kanban).await,
+        Commands::Chat { plain } => {
+            if use_tui(plain) {
+                crate::tui::run(&db, &kanban).await
+            } else {
+                chat::run(&db, &kanban).await
+            }
+        }
         Commands::Gateway { action } => match action {
             None => {
                 let schedule = crate::config::maintenance_schedule();
@@ -375,7 +398,13 @@ pub async fn run() -> anyhow::Result<()> {
         },
         Commands::Session { action } => match action {
             SessionAction::List => inspect::session_list(&db).await,
-            SessionAction::Resume { id } => chat::resume(&db, &kanban, &id).await,
+            SessionAction::Resume { id, plain } => {
+                if use_tui(plain) {
+                    crate::tui::resume(&db, &kanban, &id).await
+                } else {
+                    chat::resume(&db, &kanban, &id).await
+                }
+            }
             SessionAction::Clean => inspect::session_clean(&db).await,
         },
         Commands::Task { action } => match action {

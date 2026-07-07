@@ -4,7 +4,7 @@ mod chat;
 mod doctor;
 mod dream;
 mod gateway;
-mod gateway_client;
+pub(crate) mod gateway_client;
 mod inspect;
 mod journey;
 mod logs;
@@ -17,7 +17,7 @@ mod service;
 mod skill;
 mod upgrade;
 mod wechat;
-mod wiring;
+pub(crate) mod wiring;
 mod workday;
 
 pub use app::run;
