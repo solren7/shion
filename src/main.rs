@@ -64,19 +64,16 @@ fn init_tracing() {
 }
 
 /// Whether this invocation will run the full-screen chat TUI (`shion chat` /
-/// `shion session resume` on a TTY without `--plain`) — the same predicate
-/// `cli/app.rs` dispatches on, checked here because the tracing writer must be
-/// chosen before the CLI parses.
+/// `shion session resume` on a TTY — off a TTY they error out early instead;
+/// see `cli/app.rs::require_terminal`) — checked here because the tracing
+/// writer must be chosen before the CLI parses.
 fn will_run_tui() -> bool {
     use std::io::IsTerminal;
     let args: Vec<String> = std::env::args().collect();
     let sub = args.get(1).map(String::as_str);
     let is_chat = sub == Some("chat")
         || (sub == Some("session") && args.get(2).map(String::as_str) == Some("resume"));
-    is_chat
-        && !args.iter().any(|a| a == "--plain")
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
+    is_chat && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
 /// Append-mode log file for TUI sessions (`~/.shion/logs/chat-tui.log`).

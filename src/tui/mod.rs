@@ -1,14 +1,14 @@
-//! Full-screen chat TUI (`shion chat` on a TTY) — a ratatui front end over the
-//! same two backends the line REPL (`cli/chat.rs`) uses: a running gateway via
-//! [`GatewayClient::chat`] (trusted loopback, approvals auto-granted
-//! server-side), or the in-process [`AgentRuntime`] against the local db.
-//! Neither backend changes; this module only replaces the read-line loop with
-//! an event loop.
+//! Full-screen chat TUI — `shion chat`'s interface (a terminal is required;
+//! scripted access goes through the gateway's api channel instead). A ratatui
+//! front end over two backends: a running gateway via [`GatewayClient::chat`]
+//! (trusted loopback, approvals auto-granted server-side), or the in-process
+//! [`AgentRuntime`] against the local db.
 //!
 //! Layout: scrollable transcript · status line (spinner while a turn runs) ·
 //! bordered input box. In local mode, a side-effecting tool's approval request
 //! arrives over a channel ([`TuiApprover`]) and renders as a modal — `y`/`s`/`n`
-//! — instead of `CliApprover`'s raw stdin prompt.
+//! — with the same semantics as `cli/approver.rs`'s stdin prompt (still used
+//! by `shion run resume`).
 //!
 //! Logs: `main.rs::init_tracing` routes tracing to `~/.shion/logs/chat-tui.log`
 //! when it detects the TUI will run — stderr writes would tear the alternate

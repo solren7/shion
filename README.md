@@ -25,7 +25,7 @@ cargo build --release
 # put an API key in ~/.shion/.env (created on first run)
 echo 'DEEPSEEK_API_KEY=sk-...' >> ~/.shion/.env
 
-shion chat                       # interactive chat
+shion chat                       # interactive chat (full-screen TUI; needs a terminal)
 shion model list                 # show current provider/model
 shion model set anthropic        # switch provider (persists to config.toml)
 ```

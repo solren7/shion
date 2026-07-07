@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 
 use super::{
-    chat, doctor, dream, gateway, inspect, journey, logs, memory, model, pair, policy, resume,
-    service, skill, upgrade, wechat, workday,
+    doctor, dream, gateway, inspect, journey, logs, memory, model, pair, policy, resume, service,
+    skill, upgrade, wechat, workday,
 };
 
 #[derive(Parser)]
@@ -14,13 +14,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start an interactive chat session (full-screen TUI on a terminal;
-    /// line-mode REPL when piped or with --plain)
-    Chat {
-        /// Use the line-mode REPL even on a terminal
-        #[arg(long)]
-        plain: bool,
-    },
+    /// Start an interactive chat session (full-screen TUI; needs a terminal)
+    Chat,
     /// Run the always-on gateway: maintenance scheduler (and, later,
     /// config-declared ingress channels). Maintenance cron comes from
     /// `schedule` in ~/.shion/config.toml (or SHION_SCHEDULE); default hourly.
@@ -332,14 +327,11 @@ enum PairAction {
 enum SessionAction {
     /// List stored sessions with creation time and message counts
     List,
-    /// Resume an existing session: reopen the chat bound to its id, so its
+    /// Resume an existing session: reopen the chat TUI bound to its id, so its
     /// history is loaded and the conversation continues where it left off
     Resume {
         /// Session id (as shown by `session list`)
         id: String,
-        /// Use the line-mode REPL even on a terminal
-        #[arg(long)]
-        plain: bool,
     },
     /// Delete sessions that contain no messages
     Clean,
@@ -357,13 +349,21 @@ enum GatewayAction {
     Status,
 }
 
-/// Chat opens the full-screen TUI when interactive: a real terminal on both
-/// ends and no `--plain` opt-out. Piped/scripted invocations keep the line
-/// REPL. Must stay in sync with `main.rs::will_run_tui`, which picks the
-/// tracing writer before the CLI parses.
-fn use_tui(plain: bool) -> bool {
+/// The chat TUI owns the terminal, so it needs a real one on both ends.
+/// Piped/scripted invocations get a clear pointer to the api channel instead —
+/// that is the scripting surface (roadmap §8), not an interactive chat.
+/// Must stay in sync with `main.rs::will_run_tui`, which picks the tracing
+/// writer before the CLI parses.
+fn require_terminal() -> anyhow::Result<()> {
     use std::io::IsTerminal;
-    !plain && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "`shion chat` is a full-screen TUI and needs a terminal.\n\
+         For scripted access, POST to the gateway's api channel instead \
+         (`/v1/chat/completions`; address and key in ~/.shion/gateway.json)."
+    )
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -375,12 +375,9 @@ pub async fn run() -> anyhow::Result<()> {
     // dev state) never wipes them.
     let kanban = crate::config::default_kanban_db_url();
     match cli.command {
-        Commands::Chat { plain } => {
-            if use_tui(plain) {
-                crate::tui::run(&db, &kanban).await
-            } else {
-                chat::run(&db, &kanban).await
-            }
+        Commands::Chat => {
+            require_terminal()?;
+            crate::tui::run(&db, &kanban).await
         }
         Commands::Gateway { action } => match action {
             None => {
@@ -398,12 +395,9 @@ pub async fn run() -> anyhow::Result<()> {
         },
         Commands::Session { action } => match action {
             SessionAction::List => inspect::session_list(&db).await,
-            SessionAction::Resume { id, plain } => {
-                if use_tui(plain) {
-                    crate::tui::resume(&db, &kanban, &id).await
-                } else {
-                    chat::resume(&db, &kanban, &id).await
-                }
+            SessionAction::Resume { id } => {
+                require_terminal()?;
+                crate::tui::resume(&db, &kanban, &id).await
             }
             SessionAction::Clean => inspect::session_clean(&db).await,
         },
