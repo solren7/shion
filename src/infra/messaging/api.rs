@@ -254,20 +254,21 @@ async fn require_auth(
     }
 }
 
-/// Constant-time bearer-token check. Both sides are SHA-256'd to a fixed 32-byte
-/// digest (so neither length nor content leaks) and the digests are compared
-/// with a non-short-circuiting fold — a plain `==` on the tokens would let a
-/// timing side-channel probe the key byte by byte when the api channel is bound
-/// externally (`[channels.api] enabled = true`), where the key is the only auth.
+/// Constant-time bearer-token check. Both sides are SHA-256'd to a fixed-size
+/// digest (so neither length nor content leaks) and compared with the shared
+/// constant-time primitive (`domain::pairing::ct_eq`) — a plain `==` on the
+/// tokens would let a timing side-channel probe the key byte by byte when the
+/// api channel is bound externally (`[channels.api] enabled = true`), where
+/// the key is the only auth.
 fn bearer_matches(presented: &str, expected: &str) -> bool {
     use sha2::{Digest, Sha256};
-    let p = Sha256::digest(presented.as_bytes());
-    let e = Sha256::digest(expected.as_bytes());
-    let mut diff = 0u8;
-    for (x, y) in p.iter().zip(e.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    let digest_hex = |s: &str| -> String {
+        Sha256::digest(s.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    crate::domain::pairing::ct_eq(&digest_hex(presented), &digest_hex(expected))
 }
 
 /// Maps any handler error to a 500 with a JSON body.

@@ -138,8 +138,13 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Constant-time equality for equal-length byte strings.
-fn ct_eq(a: &str, b: &str) -> bool {
+/// Constant-time equality for byte strings — the one shared comparison
+/// primitive for secret material (pairing-code hashes here, the api channel's
+/// bearer digests). A plain `==` short-circuits on the first differing byte,
+/// letting a timing side-channel probe a secret byte by byte; keep every
+/// secret comparison on this fold so a "simplification" of one copy can't
+/// silently reintroduce the leak elsewhere.
+pub fn ct_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
         return false;
