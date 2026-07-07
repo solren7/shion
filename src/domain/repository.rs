@@ -48,7 +48,12 @@ pub trait SessionRepository: Send + Sync {
     }
 
     /// Record that `session_id` has been reviewed through `through` user turns,
-    /// so the next sweep skips it until new turns arrive. Default is a no-op.
+    /// so the next sweep skips it until new turns arrive. Stores may run on a
+    /// detached task whose write lands out of order, so an implementation must
+    /// tolerate stale marks: clamp `through` to the session's live user-turn
+    /// count (a `/new` rotate empties the transcript — a stale high watermark
+    /// would silently suppress the sweep on the fresh conversation) and never
+    /// regress an already-higher stored value. Default is a no-op.
     async fn mark_reviewed(&self, _session_id: &str, _through: usize) -> anyhow::Result<()> {
         Ok(())
     }

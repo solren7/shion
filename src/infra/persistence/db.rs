@@ -444,11 +444,27 @@ impl SessionRepository for Db {
         with_write_retry(|| async {
             let mut conn = self.inner.connection().await?;
             let mut record = SessionRecord::get_by_id(&mut conn, session_id).await?;
-            record
-                .update()
-                .reviewed_through(through as i64)
-                .exec(&mut conn)
-                .await?;
+            // The runtime's reviewer runs on a detached task, so its mark can
+            // land out of order — after a `/new` rotate reset the row to 0 (a
+            // stale high watermark would silently suppress the sweep on the
+            // fresh conversation), or after a later, larger mark. Clamp to the
+            // live user-turn count (a rotated transcript has fewer turns than
+            // the stale mark) and never regress the stored value.
+            let role = format!("{:?}", Role::User).to_lowercase();
+            let live = toasty::query!(
+                MessageRecord FILTER .session_id == #session_id AND .role == #role
+            )
+            .count()
+            .exec(&mut conn)
+            .await? as i64;
+            let new = (through as i64).min(live).max(record.reviewed_through);
+            if new != record.reviewed_through {
+                record
+                    .update()
+                    .reviewed_through(new)
+                    .exec(&mut conn)
+                    .await?;
+            }
             Ok(())
         })
         .await
@@ -1793,5 +1809,62 @@ mod tests {
         let candidates = SessionRepository::review_candidates(&db).await.unwrap();
         let c = candidates.iter().find(|c| c.id == "cli:old").unwrap();
         assert_eq!(c.reviewed_through, 1);
+    }
+
+    /// A stale watermark write (the runtime reviewer's detached task finishing
+    /// after a `/new` rotate) must not stamp the fresh, empty conversation with
+    /// the old transcript's turn count — that would silently suppress the sweep
+    /// for its first N turns. And a smaller out-of-order mark must not regress
+    /// an already-higher watermark.
+    #[tokio::test]
+    async fn mark_reviewed_clamps_stale_and_never_regresses() {
+        let db = Db::connect(&sqlite_url("shion_mark_reviewed_race.db"))
+            .await
+            .unwrap();
+        let sid = "telegram:42";
+        SessionRepository::save(&db, &Session::new(sid))
+            .await
+            .unwrap();
+        for i in 0..3 {
+            MessageRepository::save(&db, sid, &Message::user(format!("q{i}")))
+                .await
+                .unwrap();
+        }
+
+        // Normal mark: watermark reaches the live count.
+        SessionRepository::mark_reviewed(&db, sid, 3).await.unwrap();
+        let through = |cands: &[ReviewCandidate]| {
+            cands
+                .iter()
+                .find(|c| c.id == sid)
+                .map(|c| c.reviewed_through)
+                .unwrap()
+        };
+        let cands = SessionRepository::review_candidates(&db).await.unwrap();
+        assert_eq!(through(&cands), 3);
+
+        // A smaller stale mark (out-of-order detached task) never regresses.
+        SessionRepository::mark_reviewed(&db, sid, 1).await.unwrap();
+        let cands = SessionRepository::review_candidates(&db).await.unwrap();
+        assert_eq!(through(&cands), 3, "watermark must not regress");
+
+        // /new rotates: transcript archived, live row reset to 0. A stale
+        // mark(3) landing afterwards is clamped to the live (empty) count.
+        SessionRepository::rotate(&db, sid).await.unwrap();
+        SessionRepository::mark_reviewed(&db, sid, 3).await.unwrap();
+        let cands = SessionRepository::review_candidates(&db).await.unwrap();
+        assert_eq!(
+            through(&cands),
+            0,
+            "stale post-rotate mark must clamp to the fresh transcript"
+        );
+
+        // The fresh conversation's first turn is sweep-visible again.
+        MessageRepository::save(&db, sid, &Message::user("fresh"))
+            .await
+            .unwrap();
+        let cands = SessionRepository::review_candidates(&db).await.unwrap();
+        let c = cands.iter().find(|c| c.id == sid).unwrap();
+        assert!(c.user_turns > c.reviewed_through, "sweep must pick it up");
     }
 }
