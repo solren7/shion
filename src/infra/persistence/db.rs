@@ -313,16 +313,31 @@ impl SessionRepository for Db {
     }
 
     async fn save(&self, session: &Session) -> anyhow::Result<()> {
-        let mut conn = self.inner.connection().await?;
-        // INSERT OR IGNORE semantics via error handling on duplicate key.
-        let _ = toasty::create!(SessionRecord {
-            id: session.id.clone(),
-            created_at: session.created_at,
-            reviewed_through: 0,
+        // Idempotent create (save runs on every load-or-create). The old form
+        // `let _ = create!(...)` swallowed *every* error — including an MVCC
+        // write conflict, which left the session uncreated and the very next
+        // MessageRepository::save failing with a phantom "session not found".
+        // Pre-check existence, then insert only when absent; a conflict now
+        // retries and any real error surfaces. Turns are serialized per session
+        // (the dispatcher's in-flight gate), so no concurrent create races here.
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            if SessionRecord::get_by_id(&mut conn, &session.id)
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+            toasty::create!(SessionRecord {
+                id: session.id.clone(),
+                created_at: session.created_at,
+                reviewed_through: 0,
+            })
+            .exec(&mut conn)
+            .await?;
+            Ok(())
         })
-        .exec(&mut conn)
-        .await;
-        Ok(())
+        .await
     }
 
     async fn delete_empty_sessions(&self) -> anyhow::Result<usize> {
@@ -345,48 +360,58 @@ impl SessionRepository for Db {
     }
 
     async fn rotate(&self, session_id: &str) -> anyhow::Result<Option<String>> {
-        let mut conn = self.inner.connection().await?;
-        // Nothing to archive if the session is absent or already empty.
-        let Ok(mut live) = SessionRecord::get_by_id(&mut conn, session_id).await else {
-            return Ok(None);
-        };
-        let msgs = live.messages().exec(&mut conn).await?;
-        if msgs.is_empty() {
-            return Ok(None);
-        }
+        // Transactional: creating the archive, moving each message, and resetting
+        // the live row must all land or none — a mid-sequence failure used to
+        // leave a half-archived transcript. Wrapped in with_write_retry: a
+        // transaction that loses an MVCC commit rolls back cleanly, so re-running
+        // the whole closure never double-applies.
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let mut tx = conn.transaction().await?;
+            // Nothing to archive if the session is absent or already empty.
+            let Ok(mut live) = SessionRecord::get_by_id(&mut tx, session_id).await else {
+                return Ok(None);
+            };
+            let msgs = live.messages().exec(&mut tx).await?;
+            if msgs.is_empty() {
+                return Ok(None);
+            }
 
-        // Move the transcript to a fresh archive session, preserving its start
-        // time; the live row stays and is now empty for the next conversation.
-        // The archive inherits the live session's review watermark (its
-        // transcript, hence its user-turn count, is unchanged) so an
-        // already-reviewed conversation isn't re-reviewed under the archive id,
-        // while any unreviewed tail still is.
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let archived_id = format!("{session_id}#{now}");
-        let prior_reviewed = live.reviewed_through;
-        toasty::create!(SessionRecord {
-            id: archived_id.clone(),
-            created_at: live.created_at,
-            reviewed_through: prior_reviewed,
-        })
-        .exec(&mut conn)
-        .await?;
-        let archive = SessionRecord::get_by_id(&mut conn, &archived_id).await?;
-        for msg in msgs {
-            toasty::create!(in archive.messages() {
-                id: uuid::Uuid::now_v7().to_string(),
-                role: msg.role.clone(),
-                content: msg.content.clone(),
-                timestamp: msg.timestamp,
+            // Move the transcript to a fresh archive session, preserving its start
+            // time; the live row stays and is now empty for the next conversation.
+            // The archive inherits the live session's review watermark (its
+            // transcript, hence its user-turn count, is unchanged) so an
+            // already-reviewed conversation isn't re-reviewed under the archive id,
+            // while any unreviewed tail still is.
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            let archived_id = format!("{session_id}#{now}");
+            let prior_reviewed = live.reviewed_through;
+            toasty::create!(SessionRecord {
+                id: archived_id.clone(),
+                created_at: live.created_at,
+                reviewed_through: prior_reviewed,
             })
-            .exec(&mut conn)
+            .exec(&mut tx)
             .await?;
-            msg.delete().exec(&mut conn).await?;
-        }
-        // The live row is now a fresh, empty conversation: reset its watermark
-        // so the first new turn isn't compared against the archived count.
-        live.update().reviewed_through(0).exec(&mut conn).await?;
-        Ok(Some(archived_id))
+            let archive = SessionRecord::get_by_id(&mut tx, &archived_id).await?;
+            for msg in msgs {
+                toasty::create!(in archive.messages() {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    role: msg.role.clone(),
+                    content: msg.content.clone(),
+                    timestamp: msg.timestamp,
+                })
+                .exec(&mut tx)
+                .await?;
+                msg.delete().exec(&mut tx).await?;
+            }
+            // The live row is now a fresh, empty conversation: reset its watermark
+            // so the first new turn isn't compared against the archived count.
+            live.update().reviewed_through(0).exec(&mut tx).await?;
+            tx.commit().await?;
+            Ok(Some(archived_id))
+        })
+        .await
     }
 
     async fn review_candidates(&self) -> anyhow::Result<Vec<ReviewCandidate>> {
@@ -652,77 +677,89 @@ impl PairingRepository for Db {
 
     async fn approve_code(&self, code: &str) -> anyhow::Result<ApproveOutcome> {
         const LOCK_ID: &str = "approve";
-        let mut conn = self.inner.connection().await?;
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        // Transactional: the code-match status flip and the failure-counter
+        // update are two writes that must land together — a mid-sequence failure
+        // used to leave "approved but counter not cleared" (or vice versa).
+        // with_write_retry re-runs the whole closure on an MVCC conflict; the
+        // rolled-back transaction makes that safe.
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let mut tx = conn.transaction().await?;
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
 
-        // Honor an active lockout before testing the code.
-        let lock = LockoutRecord::get_by_id(&mut conn, LOCK_ID).await.ok();
-        if let Some(l) = &lock
-            && l.locked_until > now
-        {
-            return Ok(ApproveOutcome::Locked {
-                retry_after_secs: l.locked_until - now,
-            });
-        }
-
-        let rows = toasty::query!(PairingRecord).exec(&mut conn).await?;
-        let matched = rows.into_iter().find(|r| {
-            r.status == "pending"
-                && now - r.created_at <= PAIRING_CODE_TTL_SECS
-                && verify_code(&r.salt, &r.code_hash, code)
-        });
-
-        match matched {
-            Some(mut record) => {
-                record
-                    .update()
-                    .status(PairingStatus::Approved.as_str().to_string())
-                    .exec(&mut conn)
-                    .await?;
-                // Success clears the failure counter.
-                if let Some(mut l) = lock {
-                    l.update()
-                        .failed_count(0)
-                        .locked_until(0)
-                        .exec(&mut conn)
-                        .await?;
-                }
-                Ok(ApproveOutcome::Approved(pairing_from_record(record)))
+            // Honor an active lockout before testing the code (read-only path:
+            // returning here rolls the empty transaction back).
+            let lock = LockoutRecord::get_by_id(&mut tx, LOCK_ID).await.ok();
+            if let Some(l) = &lock
+                && l.locked_until > now
+            {
+                return Ok(ApproveOutcome::Locked {
+                    retry_after_secs: l.locked_until - now,
+                });
             }
-            None => {
-                let mut count = lock.as_ref().map(|l| l.failed_count).unwrap_or(0) + 1;
-                let mut locked_until = 0;
-                if count >= APPROVE_MAX_FAILURES {
-                    locked_until = now + APPROVE_LOCKOUT_SECS;
-                    count = 0; // reset the counter once locked
-                }
-                match lock {
-                    Some(mut l) => {
+
+            let rows = toasty::query!(PairingRecord).exec(&mut tx).await?;
+            let matched = rows.into_iter().find(|r| {
+                r.status == "pending"
+                    && now - r.created_at <= PAIRING_CODE_TTL_SECS
+                    && verify_code(&r.salt, &r.code_hash, code)
+            });
+
+            let outcome = match matched {
+                Some(mut record) => {
+                    record
+                        .update()
+                        .status(PairingStatus::Approved.as_str().to_string())
+                        .exec(&mut tx)
+                        .await?;
+                    // Success clears the failure counter.
+                    if let Some(mut l) = lock {
                         l.update()
-                            .failed_count(count)
-                            .locked_until(locked_until)
-                            .exec(&mut conn)
+                            .failed_count(0)
+                            .locked_until(0)
+                            .exec(&mut tx)
                             .await?;
                     }
-                    None => {
-                        toasty::create!(LockoutRecord {
-                            id: LOCK_ID.to_string(),
-                            failed_count: count,
-                            locked_until,
-                        })
-                        .exec(&mut conn)
-                        .await?;
+                    ApproveOutcome::Approved(pairing_from_record(record))
+                }
+                None => {
+                    let mut count = lock.as_ref().map(|l| l.failed_count).unwrap_or(0) + 1;
+                    let mut locked_until = 0;
+                    if count >= APPROVE_MAX_FAILURES {
+                        locked_until = now + APPROVE_LOCKOUT_SECS;
+                        count = 0; // reset the counter once locked
+                    }
+                    match lock {
+                        Some(mut l) => {
+                            l.update()
+                                .failed_count(count)
+                                .locked_until(locked_until)
+                                .exec(&mut tx)
+                                .await?;
+                        }
+                        None => {
+                            toasty::create!(LockoutRecord {
+                                id: LOCK_ID.to_string(),
+                                failed_count: count,
+                                locked_until,
+                            })
+                            .exec(&mut tx)
+                            .await?;
+                        }
+                    }
+                    if locked_until > now {
+                        ApproveOutcome::Locked {
+                            retry_after_secs: locked_until - now,
+                        }
+                    } else {
+                        ApproveOutcome::NotFound
                     }
                 }
-                if locked_until > now {
-                    Ok(ApproveOutcome::Locked {
-                        retry_after_secs: locked_until - now,
-                    })
-                } else {
-                    Ok(ApproveOutcome::NotFound)
-                }
-            }
-        }
+            };
+            tx.commit().await?;
+            Ok(outcome)
+        })
+        .await
     }
 
     async fn list(&self) -> anyhow::Result<Vec<PairingRequest>> {
@@ -883,46 +920,62 @@ impl RunRepository for Db {
     }
 
     async fn prune(&self, cutoff: i64) -> anyhow::Result<usize> {
-        let mut conn = self.inner.connection().await?;
-        // Select the stale runs with the cutoff pushed down to SQL, then drop
-        // each run's steps via the `run_id` index — no full step-table scan.
-        let stale = toasty::query!(RunRecord FILTER .started_at < #cutoff)
-            .exec(&mut conn)
-            .await?;
-        let count = stale.len();
-        for run in stale {
-            let run_id = run.id.clone();
-            let steps = toasty::query!(RunStepRecord FILTER .run_id == #run_id)
-                .exec(&mut conn)
+        // Transactional: each run and all its steps drop together — a partial
+        // prune used to orphan steps whose run was already deleted (or vice
+        // versa). with_write_retry re-runs cleanly after a rolled-back conflict.
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let mut tx = conn.transaction().await?;
+            // Select the stale runs with the cutoff pushed down to SQL, then drop
+            // each run's steps via the `run_id` index — no full step-table scan.
+            let stale = toasty::query!(RunRecord FILTER .started_at < #cutoff)
+                .exec(&mut tx)
                 .await?;
-            for step in steps {
-                step.delete().exec(&mut conn).await?;
+            let count = stale.len();
+            for run in stale {
+                let run_id = run.id.clone();
+                let steps = toasty::query!(RunStepRecord FILTER .run_id == #run_id)
+                    .exec(&mut tx)
+                    .await?;
+                for step in steps {
+                    step.delete().exec(&mut tx).await?;
+                }
+                run.delete().exec(&mut tx).await?;
             }
-            run.delete().exec(&mut conn).await?;
-        }
-        Ok(count)
+            tx.commit().await?;
+            Ok(count)
+        })
+        .await
     }
 
     async fn reconcile_interrupted(&self, now: i64) -> anyhow::Result<usize> {
-        let mut conn = self.inner.connection().await?;
-        let running = RunStatus::Running.as_str();
-        // Only the still-"running" rows are touched — filter pushed to SQL.
-        let rows = toasty::query!(RunRecord FILTER .status == #running)
-            .exec(&mut conn)
-            .await?;
-        let mut reconciled = 0;
-        for mut record in rows {
-            record
-                .update()
-                .status(RunStatus::Failed.as_str().to_string())
-                .error(INTERRUPTED_ERROR.to_string())
-                .recoverable(true)
-                .ended_at(now)
-                .exec(&mut conn)
+        // Transactional: flip every crash-residue "running" run to failed as one
+        // unit, so a failure partway doesn't leave some rows stuck "running"
+        // (they'd never be reconciled on a later startup). Retry-safe.
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let mut tx = conn.transaction().await?;
+            let running = RunStatus::Running.as_str();
+            // Only the still-"running" rows are touched — filter pushed to SQL.
+            let rows = toasty::query!(RunRecord FILTER .status == #running)
+                .exec(&mut tx)
                 .await?;
-            reconciled += 1;
-        }
-        Ok(reconciled)
+            let mut reconciled = 0;
+            for mut record in rows {
+                record
+                    .update()
+                    .status(RunStatus::Failed.as_str().to_string())
+                    .error(INTERRUPTED_ERROR.to_string())
+                    .recoverable(true)
+                    .ended_at(now)
+                    .exec(&mut tx)
+                    .await?;
+                reconciled += 1;
+            }
+            tx.commit().await?;
+            Ok(reconciled)
+        })
+        .await
     }
 
     async fn mark_resumed(&self, id: &str) -> anyhow::Result<()> {
