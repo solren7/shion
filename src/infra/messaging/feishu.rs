@@ -328,18 +328,27 @@ fn spawn_ws_thread(
                     }
                 };
                 let started = std::time::Instant::now();
-                tokio::select! {
+                let connected = tokio::select! {
                     _ = shutdown.changed() => break,
                     result = LarkWsClient::open(ws_config.clone(), dispatcher) => match result {
-                        Ok(()) => warn!("feishu connection closed; reconnecting"),
-                        Err(error) => warn!(%error, "feishu connection failed; reconnecting"),
+                        Ok(()) => {
+                            warn!("feishu connection closed; reconnecting");
+                            true
+                        }
+                        Err(error) => {
+                            warn!(%error, "feishu connection failed; reconnecting");
+                            false
+                        }
                     }
-                }
-                // A connection that stayed up a while was healthy: reset the
-                // backoff so a later blip starts from the short delay. A fast
-                // failure (e.g. bad credentials) escalates it instead of
-                // hammering the WebSocket every few seconds.
-                if started.elapsed() >= reconnect_backoff(0) {
+                };
+                // A connection that was actually established AND stayed up a
+                // while was healthy: reset the backoff so a later blip starts
+                // from the short delay. Err never resets — a failed open that
+                // merely took a long time (slow TLS/DNS/connect timeouts) is
+                // still a failure, so a persistent outage keeps escalating.
+                // The elapsed floor guards the Ok side against a server that
+                // accepts and immediately drops us in a tight loop.
+                if connected && started.elapsed() >= reconnect_backoff(0) {
                     backoff = 0;
                 }
                 tokio::select! {
