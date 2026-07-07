@@ -217,9 +217,25 @@ async fn require_auth(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     match presented {
-        Some(token) if token == state.api_key.as_str() => Ok(next.run(req).await),
+        Some(token) if bearer_matches(token, state.api_key.as_str()) => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
     }
+}
+
+/// Constant-time bearer-token check. Both sides are SHA-256'd to a fixed 32-byte
+/// digest (so neither length nor content leaks) and the digests are compared
+/// with a non-short-circuiting fold — a plain `==` on the tokens would let a
+/// timing side-channel probe the key byte by byte when the api channel is bound
+/// externally (`[channels.api] enabled = true`), where the key is the only auth.
+fn bearer_matches(presented: &str, expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let p = Sha256::digest(presented.as_bytes());
+    let e = Sha256::digest(expected.as_bytes());
+    let mut diff = 0u8;
+    for (x, y) in p.iter().zip(e.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Maps any handler error to a 500 with a JSON body.

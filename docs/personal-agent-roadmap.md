@@ -188,9 +188,9 @@ api channel 的 loopback HTTP 已经覆盖这个需求的大半：脚本、Rayca
 - 启停：`disabled` 的 skill 留在盘上可 inspect，但不进模型 catalog，`skill view` 返回明确的"已停用"。
 - inspect 与审计：`shion skill inspect` 显示全文/来源/路径/历史；`shion skill audit` 从 run ledger 的 `skill view` steps **派生**调用记录（不存任何 usage 计数字段）。
 
-所有治理命令都是纯文件操作，gateway 持锁时照常可用；catalog 变更重启 gateway 生效（热加载不做，先例同 policy）。
+所有治理命令都是纯文件操作，gateway 持锁时照常可用。**live registry 热加载已落地**：`SkillRegistry` 每次查询都重扫 skill 目录，install/promote/enable/disable 在 `skill` 工具的下一次 `list`/`view` 就可见，无需重启 gateway。仍冻结在启动快照的只有系统提示里那份 capped skills catalog teaser（活在 cache-stable 提示层，为保 prompt 缓存刻意不热加载；它只是个有界提示，指引模型调 `skill` list 拿完整实时集）。
 
-尚未做：skill 热加载；usage 信号驱动的 candidate 自动归档（skill 版 dreaming，等 candidate 真实堆积再立项）。
+尚未做：usage 信号驱动的 candidate 自动归档（skill 版 dreaming，等 candidate 真实堆积再立项）。
 
 目标是让用户随时看懂 shion 当前知道什么、正在做什么、为什么这样做。
 

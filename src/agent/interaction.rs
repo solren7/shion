@@ -143,6 +143,15 @@ impl ApprovalState {
         self.approved.lock().unwrap().remove(session);
         self.gates.lock().unwrap().remove(session);
     }
+
+    /// Reclaim the session's transient serialization gate between turns
+    /// (recreated on demand by [`gate`](Self::gate)). Called when a turn
+    /// finishes so the `gates` map doesn't accumulate one entry per session for
+    /// the gateway's lifetime. The `approved` set is deliberately *not* touched
+    /// — it is session-scoped and must survive until `/new`.
+    fn release_gate(&self, session: &str) {
+        self.gates.lock().unwrap().remove(session);
+    }
 }
 
 impl Default for ApprovalState {
@@ -613,8 +622,11 @@ impl GatewayDispatcher {
     /// A turn finished normally: drop any approval it left pending, then either
     /// dispatch the next queued message or clear the session's in-flight flag.
     fn finish_turn(self: &Arc<Self>, session: &str) {
-        // Any approval the turn abandoned (a tool call never resolved) is dropped.
+        // Any approval the turn abandoned (a tool call never resolved) is dropped,
+        // and the transient serialization gate is reclaimed (the session-scoped
+        // "approved for session" set stays until `/new`).
         self.approvals.forget_pending(session);
+        self.approvals.release_gate(session);
         let next = {
             let mut inflight = self.inflight.lock().unwrap();
             let Some(queue) = inflight.get_mut(session) else {
