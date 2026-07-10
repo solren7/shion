@@ -2,26 +2,21 @@
 //!
 //! A single read-only snapshot of "what is shion configured to do, and what is
 //! missing": the active model/provider and whether its API key is present, the
-//! maintenance/briefing schedules, each ingress channel's enabled+credentials
-//! state, the resolved home channel, and the run ledger's recent failures.
+//! sweep schedules, each ingress channel's enabled+credentials state, the
+//! resolved home channel, and the run ledger's recent failures.
 //!
-//! Channels aren't a running-process query — they are constructed fresh in
-//! `cli/gateway.rs` from config + env at startup. So this command re-derives the
-//! same state the gateway would, which is why it doubles as config-health: it
-//! reuses the very `*_config()` resolvers the gateway uses, where `Ok(None)` =
-//! disabled, `Ok(Some)` = ready, and `Err` = enabled-but-misconfigured (the
-//! error message names the missing credential).
+//! Everything config-derived renders from the one [`ConfigSnapshot`] the whole
+//! process shares — the same resolved truth the gateway boots from — so doctor
+//! can never disagree with the gateway about precedence or credential
+//! semantics. Resolution never aborts: problems arrive as `ConfigIssue`s and
+//! are all shown, not just the first.
 //!
 //! The two db-backed sections (home override, run ledger) follow the standard
 //! CLI read path: a reachable gateway → `GET /api/*` (it holds the exclusive
 //! db lock); none → open the db directly.
 
 use crate::cli::gateway_client::GatewayClient;
-use crate::config::{
-    self, FileConfig, Provider, Secrets, ShionEnv, api_config, feishu_config,
-    homeassistant_channel_config, homeassistant_config, telegram_config, wechat_config,
-    wechat_cred_path,
-};
+use crate::config::{ChannelState, ConfigSnapshot, IssueSeverity, wechat_cred_path};
 use crate::domain::{home::HomeRepository, run::RunRepository};
 use crate::infra::persistence::db::Db;
 use crate::infra::rendezvous;
@@ -37,9 +32,8 @@ fn local_time(unix: i64) -> String {
         .unwrap_or_else(|| unix.to_string())
 }
 
-pub async fn doctor(db_url: &str) -> anyhow::Result<()> {
-    let home = config::shion_home();
-    println!("home: {}", home.display());
+pub async fn doctor(config: &ConfigSnapshot) -> anyhow::Result<()> {
+    println!("home: {}", config.runtime.home.display());
 
     // One probe reused by every db-backed section: reachable gateway → read
     // over its api channel (it holds the exclusive db lock); none → open the
@@ -47,13 +41,14 @@ pub async fn doctor(db_url: &str) -> anyhow::Result<()> {
     let gw = GatewayClient::try_connect().await;
     gateway_health(gw.is_some());
 
-    model_health();
-    schedule_health();
-    policy_health();
+    issue_health(config);
+    model_health(config);
+    schedule_health(config);
+    policy_health(config);
     println!("\nchannels:");
-    channel_health();
-    home_channel_health(gw.as_ref(), db_url).await;
-    run_health(gw.as_ref(), db_url).await;
+    channel_health(config);
+    home_channel_health(gw.as_ref(), config).await;
+    run_health(gw.as_ref(), &config.runtime.db_url).await;
     Ok(())
 }
 
@@ -74,51 +69,56 @@ fn gateway_health(reachable: bool) {
     }
 }
 
-/// Provider/model resolution and whether the provider's API key is present.
-/// Mirrors `ModelConfig::resolve`'s priority (env > config.toml > default) but
-/// reports a missing key as a health line instead of erroring.
-fn model_health() {
-    let env = ShionEnv::load_lenient();
-    let file = FileConfig::load(&config::shion_home());
-    let provider_str = env
-        .provider
-        .or(file.provider)
-        .unwrap_or_else(|| "deepseek".to_string());
-    match Provider::parse(&provider_str) {
-        Ok(provider) => {
-            let model = env
-                .model
-                .or(file.model)
-                .unwrap_or_else(|| provider.default_model().to_string());
-            println!("\nmodel: {} / {}", provider.name(), model);
-            if provider.uses_api_key() {
-                let has_key = Secrets::load().key(provider).is_some();
-                let mark = if has_key { OK } else { BAD };
-                println!(
-                    "  {mark} {} {}",
-                    provider.api_key_var(),
-                    if has_key { "set" } else { "MISSING" }
-                );
-            } else {
-                // Codex authenticates from ~/.codex/auth.json — validate that
-                // login rather than looking for an env key.
-                match crate::infra::codex::CodexAuth::load() {
-                    Ok(_) => println!("  {OK} Codex OAuth (~/.codex/auth.json)"),
-                    Err(e) => println!("  {BAD} Codex auth: {e}"),
-                }
-            }
-        }
-        Err(e) => println!("\nmodel: {BAD} {e}"),
+/// Every problem resolution recorded, fatal first in resolution order. The
+/// gateway refuses to start on a fatal issue; warnings are safe to run with.
+fn issue_health(config: &ConfigSnapshot) {
+    let issues = &config.report.issues;
+    if issues.is_empty() {
+        return;
+    }
+    println!("\nconfig issues:");
+    for issue in issues {
+        let mark = match issue.severity {
+            IssueSeverity::Fatal => BAD,
+            IssueSeverity::Warning => "!",
+        };
+        println!("  {mark} {}: {}", issue.path, issue.message);
     }
 }
 
-/// Maintenance cron, daily briefing (opt-in), and the workday gate.
-fn schedule_health() {
+/// The resolved provider/model and whether its credential is present.
+fn model_health(config: &ConfigSnapshot) {
+    // An unparsable provider is already listed under config issues; the model
+    // line then shows the fallback resolution actually in effect.
+    let model = &config.runtime.model;
+    let provider = model.provider;
+    println!("\nmodel: {} / {}", provider.name(), model.model);
+    if provider.uses_api_key() {
+        let has_key = config.report.key_present(provider);
+        let mark = if has_key { OK } else { BAD };
+        println!(
+            "  {mark} {} {}",
+            provider.api_key_var(),
+            if has_key { "set" } else { "MISSING" }
+        );
+    } else {
+        // Codex authenticates from ~/.codex/auth.json — validate that
+        // login rather than looking for an env key.
+        match crate::infra::codex::CodexAuth::load() {
+            Ok(_) => println!("  {OK} Codex OAuth (~/.codex/auth.json)"),
+            Err(e) => println!("  {BAD} Codex auth: {e}"),
+        }
+    }
+}
+
+/// Maintenance cron, daily briefing (opt-in), dreaming, and the workday gate.
+fn schedule_health(config: &ConfigSnapshot) {
+    let rt = &config.runtime;
     println!("\nsweeps:");
-    println!("  maintenance  {}", config::maintenance_schedule());
-    match config::briefing_schedule() {
+    println!("  maintenance  {}", rt.maintenance_schedule);
+    match &rt.briefing_schedule {
         Some(s) => {
-            let gate = if config::briefing_workdays_only() {
+            let gate = if rt.briefing_workdays_only {
                 " (Chinese workdays only)"
             } else {
                 ""
@@ -127,14 +127,18 @@ fn schedule_health() {
         }
         None => println!("  briefing     {OFF} disabled (set briefing_schedule to enable)"),
     }
+    match &rt.dream_schedule {
+        Some(s) => println!("  dreaming     {s}"),
+        None => println!("  dreaming     {OFF} disabled"),
+    }
     println!("  reminders    every minute");
     println!("  tasks        every minute");
 }
 
 /// The permission policy: configured?, rule count, load errors.
-fn policy_health() {
+fn policy_health(config: &ConfigSnapshot) {
     use crate::domain::policy::Verdict;
-    let report = config::policy_report();
+    let report = &config.runtime.policy;
     println!("\npolicy:");
     if !report.configured {
         println!("  {OFF} no [policy] table — Normal/Dangerous actions ask interactively");
@@ -158,52 +162,51 @@ fn policy_health() {
 }
 
 /// One line per ingress channel: enabled?, credentials present?
-fn channel_health() {
-    // Each resolver: Ok(None) = disabled, Ok(Some) = ready, Err = misconfigured.
-    macro_rules! line {
-        ($label:expr, $resolved:expr) => {
-            match $resolved {
-                Ok(Some(_)) => println!("  {OK} {:<14} enabled", $label),
-                Ok(None) => println!("  {OFF} {:<14} disabled", $label),
-                Err(e) => println!("  {BAD} {:<14} {e}", $label),
-            }
-        };
+fn channel_health(config: &ConfigSnapshot) {
+    let rt = &config.runtime;
+    fn line<T>(label: &str, state: &ChannelState<T>) {
+        match state {
+            ChannelState::Ready(_) => println!("  {OK} {label:<14} enabled"),
+            ChannelState::Disabled => println!("  {OFF} {label:<14} disabled"),
+            ChannelState::Misconfigured(e) => println!("  {BAD} {label:<14} {e}"),
+        }
     }
-    line!("feishu", feishu_config());
-    line!("telegram", telegram_config());
-    line!("homeassistant", homeassistant_channel_config());
+    line("feishu", &rt.feishu);
+    line("telegram", &rt.telegram);
+    line("homeassistant", &rt.homeassistant_channel);
     // The api channel is always on (it's how the CLI reaches a running gateway);
     // `enabled` only widens it from loopback-only to externally reachable.
-    match api_config() {
-        Ok(cfg) if cfg.port != 0 => {
+    match &rt.api {
+        ChannelState::Ready(cfg) if cfg.port != 0 => {
             println!(
                 "  {OK} {:<14} enabled (external {}:{})",
                 "api", cfg.bind, cfg.port
             )
         }
-        Ok(_) => println!("  {OK} {:<14} on (loopback-only, CLI)", "api"),
-        Err(e) => println!("  {BAD} {:<14} {e}", "api"),
+        ChannelState::Ready(_) => println!("  {OK} {:<14} on (loopback-only, CLI)", "api"),
+        ChannelState::Misconfigured(e) => println!("  {BAD} {:<14} {e}", "api"),
+        ChannelState::Disabled => unreachable!("the api channel is always on"),
     }
 
     // WeChat resolves with no credential check (login is QR-based, creds in a
     // separate file), so verify the file ourselves.
-    match wechat_config() {
-        Ok(Some(_)) => {
+    match &rt.wechat {
+        ChannelState::Ready(_) => {
             if wechat_cred_path().exists() {
                 println!("  {OK} {:<14} enabled", "wechat");
             } else {
                 println!(
-                    "  {BAD} {:<14} enabled but not logged in (run `shion wechat login`)",
+                    "  {BAD} {:<14} enabled but not logged in (run `shion channel wechat login`)",
                     "wechat"
                 );
             }
         }
-        Ok(None) => println!("  {OFF} {:<14} disabled", "wechat"),
-        Err(e) => println!("  {BAD} {:<14} {e}", "wechat"),
+        ChannelState::Disabled => println!("  {OFF} {:<14} disabled", "wechat"),
+        ChannelState::Misconfigured(e) => println!("  {BAD} {:<14} {e}", "wechat"),
     }
 
     // The homeassistant *tool* (agent controls HA) is independent of the channel.
-    let ha_tool = if homeassistant_config().is_some() {
+    let ha_tool = if rt.homeassistant_tool.is_some() {
         format!("{OK} HASS_TOKEN set")
     } else {
         format!("{OFF} HASS_TOKEN unset (homeassistant tool not registered)")
@@ -213,18 +216,18 @@ fn channel_health() {
 
 /// Resolved proactive-output home: the `/sethome` runtime override (db) wins
 /// over the config `home_chat` fallback (feishu first).
-async fn home_channel_health(gw: Option<&GatewayClient>, db_url: &str) {
+async fn home_channel_health(gw: Option<&GatewayClient>, config: &ConfigSnapshot) {
     println!("\nhome channel (proactive output):");
     let over = match gw {
         Some(gw) => gw.home_override().await,
-        None => match Db::connect(db_url).await {
+        None => match Db::connect(&config.runtime.db_url).await {
             Ok(db) => HomeRepository::get(&db).await,
             Err(e) => Err(e),
         },
     };
     match over {
         Ok(Some(session)) => println!("  {OK} /sethome override → {session}"),
-        Ok(None) => match config_home_chat() {
+        Ok(None) => match config_home_chat(config) {
             Some((platform, chat)) => {
                 println!("  {OK} config home_chat → {platform}:{chat}")
             }
@@ -237,20 +240,15 @@ async fn home_channel_health(gw: Option<&GatewayClient>, db_url: &str) {
 }
 
 /// The config `home_chat` fallback, feishu-first (matches `HomeNotifier`).
-fn config_home_chat() -> Option<(&'static str, String)> {
-    if let Ok(Some(c)) = feishu_config()
-        && let Some(chat) = c.home_chat
-    {
+fn config_home_chat(config: &ConfigSnapshot) -> Option<(&'static str, String)> {
+    let rt = &config.runtime;
+    if let Some(chat) = rt.feishu.ready().and_then(|c| c.home_chat.clone()) {
         return Some(("feishu", chat));
     }
-    if let Ok(Some(c)) = telegram_config()
-        && let Some(chat) = c.home_chat
-    {
+    if let Some(chat) = rt.telegram.ready().and_then(|c| c.home_chat.clone()) {
         return Some(("telegram", chat));
     }
-    if let Ok(Some(c)) = wechat_config()
-        && let Some(chat) = c.home_chat
-    {
+    if let Some(chat) = rt.wechat.ready().and_then(|c| c.home_chat.clone()) {
         return Some(("wechat", chat));
     }
     None

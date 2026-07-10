@@ -440,7 +440,7 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Journey { limit, since } => {
             journey::journey(&crate::config::default_memory_db_url(), limit, since).await
         }
-        Commands::Doctor => doctor::doctor(&db).await,
+        Commands::Doctor => doctor::doctor(&crate::config::ConfigSnapshot::load()).await,
         Commands::Pair { action } => match action {
             PairAction::List => pair::list(&db).await,
             PairAction::Approve { code } => pair::approve(&db, &code).await,
