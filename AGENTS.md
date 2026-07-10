@@ -91,31 +91,33 @@ runs it is the sole owner of all three dbs — a CLI that opened one directly wo
 fail with `File is locked by another process`. So the gateway runs an **always-on
 loopback api channel** (`infra/messaging/api.rs`) and advertises it in
 `~/.shion/gateway.json` (`infra/rendezvous.rs`: bind/port/auto-key/pid, written on
-start, removed on graceful shutdown). Every CLI command first calls
-`cli::gateway_client::GatewayClient::try_connect` (read the rendezvous file →
-probe `/health`): reachable ⇒ route the request to the gateway over HTTP;
-otherwise open the db directly (unchanged). `shion chat` routes to
+start, removed on graceful shutdown). Every **operator** action goes through
+`services/operator_control/` — the CLI resolves one `OperatorControl::connect`
+per invocation (probe the rendezvous file → `/health`, exactly once) and issues
+typed `OperatorQuery`/`OperatorCommand` calls; whichever backend answered is
+invisible to the command modules. The **gateway adapter** maps those onto the
+existing `/api/*` routes via `infra/gateway_client.rs::GatewayClient` (reads
+deserialize the domain types verbatim; writes hit the loopback-gated `POST`
+endpoints — memory promote/reject/pin, `runs/prune`, `sessions/clean`,
+`pairings/approve|revoke`, `dream/apply`, `runs/{id}/resume`). The **direct
+adapter** opens the stores lazily per request family (a `run list` never
+touches memory.db; a triage batch reuses one connection), so there is no "stop
+the gateway first" refusal. Business results can't fork between the two paths:
+both run the shared projections/transitions in `operator_control/actions.rs`
+(`OperatorActions` is the same bundle the api channel's handlers delegate to,
+and transition semantics live on `Memory::promote/reject/pin`). `run resume`
+keeps eligibility, the priming digest, and the at-most-once `recoverable` clear
+inside `OperatorControl::resume_run`; only the interactive local turn is a
+caller-supplied closure over the already-open stores. `shion chat` is the one
+non-operator path: the TUI connects via `GatewayClient::chat` →
 `POST /v1/chat/completions` with a stable `X-Shion-Session-Id` (server-side
 history) and `X-Shion-Trusted` (the gateway runs the turn with
 `SessionContext::trusted` → side-effecting tools **auto-approve**, since the CLI
 user is the host operator; gated to **loopback** callers, so a publicly-bound api
-never gets it). Read commands (`memory`/`task`/`run`/`session`/`cron`/`skill`/
-`pair` list, `dream` preview) route to `GET /api/*`, which serialize the domain
-types verbatim so the CLI reuses its renderers. Memory governance writes
-(`memory promote/reject/pin/triage`) route to loopback-gated
-`POST /api/memories/{id}/promote|reject|pin` (the transition semantics live on
-`Memory::promote/reject/pin` so CLI, api, and the `memory` tool share one
-definition). The maintenance **write** commands route too, to loopback-gated
-endpoints: `run prune` → `POST /api/runs/prune?cutoff=` (the `--keep N` cutoff
-is resolved client-side from `GET /api/runs`), `session clean` →
-`POST /api/sessions/clean`, `pair approve/revoke` →
-`POST /api/pairings/approve|/{id}/revoke`, `dream --apply` →
-`POST /api/dream/apply` (runs the same `DreamSweep`). Each falls back to opening
-the db directly when no gateway is up, so there is no longer a "stop the gateway
-first" refusal (`/pair approve` in chat remains the other in-gateway path). The api channel is
-loopback-only on an ephemeral port by default; `[channels.api] enabled = true`
-widens it to an external bind/port (requires `API_SERVER_KEY`) for Open WebUI /
-the dashboard.
+never gets it). `/pair approve` in chat remains the other in-gateway admission
+path. The api channel is loopback-only on an ephemeral port by default;
+`[channels.api] enabled = true` widens it to an external bind/port (requires
+`API_SERVER_KEY`) for Open WebUI / the dashboard.
 
 Building requires `protoc` (`brew install protobuf`): the feishu channel's websocket
 frames are protobuf, and `lark-websocket-protobuf` compiles its `.proto` at build time.
