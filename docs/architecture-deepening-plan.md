@@ -1,6 +1,6 @@
 # Shion 架构深化方案
 
-- 状态：Proposed
+- 状态：Implemented（2026-07-11，commits bb5348f…b781243；§11 全部结构检查通过）
 - 范围：operator control、resolved configuration、tool execution、memory enrichment、review orchestration
 - 原则：渐进迁移；保持 CLI、HTTP 路由、持久化格式和用户行为兼容
 
