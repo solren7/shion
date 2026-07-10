@@ -16,11 +16,10 @@ use crate::{
         approval::Approver,
         gateway::{MessageHandler, WeChatLogin},
         home::HomeRepository,
-        memory::MemoryRepository,
         notify::Notifier,
         pairing::PairingRepository,
         reminder::ReminderRepository,
-        repository::{MessageRepository, SessionRepository, SkillRepository},
+        repository::SessionRepository,
         run::RunRepository,
         task::TaskRepository,
         todo::SessionTodoRepository,
@@ -38,6 +37,7 @@ use crate::{
         persistence::{db::Db, kanban::KanbanDb},
         workday::HolidayCalendar,
     },
+    services::operator_control::actions::OperatorActions,
 };
 
 /// Run the always-on gateway: a persistent process hosting the maintenance
@@ -302,25 +302,26 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             names.push("api".to_string());
             names
         };
-        let messages: Arc<dyn MessageRepository> = db.clone();
-        let runs: Arc<dyn RunRepository> = db.clone();
-        let memories: Arc<dyn MemoryRepository> = wired.memories.clone();
-        let reminders: Arc<dyn ReminderRepository> = db.clone();
-        let skills: Arc<dyn SkillRepository> = wired.skills.clone();
+        // The operator use cases behind the /api/* routes — the same shared
+        // definitions the CLI's direct adapter runs, here over the gateway's
+        // repositories.
+        let actions = Arc::new(OperatorActions {
+            sessions: db.clone(),
+            messages: db.clone(),
+            tasks: kanban.clone(),
+            memories: wired.memories.clone(),
+            runs: db.clone(),
+            reminders: db.clone(),
+            skills: wired.skills.clone(),
+            pairings: pairings.clone(),
+            home: db.clone(),
+        });
         gateway = gateway.add_channel(Box::new(ApiChannel::new(
             api,
             handler.clone(),
-            db.clone(),
-            messages,
-            kanban.clone(),
-            memories,
-            runs,
-            reminders,
-            skills,
-            pairings.clone(),
+            actions,
             enabled,
             config_home.clone(),
-            db.clone(),
         )));
         channels.push("api");
     }

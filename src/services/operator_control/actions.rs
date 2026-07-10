@@ -6,14 +6,131 @@
 //! transport — the api handlers and the direct adapter both call these, so the
 //! business result can't fork between the two paths.
 
-use crate::domain::memory::{DreamVerdict, Memory, MemoryRepository, dream_score, dream_verdict};
-use crate::domain::pairing::{PairingRequest, PairingStatus};
+use std::sync::Arc;
+
+use crate::domain::home::HomeRepository;
+use crate::domain::memory::{
+    DreamVerdict, Memory, MemoryRepository, MemoryStatus, dream_score, dream_verdict,
+};
+use crate::domain::message::Message;
+use crate::domain::pairing::{ApproveOutcome, PairingRepository, PairingRequest, PairingStatus};
+use crate::domain::reminder::{Reminder, ReminderRepository};
+use crate::domain::repository::{MessageRepository, SessionRepository, SkillRepository};
 use crate::domain::run::{Run, RunRepository, RunStep, resume_prompt, step_views_skill};
 use crate::domain::session::Session;
+use crate::domain::skill::Skill;
+use crate::domain::task::{Task, TaskRepository};
 
+use super::now;
 use super::request::{
     DreamItem, DreamReport, MemoryTransitionAction, PairingView, SessionSummary, SkillInvocation,
 };
+
+/// The operator use-case implementation over the gateway's repositories: one
+/// bundle the HTTP api channel delegates to, so its transport state stops
+/// doubling as a dependency list. Methods mirror the operations both
+/// transports must agree on and delegate to the same pure helpers the direct
+/// adapter uses.
+pub struct OperatorActions {
+    pub sessions: Arc<dyn SessionRepository>,
+    pub messages: Arc<dyn MessageRepository>,
+    pub tasks: Arc<dyn TaskRepository>,
+    pub memories: Arc<dyn MemoryRepository>,
+    pub runs: Arc<dyn RunRepository>,
+    pub reminders: Arc<dyn ReminderRepository>,
+    pub skills: Arc<dyn SkillRepository>,
+    pub pairings: Arc<dyn PairingRepository>,
+    pub home: Arc<dyn HomeRepository>,
+}
+
+impl OperatorActions {
+    pub async fn session_summaries(&self) -> anyhow::Result<Vec<SessionSummary>> {
+        Ok(session_summaries(self.sessions.list().await?))
+    }
+
+    pub async fn session_messages(&self, id: &str) -> anyhow::Result<Vec<Message>> {
+        self.messages.list_by_session(id).await
+    }
+
+    pub async fn open_tasks(&self) -> anyhow::Result<Vec<Task>> {
+        self.tasks.list_open().await
+    }
+
+    pub async fn list_memories(&self, status: Option<MemoryStatus>) -> anyhow::Result<Vec<Memory>> {
+        let mut memories = self.memories.list().await?;
+        if let Some(want) = status {
+            memories.retain(|m| m.status == want);
+        }
+        Ok(memories)
+    }
+
+    pub async fn memory_transition(
+        &self,
+        id: &str,
+        action: MemoryTransitionAction,
+    ) -> anyhow::Result<TransitionOutcome> {
+        apply_memory_transition(self.memories.as_ref(), id, action, now()).await
+    }
+
+    pub async fn runs(&self, limit: usize) -> anyhow::Result<Vec<Run>> {
+        self.runs.list(limit).await
+    }
+
+    pub async fn run(&self, id: &str) -> anyhow::Result<Option<(Run, Vec<RunStep>)>> {
+        Ok(match self.runs.get(id).await? {
+            Some(run) => {
+                let steps = self.runs.steps(&run.id).await?;
+                Some((run, steps))
+            }
+            None => None,
+        })
+    }
+
+    pub async fn prune_runs(&self, cutoff: i64) -> anyhow::Result<usize> {
+        self.runs.prune(cutoff).await
+    }
+
+    pub async fn clean_sessions(&self) -> anyhow::Result<usize> {
+        self.sessions.delete_empty_sessions().await
+    }
+
+    pub async fn pending_reminders(&self) -> anyhow::Result<Vec<Reminder>> {
+        let mut pending = self.reminders.list_pending().await?;
+        pending.sort_by_key(|r| r.run_at);
+        Ok(pending)
+    }
+
+    pub async fn list_skills(&self) -> anyhow::Result<Vec<Skill>> {
+        let mut skills = self.skills.list().await?;
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(skills)
+    }
+
+    pub async fn skill_audit(&self, name: &str) -> anyhow::Result<Vec<SkillInvocation>> {
+        let steps = self.runs.steps_by_tool("skill", AUDIT_SCAN_LIMIT).await?;
+        Ok(skill_invocations(steps, name, AUDIT_RESULT_CAP))
+    }
+
+    pub async fn pairing_views(&self) -> anyhow::Result<Vec<PairingView>> {
+        Ok(pairing_views(self.pairings.list().await?, now()))
+    }
+
+    pub async fn pair_approve(&self, code: &str) -> anyhow::Result<ApproveOutcome> {
+        self.pairings.approve_code(code).await
+    }
+
+    pub async fn pair_revoke(&self, id: &str) -> anyhow::Result<bool> {
+        self.pairings.revoke(id).await
+    }
+
+    pub async fn dream_preview(&self) -> anyhow::Result<DreamReport> {
+        Ok(dream_classify(&self.memories.list().await?, now()))
+    }
+
+    pub async fn home_override(&self) -> anyhow::Result<Option<String>> {
+        self.home.get().await
+    }
+}
 
 /// How many `skill`-tool ledger steps one audit request scans, and how many
 /// matches it returns.
@@ -39,7 +156,7 @@ pub fn not_recoverable_message(id: &str, status: &str) -> String {
 /// A memory governance transition's result: applied, or no such id (each
 /// transport maps `NotFound` to its own shape — 404 vs. a CLI error).
 pub enum TransitionOutcome {
-    Applied(Memory),
+    Applied(Box<Memory>),
     NotFound,
 }
 
@@ -56,7 +173,7 @@ pub async fn apply_memory_transition(
     };
     (action.apply())(&mut memory, now);
     memories.save(&memory).await?;
-    Ok(TransitionOutcome::Applied(memory))
+    Ok(TransitionOutcome::Applied(Box::new(memory)))
 }
 
 /// An explicit-id resume request's eligibility, plus the priming input when

@@ -46,20 +46,14 @@ use crate::{
     config::ApiConfig,
     domain::{
         gateway::MessageHandler,
-        home::HomeRepository,
-        memory::{Memory, MemoryRepository, MemoryStatus, parse_memory_status},
-        pairing::{ApproveOutcome, PairingRepository},
-        reminder::ReminderRepository,
-        repository::{MessageRepository, SessionRepository, SkillRepository},
-        run::{RunRepository, resume_prompt},
-        task::TaskRepository,
+        memory::{MemoryStatus, parse_memory_status},
+        pairing::ApproveOutcome,
     },
     services::{
         operator_control::{
-            ResumeOutcome,
+            MemoryTransitionAction, ResumeOutcome,
             actions::{
-                AUDIT_RESULT_CAP, AUDIT_SCAN_LIMIT, dream_classify, pairing_views,
-                session_summaries, skill_invocations,
+                OperatorActions, TransitionOutcome, not_recoverable_message, resolve_resume,
             },
         },
         tool_registry::{SessionContext, with_session},
@@ -67,26 +61,19 @@ use crate::{
 };
 use std::net::SocketAddr;
 
-/// Everything the HTTP handlers need, cheaply cloned per request (all `Arc`).
+/// What the HTTP transport itself needs, cheaply cloned per request (all
+/// `Arc`): the bearer key, the chat handler, the operator use cases, and the
+/// two `/api/status` facts. Operator behavior lives in [`OperatorActions`] —
+/// this is transport state, not a dependency list.
 #[derive(Clone)]
 struct AppState {
     api_key: Arc<String>,
     handler: Arc<dyn MessageHandler>,
-    sessions: Arc<dyn SessionRepository>,
-    messages: Arc<dyn MessageRepository>,
-    tasks: Arc<dyn TaskRepository>,
-    memories: Arc<dyn MemoryRepository>,
-    runs: Arc<dyn RunRepository>,
-    reminders: Arc<dyn ReminderRepository>,
-    skills: Arc<dyn SkillRepository>,
-    pairings: Arc<dyn PairingRepository>,
+    actions: Arc<OperatorActions>,
     /// Channel names enabled on this gateway (for `/api/status`).
     channels: Arc<Vec<String>>,
     /// Resolved config `home_chat` fallback, if any (for `/api/status`).
     home: Option<String>,
-    /// The `/sethome` runtime override lives in the db the gateway holds the
-    /// lock on, so `/api/home` is how the CLI (`shion doctor`) reads it.
-    home_repo: Arc<dyn HomeRepository>,
 }
 
 /// The HTTP API channel. Holds the listen config and the shared handler state.
@@ -97,21 +84,12 @@ pub struct ApiChannel {
 }
 
 impl ApiChannel {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &ApiConfig,
         handler: Arc<dyn MessageHandler>,
-        sessions: Arc<dyn SessionRepository>,
-        messages: Arc<dyn MessageRepository>,
-        tasks: Arc<dyn TaskRepository>,
-        memories: Arc<dyn MemoryRepository>,
-        runs: Arc<dyn RunRepository>,
-        reminders: Arc<dyn ReminderRepository>,
-        skills: Arc<dyn SkillRepository>,
-        pairings: Arc<dyn PairingRepository>,
+        actions: Arc<OperatorActions>,
         channels: Vec<String>,
         home: Option<String>,
-        home_repo: Arc<dyn HomeRepository>,
     ) -> Self {
         Self {
             bind: config.bind.clone(),
@@ -119,17 +97,9 @@ impl ApiChannel {
             state: AppState {
                 api_key: Arc::new(config.server_key.clone()),
                 handler,
-                sessions,
-                messages,
-                tasks,
-                memories,
-                runs,
-                reminders,
-                skills,
-                pairings,
+                actions,
                 channels: Arc::new(channels),
                 home,
-                home_repo,
             },
         }
     }
@@ -461,8 +431,8 @@ fn build_input(messages: &[ChatMessage], stateful: bool) -> String {
 // ---- dashboard endpoints ---------------------------------------------------
 
 async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let open_tasks = state.tasks.list_open().await?.len();
-    let sessions = state.sessions.list().await?.len();
+    let open_tasks = state.actions.open_tasks().await?.len();
+    let sessions = state.actions.session_summaries().await?.len();
     Ok(Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
@@ -477,13 +447,13 @@ async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
 /// fallback is *not* resolved here — the CLI derives it from the same
 /// config.toml locally; only the db-held override needs the gateway.
 async fn get_home(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let over = state.home_repo.get().await?;
+    let over = state.actions.home_override().await?;
     Ok(Json(json!({ "override": over })))
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     // Summaries only — never dump every transcript in a list view.
-    let sessions = session_summaries(state.sessions.list().await?);
+    let sessions = state.actions.session_summaries().await?;
     Ok(Json(json!({ "sessions": sessions })))
 }
 
@@ -491,14 +461,14 @@ async fn session_messages(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let messages = state.messages.list_by_session(&id).await?;
+    let messages = state.actions.session_messages(&id).await?;
     Ok(Json(json!({ "session_id": id, "messages": messages })))
 }
 
 async fn list_tasks(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     // `Task` serializes verbatim (snake_case status), so the CLI deserializes it
     // straight back into the domain type and reuses its existing renderer.
-    let tasks = state.tasks.list_open().await?;
+    let tasks = state.actions.open_tasks().await?;
     Ok(Json(json!({ "tasks": tasks })))
 }
 
@@ -511,12 +481,13 @@ async fn list_memories(
     State(state): State<AppState>,
     Query(params): Query<MemoryQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let mut memories = state.memories.list().await?;
-    if let Some(status) = params.status.as_deref().filter(|s| !s.is_empty()) {
-        let want: MemoryStatus = parse_memory_status(status);
-        memories.retain(|m| m.status == want);
-    }
+    let status: Option<MemoryStatus> = params
+        .status
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(parse_memory_status);
     // Memory derives Serialize, so it serializes verbatim.
+    let memories = state.actions.list_memories(status).await?;
     Ok(Json(json!({ "memories": memories })))
 }
 
@@ -528,40 +499,39 @@ async fn memory_promote(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    memory_transition(&state, &id, Memory::promote).await
+    memory_transition(&state, &id, MemoryTransitionAction::Promote).await
 }
 
 async fn memory_reject(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    memory_transition(&state, &id, Memory::reject).await
+    memory_transition(&state, &id, MemoryTransitionAction::Reject).await
 }
 
 async fn memory_pin(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    memory_transition(&state, &id, Memory::pin).await
+    memory_transition(&state, &id, MemoryTransitionAction::Pin).await
 }
 
-/// Apply one governance transition (a `Memory` method — the domain owns the
-/// semantics) and return the updated memory. 404 on an unknown id.
+/// Apply one governance transition (the shared operator definition — the
+/// domain owns the semantics) and return the updated memory. 404 on an
+/// unknown id.
 async fn memory_transition(
     state: &AppState,
     id: &str,
-    apply: fn(&mut Memory, i64),
+    action: MemoryTransitionAction,
 ) -> Result<Response, ApiError> {
-    let Some(mut memory) = state.memories.get(id).await? else {
-        return Ok((
+    match state.actions.memory_transition(id, action).await? {
+        TransitionOutcome::Applied(memory) => Ok(Json(json!({ "memory": memory })).into_response()),
+        TransitionOutcome::NotFound => Ok((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("no memory with id `{id}`") })),
         )
-            .into_response());
-    };
-    apply(&mut memory, now());
-    state.memories.save(&memory).await?;
-    Ok(Json(json!({ "memory": memory })).into_response())
+            .into_response()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -574,7 +544,7 @@ async fn list_runs(
     Query(params): Query<RunsQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
-    let runs = state.runs.list(limit).await?;
+    let runs = state.actions.runs(limit).await?;
     Ok(Json(json!({ "runs": runs })))
 }
 
@@ -582,16 +552,15 @@ async fn get_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let Some(run) = state.runs.get(&id).await? else {
-        return Ok((
+    // `Run` and `RunStep` serialize verbatim; the CLI reuses its run renderer.
+    match state.actions.run(&id).await? {
+        Some((run, steps)) => Ok(Json(json!({ "run": run, "steps": steps })).into_response()),
+        None => Ok((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "run not found" })),
         )
-            .into_response());
-    };
-    // `Run` and `RunStep` serialize verbatim; the CLI reuses its run renderer.
-    let steps = state.runs.steps(&id).await?;
-    Ok(Json(json!({ "run": run, "steps": steps })).into_response())
+            .into_response()),
+    }
 }
 
 /// Resume an interrupted run (backs `shion run resume` while the gateway holds
@@ -605,26 +574,27 @@ async fn resume_run(
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let Some(run) = state.runs.get(&id).await? else {
-        return Ok((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "run not found" })),
-        )
-            .into_response());
+    // Eligibility + priming come from the shared operator definition, so this
+    // endpoint and the CLI's direct path can never disagree.
+    let (run, steps, input) = match resolve_resume(state.actions.runs.as_ref(), &id).await? {
+        crate::services::operator_control::actions::ResumeTarget::Missing => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "run not found" })),
+            )
+                .into_response());
+        }
+        crate::services::operator_control::actions::ResumeTarget::NotRecoverable { status } => {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": not_recoverable_message(&id, &status) })),
+            )
+                .into_response());
+        }
+        crate::services::operator_control::actions::ResumeTarget::Ready { run, steps, input } => {
+            (run, steps, input)
+        }
     };
-    if !run.recoverable {
-        return Ok((
-            StatusCode::CONFLICT,
-            Json(json!({ "error": format!(
-                "run `{id}` is not recoverable (status: {} — it finished normally, \
-                 failed without interruption, or was already resumed)",
-                run.status.as_str()
-            ) })),
-        )
-            .into_response());
-    }
-    let steps = state.runs.steps(&id).await?;
-    let input = resume_prompt(&run, &steps);
 
     let trusted = peer.ip().is_loopback() && headers.contains_key("x-shion-trusted");
     let ctx = if trusted {
@@ -634,7 +604,7 @@ async fn resume_run(
     };
     let reply = with_session(ctx, state.handler.handle(&run.session_id, input)).await?;
 
-    if let Err(error) = state.runs.mark_resumed(&id).await {
+    if let Err(error) = state.actions.runs.mark_resumed(&id).await {
         warn!(%error, run_id = %id, "failed to clear recoverable flag after resume");
     }
     info!(run_id = %id, session = %run.session_id, "run resumed");
@@ -665,13 +635,13 @@ async fn prune_runs(
     State(state): State<AppState>,
     Query(params): Query<PruneParams>,
 ) -> Result<Response, ApiError> {
-    let removed = state.runs.prune(params.cutoff).await?;
+    let removed = state.actions.prune_runs(params.cutoff).await?;
     Ok(Json(json!({ "removed": removed })).into_response())
 }
 
 /// Delete every session with no messages (backs `shion session clean`).
 async fn clean_sessions(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let removed = state.sessions.delete_empty_sessions().await?;
+    let removed = state.actions.clean_sessions().await?;
     Ok(Json(json!({ "removed": removed })).into_response())
 }
 
@@ -686,7 +656,7 @@ async fn pair_approve(
     State(state): State<AppState>,
     Json(body): Json<ApproveParams>,
 ) -> Result<Response, ApiError> {
-    let json = match state.pairings.approve_code(&body.code).await? {
+    let json = match state.actions.pair_approve(&body.code).await? {
         ApproveOutcome::Approved(request) => json!({ "outcome": "approved", "id": request.id }),
         ApproveOutcome::NotFound => json!({ "outcome": "not_found" }),
         ApproveOutcome::Locked { retry_after_secs } => {
@@ -701,7 +671,7 @@ async fn pair_revoke(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let revoked = state.pairings.revoke(&id).await?;
+    let revoked = state.actions.pair_revoke(&id).await?;
     Ok(Json(json!({ "revoked": revoked })).into_response())
 }
 
@@ -709,7 +679,7 @@ async fn pair_revoke(
 /// `DreamSweep` the gateway schedules.
 async fn dream_apply(State(state): State<AppState>) -> Result<Response, ApiError> {
     let summary = DreamSweep {
-        memories: state.memories.clone(),
+        memories: state.actions.memories.clone(),
     }
     .apply()
     .await?;
@@ -724,15 +694,13 @@ async fn dream_apply(State(state): State<AppState>) -> Result<Response, ApiError
 
 /// Pending reminders (backs `shion cron list`), soonest first.
 async fn list_reminders(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let mut pending = state.reminders.list_pending().await?;
-    pending.sort_by_key(|r| r.run_at);
+    let pending = state.actions.pending_reminders().await?;
     Ok(Json(json!({ "reminders": pending })))
 }
 
 /// Registered skills (backs `shion skill list`), by name.
 async fn list_skills(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let mut skills = state.skills.list().await?;
-    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    let skills = state.actions.list_skills().await?;
     Ok(Json(json!({ "skills": skills })))
 }
 
@@ -743,22 +711,21 @@ async fn skill_audit(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let steps = state.runs.steps_by_tool("skill", AUDIT_SCAN_LIMIT).await?;
-    let invocations = skill_invocations(steps, &name, AUDIT_RESULT_CAP);
+    let invocations = state.actions.skill_audit(&name).await?;
     Ok(Json(json!({ "invocations": invocations })))
 }
 
 /// Pairings (backs `shion pair list`). A hash-free view — the salted code hash
 /// and per-row salt are never serialized off the host.
 async fn list_pairings(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let pairings = pairing_views(state.pairings.list().await?, now());
+    let pairings = state.actions.pairing_views().await?;
     Ok(Json(json!({ "pairings": pairings })))
 }
 
 /// The dreaming dry-run classification (backs `shion dream`, no `--apply`):
 /// which candidates would promote / archive, with their scores. Read-only.
 async fn dream_preview(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let report = dream_classify(&state.memories.list().await?, now());
+    let report = state.actions.dream_preview().await?;
     Ok(Json(
         json!({ "promote": report.promote, "archive": report.archive }),
     ))
