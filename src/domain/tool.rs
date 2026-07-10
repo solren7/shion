@@ -3,7 +3,7 @@ use async_trait::async_trait;
 /// A failure's retry-safety, classified at its source (where the typed cause is
 /// still intact — e.g. a `reqwest::Error`, before it is flattened to a string)
 /// and carried on the error via [`TransientError`]. The retry layer
-/// (`services::tool_registry`) reads this in preference to sniffing the error's
+/// (`services::tool_execution`) reads this in preference to sniffing the error's
 /// Display text. Mirrors the buckets that layer acts on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryHint {
@@ -72,13 +72,13 @@ pub trait Tool: Send + Sync {
     ///
     /// Connection-level failures (the request provably never reached the
     /// server — connection refused, DNS failure) are retried regardless of
-    /// this flag; see `services::tool_registry::execute_isolated`.
+    /// this flag; see `services::tool_execution`.
     fn idempotent(&self) -> bool {
         false
     }
 
     /// Sanitize the raw arguments before they are written to the run ledger
-    /// (`services::tool_registry::execute_isolated`). The ledger stores tool
+    /// (`services::tool_execution`). The ledger stores tool
     /// args verbatim by default (this identity impl); tools carrying sensitive
     /// payloads override it so secrets/large bodies never land in `shion.db`.
     /// `shell` scrubs secret-looking substrings, `file` drops write bodies.

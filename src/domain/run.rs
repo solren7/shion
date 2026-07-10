@@ -1,7 +1,7 @@
 //! The run ledger — an execution/audit record of every agent turn
 //! (docs/personal-agent-roadmap.md §7). One [`Run`] per user turn, with one
 //! [`RunStep`] per tool invocation (captured at the single choke point every
-//! tool call funnels through, `services::tool_registry::execute_isolated`).
+//! tool call funnels through, the tool executor (`services::tool_execution`)).
 //!
 //! Runs are execution state bound to a session, so they live in `shion.db`
 //! (disposable dev state) alongside sessions/messages — not in the durable

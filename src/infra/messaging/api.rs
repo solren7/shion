@@ -56,7 +56,7 @@ use crate::{
                 OperatorActions, TransitionOutcome, not_recoverable_message, resolve_resume,
             },
         },
-        tool_registry::{SessionContext, with_session},
+        tool_execution::{SessionContext, with_session},
     },
 };
 use std::net::SocketAddr;

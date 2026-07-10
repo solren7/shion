@@ -18,7 +18,7 @@ use crate::domain::{
     approval::{ApprovalRequest, Approver, Risk},
     policy::{Policy, Verdict},
 };
-use crate::services::tool_registry::current_session;
+use crate::services::tool_execution::current_session;
 
 /// Wraps an [`Approver`], applying a [`Policy`] before falling back to it.
 pub struct PolicyApprover {
@@ -87,7 +87,7 @@ mod tests {
     use super::*;
     use crate::domain::approval::ActionRef;
     use crate::domain::policy::{Category, Effect, Matcher, Rule};
-    use crate::services::tool_registry::{SessionContext, with_session};
+    use crate::services::tool_execution::{SessionContext, with_session};
     use std::sync::Mutex;
 
     struct Recording {

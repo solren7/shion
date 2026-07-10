@@ -17,7 +17,7 @@
 //!     of starting a new turn.
 //!
 //! The turn's session context (id + reply sink) reaches the approver through
-//! the task-local in `services::tool_registry`.
+//! the task-local in `services::tool_execution`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -38,7 +38,7 @@ use crate::{
         repository::SessionRepository,
         todo::SessionTodoRepository,
     },
-    services::tool_registry::{SessionContext, current_session, with_session},
+    services::tool_execution::{SessionContext, current_session, with_session},
 };
 
 /// How long an approval prompt waits for a reply before auto-denying.

@@ -190,7 +190,7 @@ pub struct FileConfig {
     pub max_turns: Option<usize>,
     /// Byte cap on a tool result handed back to the LLM, a global backstop
     /// against context-window bloat (default: 16384). See
-    /// `services::tool_registry::cap_tool_result`.
+    /// `services::tool_execution` (the executor's result cap).
     pub max_tool_result_bytes: Option<usize>,
     /// Max prior messages replayed as history per turn — the global backstop
     /// against an ever-growing chat session sending its whole transcript to the

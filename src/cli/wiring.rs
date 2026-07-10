@@ -26,7 +26,10 @@ use crate::{
         persistence::{db::Db, kanban::KanbanDb},
         skills::FsSkillStore,
     },
-    services::{skill_registry::SkillRegistry, tool_registry::ToolRegistry},
+    services::{
+        skill_registry::SkillRegistry,
+        tool_execution::{ToolExecutionConfig, ToolExecutor},
+    },
     tools::{
         delegate::DelegateTool, file::FileTool, homeassistant::HomeAssistantTool,
         memory::MemoryTool, reminder::ReminderTool, session::SessionTool, shell::ShellTool,
@@ -65,10 +68,6 @@ pub async fn build(
     // strict resolver did.
     config.validate_agent()?;
     let model_config = &config.runtime.model;
-    // Install the process-wide tool-result byte cap (the global backstop in
-    // `execute_isolated`). Resolved like every other setting; first call wins,
-    // which is fine — chat and gateway each build once.
-    crate::services::tool_registry::set_tool_result_cap(model_config.max_tool_result_bytes);
 
     // Wrap the interactive approver in the configurable permission policy
     // (roadmap §3): the policy auto-allows / hard-denies per `[policy]` rules and
@@ -82,7 +81,11 @@ pub async fn build(
     // File operations are confined to the current working directory.
     let workspace = Arc::new(Workspace::current_dir()?);
 
-    let mut tools = ToolRegistry::new();
+    // The executor owns execution policy (result cap, per-turn call budget) as
+    // instance config — no process globals.
+    let mut tools = ToolExecutor::new(ToolExecutionConfig::with_result_cap(
+        model_config.max_tool_result_bytes,
+    ));
     tools.register(Arc::new(TimeTool));
     tools.register(Arc::new(FileTool::new(workspace.clone(), approver.clone())));
     tools.register(Arc::new(ShellTool::new(
@@ -129,7 +132,7 @@ pub async fn build(
     let aux_preamble: PreambleFn = Arc::new(move || aux_builder.build());
     // Aux/delegate sub-agents must not be fed the user's memory library — and
     // the aux agent never gets an aux of its own (no recursion).
-    let aux_llm = build_llm(&aux_config, Vec::new(), aux_preamble, None, None)?;
+    let aux_llm = build_llm(&aux_config, None, aux_preamble, None, None)?;
     tools.register(Arc::new(DelegateTool::new(aux_llm.clone())));
 
     // The governed skill store: `~/.shion/skills` is the shion-owned home for
@@ -184,7 +187,11 @@ pub async fn build(
     // project-instruction file, then the day-precision volatile footer. Wrapped
     // in a factory so `complete` rebuilds it per turn (per session) rather than
     // freezing the date at process start — important for the long-lived gateway.
-    let tool_names = tools.tools().iter().map(|t| t.name().to_string()).collect();
+    let tool_names = tools
+        .definitions()
+        .iter()
+        .map(|t| t.name().to_string())
+        .collect();
     let prompt_builder = Arc::new(
         SystemPromptBuilder::new(model_config)
             .tools(tool_names)
@@ -198,7 +205,7 @@ pub async fn build(
     // screening (main agent only).
     let llm = build_llm(
         model_config,
-        tools.tools(),
+        Some(&tools),
         preamble,
         Some(memory_repo.clone()),
         Some(aux_llm.clone()),
@@ -216,9 +223,9 @@ pub async fn build(
         sessions: db.clone(),
         messages: db.clone(),
         runs: db.clone(),
-        // The in-house agent loop dispatches model-requested tools against this
-        // same catalog (the LLM was handed clones of the same instances above).
-        tools: Arc::new(tools),
+        // The in-house agent loop hands each round to this executor; the LLM
+        // was handed RigTool adapters over the same core above.
+        tool_executor: tools,
         max_turns: model_config.max_turns,
         // Mirror the LLM's history window so the turn loads exactly what the
         // model will replay (no full-transcript read on long chat sessions).

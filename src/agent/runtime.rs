@@ -11,9 +11,8 @@ use crate::{
         run::{RUN_FIELD_CAP, Run, RunRepository, RunStatus, truncate},
         session::Session,
     },
-    services::tool_registry::{
-        RunContext, SessionContext, ToolRegistry, current_session, execute_isolated, with_run,
-        with_session,
+    services::tool_execution::{
+        RunContext, SessionContext, ToolExecutor, ToolTurnContext, current_session, with_session,
     },
 };
 
@@ -28,15 +27,15 @@ pub struct AgentRuntime {
     pub sessions: Arc<dyn SessionRepository>,
     pub messages: Arc<dyn MessageRepository>,
     /// Run ledger: every turn is recorded here, with one step per tool call
-    /// (captured at `execute_isolated`). See `domain/run.rs`, roadmap §7.
+    /// (captured by the tool executor). See `domain/run.rs`, roadmap §7.
     pub runs: Arc<dyn RunRepository>,
     /// Tool catalog the in-house loop dispatches against. shion (not rig) now
-    /// owns the multi-step loop, so it looks tools up here and runs them through
-    /// `execute_isolated` directly. See `turn_body`, roadmap §7.
-    pub tools: Arc<ToolRegistry>,
+    /// owns the multi-step loop and hands each round of requested calls to the
+    /// executor, which owns lookup/retry/ledger/cap. See `run_agent_loop`.
+    pub tool_executor: ToolExecutor,
     /// Max tool-calling rounds per turn before the loop forces a final answer
     /// (config `max_turns`). The hard, loop-level budget — distinct from the
-    /// per-call fan-out cap in `execute_isolated`.
+    /// executor's per-call fan-out cap.
     pub max_turns: usize,
     /// How many recent messages to load for the turn's agent loop (mirrors the
     /// LLM's `max_history_messages`; `0` = load the whole transcript). Keeps the
@@ -85,7 +84,8 @@ impl AgentRuntime {
         // counter is shared via `Arc`, so this clone sees the final value).
         let probe = ctx.clone();
 
-        let outcome = with_run(ctx, self.turn_body(session_id, user_input))
+        let outcome = self
+            .turn_body(session_id, user_input, ctx)
             .instrument(span)
             .await;
 
@@ -116,7 +116,12 @@ impl AgentRuntime {
     /// The turn's actual work: persist the user message, drive the agent loop
     /// (shion owns it — model round-trip, execute requested tools, feed results
     /// back, repeat), persist the reply, and kick off the periodic reviewer.
-    async fn turn_body(&self, session_id: &str, user_input: String) -> anyhow::Result<String> {
+    async fn turn_body(
+        &self,
+        session_id: &str,
+        user_input: String,
+        run: RunContext,
+    ) -> anyhow::Result<String> {
         // Load only the recent window for the agent loop — the LLM windows the
         // history to the same bound anyway, so a long-lived chat session no
         // longer deserializes its whole transcript every turn. The reviewer
@@ -138,7 +143,7 @@ impl AgentRuntime {
         self.messages.save(session_id, &user_msg).await?;
         session.messages.push(user_msg);
 
-        let reply = self.run_agent_loop(&session).await?;
+        let reply = self.run_agent_loop(&session, run).await?;
 
         let assistant_msg = Message::assistant(&reply);
         self.messages.save(session_id, &assistant_msg).await?;
@@ -182,12 +187,19 @@ impl AgentRuntime {
 
     /// shion's own tool-calling loop (roadmap §7 — the loop lives here, not in
     /// rig, so control points can sit between rounds). Drive the model a round
-    /// at a time: a [`Step::Final`] ends the turn; [`Step::ToolCalls`] are run
-    /// through `execute_isolated` (preserving the run-ledger/approval task-locals
-    /// already in scope, plus its retry/budget/cap) and threaded back. Once the
-    /// per-turn round budget is exceeded, feed [`BUDGET_REACHED_NOTE`] back in
-    /// place of results and force a final answer.
-    async fn run_agent_loop(&self, session: &Session) -> anyhow::Result<String> {
+    /// at a time: a [`Step::Final`] ends the turn; [`Step::ToolCalls`] go to the
+    /// tool executor as one round (it owns lookup, retry, the per-call budget,
+    /// the ledger, and the result cap) and the outcomes are threaded back. Once
+    /// the per-turn *round* budget is exceeded, feed [`BUDGET_REACHED_NOTE`]
+    /// back in place of results and force a final answer.
+    async fn run_agent_loop(&self, session: &Session, run: RunContext) -> anyhow::Result<String> {
+        // The executor gets the turn's context explicitly: the run handle this
+        // turn opened, and the session established by the dispatcher / api /
+        // handle_input (read once here — the one ambient-to-explicit bridge).
+        let context = ToolTurnContext {
+            session: current_session().unwrap_or_else(|| SessionContext::detached(&session.id)),
+            run: Some(run),
+        };
         let mut driver = self.llm.begin_turn(session).await?;
         let mut step = driver.first().await?;
         let mut rounds = 0usize;
@@ -209,35 +221,12 @@ impl AgentRuntime {
                             })
                             .collect()
                     } else {
-                        // Run a round's tool calls concurrently. `execute_isolated`
-                        // already spawns each on its own task; doing them in a
-                        // sequential `for` only made them queue behind one another,
-                        // so a round of N reads paid N× latency. `join_all`
-                        // preserves order, so results still line up with `calls`.
-                        // Approval prompts stay safe under concurrency: the
-                        // interactive approver serializes them per session (its
-                        // single pending slot is never raced), so two
-                        // side-effecting tools in one round still prompt
-                        // one-at-a-time.
-                        let futures = calls.iter().map(|call| async move {
-                            let content = match self.tools.get(&call.name) {
-                                // A tool error is fed back as the result (the
-                                // model can recover), not propagated — only a
-                                // driver/LLM error aborts the turn.
-                                Some(tool) => match execute_isolated(tool, call.args.clone()).await
-                                {
-                                    Ok(out) => out,
-                                    Err(error) => format!("tool `{}` failed: {error:#}", call.name),
-                                },
-                                None => format!("error: unknown tool `{}`", call.name),
-                            };
-                            ToolOutcome {
-                                id: call.id.clone(),
-                                call_id: call.call_id.clone(),
-                                content,
-                            }
-                        });
-                        futures_util::future::join_all(futures).await
+                        // One round, delegated whole: the executor runs the
+                        // calls concurrently (order-preserving) and maps tool
+                        // errors / unknown names into outcome content the model
+                        // can recover from — only a driver/LLM error aborts the
+                        // turn.
+                        self.tool_executor.execute_round(&calls, &context).await
                     };
 
                     let next = driver.step(results).await?;
@@ -371,9 +360,10 @@ mod tests {
         max_turns: usize,
     ) -> (AgentRuntime, Arc<Mutex<Vec<Vec<ToolOutcome>>>>) {
         let received = Arc::new(Mutex::new(Vec::new()));
-        let mut reg = ToolRegistry::new();
+        let mut executor =
+            ToolExecutor::new(crate::services::tool_execution::ToolExecutionConfig::default());
         for t in tools {
-            reg.register(t);
+            executor.register(t);
         }
         let rt = AgentRuntime {
             llm: Arc::new(ScriptedLlm {
@@ -383,7 +373,7 @@ mod tests {
             sessions: db.clone(),
             messages: db.clone(),
             runs: db.clone(),
-            tools: Arc::new(reg),
+            tool_executor: executor,
             max_turns,
             history_window: 0,
             reviewer: None,

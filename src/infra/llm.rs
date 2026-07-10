@@ -27,7 +27,6 @@ use crate::{
         },
         message::{Message, Role},
         session::Session,
-        tool::Tool,
     },
     infra::{
         codex::{CODEX_BASE_URL, CodexAuth, CodexHttpClient, codex_static_headers},
@@ -524,15 +523,23 @@ fn choice_to_step(choice: &OneOrMany<AssistantContent>) -> Step {
 /// both `Some` only for the main agent, `None` for aux/delegate sub-agents.
 pub fn build_llm(
     config: &ModelConfig,
-    tools: Vec<Arc<dyn Tool>>,
+    tools: Option<&crate::services::tool_execution::ToolExecutor>,
     preamble: PreambleFn,
     memories: Option<Arc<dyn MemoryRepository>>,
     aux: Option<Arc<dyn LlmClient>>,
 ) -> anyhow::Result<Arc<dyn LlmClient>> {
+    // Each RigTool shares the executor's core, so the trait-required fallback
+    // path carries the same retry/ledger/cap semantics as the runtime's loop.
     let adapters: Vec<Box<dyn ToolDyn>> = tools
-        .into_iter()
-        .map(|t| Box::new(RigTool(t)) as Box<dyn ToolDyn>)
-        .collect();
+        .map(|executor| {
+            let core = executor.core();
+            executor
+                .definitions()
+                .into_iter()
+                .map(|t| Box::new(RigTool::new(t, core.clone())) as Box<dyn ToolDyn>)
+                .collect()
+        })
+        .unwrap_or_default();
     let model = config.model.clone();
     let key = config.api_key.clone();
     let base = config.base_url.as_deref();

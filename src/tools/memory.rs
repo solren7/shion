@@ -13,7 +13,7 @@ use crate::{
         },
         tool::Tool,
     },
-    services::tool_registry::current_session,
+    services::tool_execution::current_session,
 };
 
 /// Default cap on search results.

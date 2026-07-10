@@ -1,7 +1,7 @@
 //! Shared error helpers for the reqwest-backed tools (`web_fetch`,
 //! `web_search`, `homeassistant`). They classify a failure into a typed
 //! [`RetryHint`] at the point the `reqwest::Error` / status code is still
-//! intact, so the retry layer (`services::tool_registry::classify_error`) acts
+//! intact, so the retry layer (`services::tool_execution`'s retry classifier) acts
 //! on a lossless signal instead of sniffing the error's Display string.
 
 use std::fmt::Display;

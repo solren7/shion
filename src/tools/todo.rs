@@ -19,7 +19,7 @@ use crate::{
         todo::{SessionTodoRepository, TodoItem, TodoStatus, parse_todo_status},
         tool::Tool,
     },
-    services::tool_registry::current_session,
+    services::tool_execution::current_session,
 };
 
 #[derive(Deserialize)]
@@ -175,7 +175,7 @@ impl Tool for TodoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::tool_registry::{SessionContext, with_session};
+    use crate::services::tool_execution::{SessionContext, with_session};
     use std::sync::Mutex;
 
     #[derive(Default)]
