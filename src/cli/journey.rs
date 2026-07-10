@@ -22,6 +22,7 @@ use crate::{
         skill::Skill,
     },
     infra::skills::FsSkillStore,
+    services::operator_control::OperatorControl,
 };
 
 /// One dated thing shion learned (or forgot). Kept small and owned so the
@@ -40,13 +41,17 @@ pub(crate) struct Event {
     tail: String,
 }
 
-pub async fn journey(mem_url: &str, limit: usize, since: Option<String>) -> anyhow::Result<()> {
+pub async fn journey(
+    control: &OperatorControl,
+    limit: usize,
+    since: Option<String>,
+) -> anyhow::Result<()> {
     let cutoff = match since.as_deref() {
         Some(date) => Some(crate::cli::app::parse_local_date(date)?),
         None => None,
     };
 
-    let mut events = memory_events(&memory::load_all(mem_url).await?);
+    let mut events = memory_events(&memory::load_all(control).await?);
     events.extend(skill_events(&FsSkillStore::new(
         FsSkillStore::default_root(),
     )));

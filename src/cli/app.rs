@@ -373,11 +373,6 @@ pub async fn run() -> anyhow::Result<()> {
     // config home; use SHION_HOME to point at a different one (e.g. for tests
     // or a second instance).
     let config = crate::config::ConfigSnapshot::load();
-    let db = config.runtime.db_url.clone();
-    // Durable tasks live in a separate file so resetting `shion.db` (disposable
-    // dev state) never wipes them.
-    let kanban = config.runtime.kanban_db_url.clone();
-    let memory = config.runtime.memory_db_url.clone();
     match cli.command {
         Commands::Chat => {
             require_terminal()?;
@@ -392,35 +387,40 @@ pub async fn run() -> anyhow::Result<()> {
         },
         Commands::Upgrade { no_restart } => upgrade::run(no_restart),
         Commands::Cron { action } => match action {
-            CronAction::List => inspect::cron_list(&db).await,
+            CronAction::List => inspect::cron_list(&operator(&config).await?).await,
         },
         Commands::Session { action } => match action {
-            SessionAction::List => inspect::session_list(&db).await,
+            SessionAction::List => inspect::session_list(&operator(&config).await?).await,
             SessionAction::Resume { id } => {
                 require_terminal()?;
                 crate::tui::resume(&config, &id).await
             }
-            SessionAction::Clean => inspect::session_clean(&db).await,
+            SessionAction::Clean => inspect::session_clean(&operator(&config).await?).await,
         },
         Commands::Task { action } => match action {
-            TaskAction::List => inspect::task_list(&kanban).await,
+            TaskAction::List => inspect::task_list(&operator(&config).await?).await,
         },
         Commands::Run { action } => match action {
-            RunAction::List { limit } => inspect::run_list(&db, limit).await,
-            RunAction::Inspect { id } => inspect::run_inspect(&db, &id).await,
-            RunAction::Resume { id } => resume::run(&config, id).await,
-            RunAction::Prune { before, keep } => run_prune(&db, before, keep).await,
+            RunAction::List { limit } => inspect::run_list(&operator(&config).await?, limit).await,
+            RunAction::Inspect { id } => inspect::run_inspect(&operator(&config).await?, &id).await,
+            RunAction::Resume { id } => resume::run(&config, &operator(&config).await?, id).await,
+            RunAction::Prune { before, keep } => {
+                run_prune(&operator(&config).await?, before, keep).await
+            }
         },
-        Commands::Memory { action } => match action {
-            MemoryAction::List { status } => memory::list(&memory, status).await,
-            MemoryAction::Search { query } => memory::search(&memory, &query).await,
-            MemoryAction::Promote { ids } => memory::promote(&memory, &ids).await,
-            MemoryAction::Reject { ids } => memory::reject(&memory, &ids).await,
-            MemoryAction::Pin { id } => memory::pin(&memory, &id).await,
-            MemoryAction::Triage => memory::triage(&memory).await,
-            MemoryAction::Report => memory::report(&memory).await,
-        },
-        Commands::Dream { apply } => dream::run(&memory, apply).await,
+        Commands::Memory { action } => {
+            let control = operator(&config).await?;
+            match action {
+                MemoryAction::List { status } => memory::list(&control, status).await,
+                MemoryAction::Search { query } => memory::search(&control, &query).await,
+                MemoryAction::Promote { ids } => memory::promote(&control, &ids).await,
+                MemoryAction::Reject { ids } => memory::reject(&control, &ids).await,
+                MemoryAction::Pin { id } => memory::pin(&control, &id).await,
+                MemoryAction::Triage => memory::triage(&control).await,
+                MemoryAction::Report => memory::report(&control).await,
+            }
+        }
+        Commands::Dream { apply } => dream::run(&operator(&config).await?, apply).await,
         Commands::Skill { action } => match action {
             SkillAction::List => inspect::skill_list(),
             SkillAction::Install { source } => skill::install(&source).await,
@@ -431,15 +431,20 @@ pub async fn run() -> anyhow::Result<()> {
             SkillAction::Enable { name } => skill::set_enabled(&name, true),
             SkillAction::Disable { name } => skill::set_enabled(&name, false),
             SkillAction::Inspect { name } => skill::inspect(&name),
-            SkillAction::Audit { name } => skill::audit(&db, &name).await,
+            SkillAction::Audit { name } => skill::audit(&operator(&config).await?, &name).await,
         },
-        Commands::Journey { limit, since } => journey::journey(&memory, limit, since).await,
-        Commands::Doctor => doctor::doctor(&config).await,
-        Commands::Pair { action } => match action {
-            PairAction::List => pair::list(&db).await,
-            PairAction::Approve { code } => pair::approve(&db, &code).await,
-            PairAction::Revoke { id } => pair::revoke(&db, &id).await,
-        },
+        Commands::Journey { limit, since } => {
+            journey::journey(&operator(&config).await?, limit, since).await
+        }
+        Commands::Doctor => doctor::doctor(&config, &operator(&config).await?).await,
+        Commands::Pair { action } => {
+            let control = operator(&config).await?;
+            match action {
+                PairAction::List => pair::list(&control).await,
+                PairAction::Approve { code } => pair::approve(&control, &code).await,
+                PairAction::Revoke { id } => pair::revoke(&control, &id).await,
+            }
+        }
         Commands::Policy { action } => match action {
             PolicyAction::List => policy::list(&config),
             PolicyAction::Check {
@@ -479,39 +484,37 @@ pub async fn run() -> anyhow::Result<()> {
     }
 }
 
+/// Resolve one operator backend for this invocation: the gateway is probed
+/// exactly once, and every read/write the command performs reuses it.
+async fn operator(
+    config: &crate::config::ConfigSnapshot,
+) -> anyhow::Result<crate::services::operator_control::OperatorControl> {
+    crate::services::operator_control::OperatorControl::connect(
+        crate::services::operator_control::StoreUrls::from_config(&config.runtime),
+    )
+    .await
+}
+
 /// Resolve `run prune`'s `--before <date>` / `--keep N` into a cutoff timestamp,
 /// then prune. Exactly one of the two must be given (clap enforces mutual
 /// exclusion, but not presence).
-async fn run_prune(db: &str, before: Option<String>, keep: Option<usize>) -> anyhow::Result<()> {
-    // Route through a running gateway (which holds the db lock) when one is up,
-    // else open the db directly. The `--keep N` cutoff needs the run list, which
-    // also comes from the gateway when routed.
-    let gw = crate::infra::gateway_client::GatewayClient::try_connect().await;
+async fn run_prune(
+    control: &crate::services::operator_control::OperatorControl,
+    before: Option<String>,
+    keep: Option<usize>,
+) -> anyhow::Result<()> {
     let cutoff = match (before, keep) {
         (Some(date), None) => parse_local_date(&date)?,
-        (None, Some(keep)) => {
-            let cutoff = match &gw {
-                Some(gw) => gw.runs(keep + 1).await?.get(keep).map(|r| r.started_at),
-                None => inspect::run_keep_cutoff(db, keep).await?,
-            };
-            match cutoff {
-                Some(cutoff) => cutoff,
-                None => {
-                    println!("Fewer than {} runs; nothing to prune.", keep + 1);
-                    return Ok(());
-                }
+        (None, Some(keep)) => match inspect::run_keep_cutoff(control, keep).await? {
+            Some(cutoff) => cutoff,
+            None => {
+                println!("Fewer than {} runs; nothing to prune.", keep + 1);
+                return Ok(());
             }
-        }
+        },
         _ => anyhow::bail!("pass exactly one of --before <YYYY-MM-DD> or --keep <N>"),
     };
-    match &gw {
-        Some(gw) => {
-            let removed = gw.prune_runs(cutoff).await?;
-            inspect::report_prune(removed, cutoff);
-            Ok(())
-        }
-        None => inspect::run_prune(db, cutoff).await,
-    }
+    inspect::run_prune(control, cutoff).await
 }
 
 /// Parse a `YYYY-MM-DD` date as local-time midnight, returning a unix timestamp.

@@ -3,31 +3,30 @@
 //! Unlike the in-chat `memory` tool (scoped to the current chat), the CLI is a
 //! host-side operator view: it lists and searches across *all* scopes, so you
 //! can triage candidates the reviewer captured and promote/pin the durable ones.
+//! Every read and write goes through [`OperatorControl`] — whether it reaches a
+//! running gateway or the store directly is not this module's business.
 
-use crate::domain::memory::{Memory, MemoryConfidence, MemoryRepository, MemoryStatus};
-use crate::infra::gateway_client::GatewayClient;
-use crate::infra::memory::memory_db::MemoryDb;
+use crate::domain::memory::{Memory, MemoryConfidence, MemoryStatus};
+use crate::services::operator_control::{
+    MemoryTransitionAction, OperatorCommand, OperatorControl, OperatorQuery, OperatorQueryResult,
+};
 
-async fn store(url: &str) -> anyhow::Result<MemoryDb> {
-    MemoryDb::connect(url).await
-}
-
-/// Load every memory — from a running gateway (which holds the db lock) if one
-/// is up, else straight from the db. The CLI's list/search/report all filter
-/// this set client-side, so one loader serves them all (plus `journey`).
-pub(crate) async fn load_all(url: &str) -> anyhow::Result<Vec<Memory>> {
-    match GatewayClient::try_connect().await {
-        Some(gw) => gw.memories().await,
-        None => store(url).await?.list().await,
+/// Load every memory through the operator surface. The CLI's list/search/report
+/// all filter this set client-side, so one loader serves them all (plus
+/// `journey`).
+pub(crate) async fn load_all(control: &OperatorControl) -> anyhow::Result<Vec<Memory>> {
+    match control.query(OperatorQuery::Memories).await? {
+        OperatorQueryResult::Memories(memories) => Ok(memories),
+        _ => unreachable!("Memories query answers with Memories"),
     }
 }
 
 /// List stored memories, optionally filtered by status.
-pub async fn list(url: &str, status: Option<String>) -> anyhow::Result<()> {
+pub async fn list(control: &OperatorControl, status: Option<String>) -> anyhow::Result<()> {
     let filter = status
         .as_deref()
         .map(crate::domain::memory::parse_memory_status);
-    let mut memories = load_all(url).await?;
+    let mut memories = load_all(control).await?;
     if let Some(status) = filter {
         memories.retain(|m| m.status == status);
     }
@@ -49,9 +48,9 @@ pub async fn list(url: &str, status: Option<String>) -> anyhow::Result<()> {
 }
 
 /// Substring search across all scopes (operator view — no scope enforcement).
-pub async fn search(url: &str, query: &str) -> anyhow::Result<()> {
+pub async fn search(control: &OperatorControl, query: &str) -> anyhow::Result<()> {
     let needle = query.to_lowercase();
-    let hits: Vec<Memory> = load_all(url)
+    let hits: Vec<Memory> = load_all(control)
         .await?
         .into_iter()
         .filter(|m| m.content.to_lowercase().contains(&needle))
@@ -66,59 +65,34 @@ pub async fn search(url: &str, query: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Where a governance write lands: a running gateway (which holds the db lock)
-/// over HTTP, or the db directly. Resolved **once** per command so a batch of
-/// ids doesn't re-probe/reconnect per id.
-enum WriteStore {
-    Gateway(GatewayClient),
-    Direct(MemoryDb),
-}
-
-async fn write_store(url: &str) -> anyhow::Result<WriteStore> {
-    Ok(match GatewayClient::try_connect().await {
-        Some(gw) => WriteStore::Gateway(gw),
-        None => WriteStore::Direct(store(url).await?),
-    })
-}
-
-/// Apply one governance transition to one id. `action` is the api route leg;
-/// `apply` is the same domain method the gateway itself runs, so both paths
-/// share `Memory`'s semantics.
+/// Apply one governance transition to one id through the already-resolved
+/// operator backend.
 async fn transition(
-    store: &WriteStore,
+    control: &OperatorControl,
     id: &str,
-    action: &str,
-    apply: fn(&mut Memory, i64),
+    action: MemoryTransitionAction,
 ) -> anyhow::Result<()> {
-    match store {
-        WriteStore::Gateway(gw) => gw.memory_transition(id, action).await,
-        WriteStore::Direct(db) => {
-            let mut memory = db
-                .get(id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("no memory with id `{id}`"))?;
-            apply(
-                &mut memory,
-                time::OffsetDateTime::now_utc().unix_timestamp(),
-            );
-            db.save(&memory).await
-        }
-    }
+    control
+        .command(OperatorCommand::MemoryTransition {
+            id: id.to_string(),
+            action,
+        })
+        .await?;
+    Ok(())
 }
 
 /// Run a transition over a batch of ids, reporting per id and failing the
-/// command (after trying every id) if any failed.
+/// command (after trying every id) if any failed. The backend was resolved
+/// once by the caller, so the batch never re-probes or reconnects per id.
 async fn transition_batch(
-    url: &str,
+    control: &OperatorControl,
     ids: &[String],
-    action: &str,
-    apply: fn(&mut Memory, i64),
+    action: MemoryTransitionAction,
     done: &str,
 ) -> anyhow::Result<()> {
-    let store = write_store(url).await?;
     let mut failed = 0usize;
     for id in ids {
-        match transition(&store, id, action, apply).await {
+        match transition(control, id, action).await {
             Ok(()) => println!("{done} {id}."),
             Err(error) => {
                 failed += 1;
@@ -133,21 +107,21 @@ async fn transition_batch(
 }
 
 /// Promote candidates to active, confirmed memories.
-pub async fn promote(url: &str, ids: &[String]) -> anyhow::Result<()> {
-    transition_batch(url, ids, "promote", Memory::promote, "Promoted").await
+pub async fn promote(control: &OperatorControl, ids: &[String]) -> anyhow::Result<()> {
+    transition_batch(control, ids, MemoryTransitionAction::Promote, "Promoted").await
 }
 
 /// Reject candidates (won't surface in recall or injection).
-pub async fn reject(url: &str, ids: &[String]) -> anyhow::Result<()> {
-    transition_batch(url, ids, "reject", Memory::reject, "Rejected").await
+pub async fn reject(control: &OperatorControl, ids: &[String]) -> anyhow::Result<()> {
+    transition_batch(control, ids, MemoryTransitionAction::Reject, "Rejected").await
 }
 
 /// Interactively triage the candidate pile: one prompt per candidate,
 /// **oldest first** — the oldest are closest to dreaming's 30-day archive
 /// line, so they get the operator's eye before the sweep quietly retires
 /// them. `p` promote / `r` reject / `s` skip / `q` quit.
-pub async fn triage(url: &str) -> anyhow::Result<()> {
-    let mut candidates: Vec<Memory> = load_all(url)
+pub async fn triage(control: &OperatorControl) -> anyhow::Result<()> {
+    let mut candidates: Vec<Memory> = load_all(control)
         .await?
         .into_iter()
         .filter(|m| m.status == MemoryStatus::Candidate)
@@ -158,17 +132,16 @@ pub async fn triage(url: &str) -> anyhow::Result<()> {
     }
     candidates.sort_by_key(|m| m.created_at);
 
-    let store = write_store(url).await?;
     let total = candidates.len();
     let (mut promoted, mut rejected, mut skipped, mut failed) = (0usize, 0usize, 0usize, 0usize);
     println!("{total} candidate(s) to triage — p=promote  r=reject  s=skip  q=quit\n");
     'items: for (i, m) in candidates.iter().enumerate() {
         println!("[{}/{total}] {}", i + 1, line(m));
-        let (action, apply, bucket): (&str, fn(&mut Memory, i64), &mut usize) = loop {
+        let (action, bucket): (MemoryTransitionAction, &mut usize) = loop {
             match triage_choice(read_choice("  p/r/s/q> ").await?.as_deref()) {
                 TriageChoice::Quit => break 'items,
-                TriageChoice::Promote => break ("promote", Memory::promote, &mut promoted),
-                TriageChoice::Reject => break ("reject", Memory::reject, &mut rejected),
+                TriageChoice::Promote => break (MemoryTransitionAction::Promote, &mut promoted),
+                TriageChoice::Reject => break (MemoryTransitionAction::Reject, &mut rejected),
                 TriageChoice::Skip => {
                     skipped += 1;
                     continue 'items;
@@ -176,7 +149,7 @@ pub async fn triage(url: &str) -> anyhow::Result<()> {
                 TriageChoice::Invalid => println!("  (p=promote  r=reject  s=skip  q=quit)"),
             }
         };
-        match transition(&store, &m.id, action, apply).await {
+        match transition(control, &m.id, action).await {
             Ok(()) => *bucket += 1,
             Err(error) => {
                 failed += 1;
@@ -232,9 +205,8 @@ async fn read_choice(prompt: &str) -> anyhow::Result<Option<String>> {
 
 /// Pin a memory into the L1 per-turn profile (the manual, explicit path —
 /// automated extraction never pins). Raises confidence so it actually surfaces.
-pub async fn pin(url: &str, id: &str) -> anyhow::Result<()> {
-    let store = write_store(url).await?;
-    transition(&store, id, "pin", Memory::pin).await?;
+pub async fn pin(control: &OperatorControl, id: &str) -> anyhow::Result<()> {
+    transition(control, id, MemoryTransitionAction::Pin).await?;
     println!("Pinned {id} into the L1 profile.");
     Ok(())
 }
@@ -246,8 +218,8 @@ pub async fn pin(url: &str, id: &str) -> anyhow::Result<()> {
 ///
 /// Recall counts (the dreaming usage signal) are shown per line; `shion dream`
 /// previews which candidates that signal would promote or archive.
-pub async fn report(url: &str) -> anyhow::Result<()> {
-    let memories = load_all(url).await?;
+pub async fn report(control: &OperatorControl) -> anyhow::Result<()> {
+    let memories = load_all(control).await?;
     if memories.is_empty() {
         println!("(no memories)");
         return Ok(());

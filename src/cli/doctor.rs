@@ -16,10 +16,8 @@
 //! db lock); none → open the db directly.
 
 use crate::config::{ChannelState, ConfigSnapshot, IssueSeverity, wechat_cred_path};
-use crate::domain::{home::HomeRepository, run::RunRepository};
-use crate::infra::gateway_client::GatewayClient;
-use crate::infra::persistence::db::Db;
 use crate::infra::rendezvous;
+use crate::services::operator_control::{OperatorControl, OperatorQuery, OperatorQueryResult};
 
 /// Status glyph for a channel/credential line.
 const OK: &str = "✓";
@@ -32,14 +30,12 @@ fn local_time(unix: i64) -> String {
         .unwrap_or_else(|| unix.to_string())
 }
 
-pub async fn doctor(config: &ConfigSnapshot) -> anyhow::Result<()> {
+pub async fn doctor(config: &ConfigSnapshot, control: &OperatorControl) -> anyhow::Result<()> {
     println!("home: {}", config.runtime.home.display());
 
-    // One probe reused by every db-backed section: reachable gateway → read
-    // over its api channel (it holds the exclusive db lock); none → open the
-    // db directly.
-    let gw = GatewayClient::try_connect().await;
-    gateway_health(gw.is_some());
+    // The operator backend was resolved once by the caller; the db-backed
+    // sections below reuse it, and the gateway line reports which side it hit.
+    gateway_health(control.via_gateway());
 
     issue_health(config);
     model_health(config);
@@ -47,8 +43,8 @@ pub async fn doctor(config: &ConfigSnapshot) -> anyhow::Result<()> {
     policy_health(config);
     println!("\nchannels:");
     channel_health(config);
-    home_channel_health(gw.as_ref(), config).await;
-    run_health(gw.as_ref(), &config.runtime.db_url).await;
+    home_channel_health(control, config).await;
+    run_health(control).await;
     Ok(())
 }
 
@@ -216,15 +212,15 @@ fn channel_health(config: &ConfigSnapshot) {
 
 /// Resolved proactive-output home: the `/sethome` runtime override (db) wins
 /// over the config `home_chat` fallback (feishu first).
-async fn home_channel_health(gw: Option<&GatewayClient>, config: &ConfigSnapshot) {
+async fn home_channel_health(control: &OperatorControl, config: &ConfigSnapshot) {
     println!("\nhome channel (proactive output):");
-    let over = match gw {
-        Some(gw) => gw.home_override().await,
-        None => match Db::connect(&config.runtime.db_url).await {
-            Ok(db) => HomeRepository::get(&db).await,
-            Err(e) => Err(e),
-        },
-    };
+    let over = control
+        .query(OperatorQuery::HomeOverride)
+        .await
+        .map(|r| match r {
+            OperatorQueryResult::HomeOverride(over) => over,
+            _ => unreachable!("HomeOverride query answers with HomeOverride"),
+        });
     match over {
         Ok(Some(session)) => println!("  {OK} /sethome override → {session}"),
         Ok(None) => match config_home_chat(config) {
@@ -256,15 +252,15 @@ fn config_home_chat(config: &ConfigSnapshot) -> Option<(&'static str, String)> {
 
 /// Recent run-ledger health: how many of the last 50 turns failed, with the
 /// most recent few. The roadmap §9 "last error" view.
-async fn run_health(gw: Option<&GatewayClient>, db_url: &str) {
+async fn run_health(control: &OperatorControl) {
     println!("\nrecent runs:");
-    let fetched = match gw {
-        Some(gw) => gw.runs(50).await,
-        None => match Db::connect(db_url).await {
-            Ok(db) => RunRepository::list(&db, 50).await,
-            Err(e) => Err(e),
-        },
-    };
+    let fetched = control
+        .query(OperatorQuery::Runs { limit: 50 })
+        .await
+        .map(|r| match r {
+            OperatorQueryResult::Runs(runs) => runs,
+            _ => unreachable!("Runs query answers with Runs"),
+        });
     let runs = match fetched {
         Ok(r) => r,
         Err(e) => {

@@ -8,10 +8,8 @@
 
 use crate::{
     cli::inspect::local_time,
-    domain::run::RunRepository,
-    infra::gateway_client::GatewayClient,
-    infra::{persistence::db::Db, skills::FsSkillStore},
-    services::operator_control::actions::skill_invocations,
+    infra::skills::FsSkillStore,
+    services::operator_control::{OperatorControl, OperatorQuery, OperatorQueryResult},
 };
 
 fn store() -> FsSkillStore {
@@ -128,17 +126,15 @@ pub fn inspect(name: &str) -> anyhow::Result<()> {
 }
 
 /// Which turns loaded this skill — derived from the run ledger (`skill view`
-/// steps), so it needs the db: routed to the gateway when one is running.
-pub async fn audit(db_url: &str, name: &str) -> anyhow::Result<()> {
-    const SCAN: usize = 500;
-    const CAP: usize = 50;
-    let invocations = match GatewayClient::try_connect().await {
-        Some(gw) => gw.skill_audit(name).await?,
-        None => {
-            let db = Db::connect(db_url).await?;
-            let steps = RunRepository::steps_by_tool(&db, "skill", SCAN).await?;
-            skill_invocations(steps, name, CAP)
-        }
+/// steps), so it needs the db, i.e. the operator surface.
+pub async fn audit(control: &OperatorControl, name: &str) -> anyhow::Result<()> {
+    let OperatorQueryResult::SkillAudit(invocations) = control
+        .query(OperatorQuery::SkillAudit {
+            name: name.to_string(),
+        })
+        .await?
+    else {
+        unreachable!("SkillAudit query answers with SkillAudit");
     };
     if invocations.is_empty() {
         println!("No recorded loads of `{name}` in the run ledger.");

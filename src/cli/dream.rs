@@ -7,29 +7,21 @@
 //! `promote-explain`. Pass `--apply` to actually run one consolidation cycle
 //! (the same `DreamSweep` the gateway runs on `dream_schedule`).
 //!
-//! The dry-run routes through a running gateway (which holds the db lock) when
-//! one is up; `--apply` mutates the db, so it requires the gateway stopped.
+//! Both preview and apply run through the operator surface — whichever
+//! transport answers (a running gateway, or the store directly) is not this
+//! module's business.
 
-use crate::agent::daemon::DreamSweep;
-use crate::domain::memory::MemoryRepository;
-use crate::infra::gateway_client::GatewayClient;
-use crate::infra::memory::memory_db::MemoryDb;
-use crate::services::operator_control::{DreamItem, DreamReport, actions::dream_classify};
-use std::sync::Arc;
+use crate::services::operator_control::{
+    DreamItem, OperatorCommand, OperatorCommandResult, OperatorControl, OperatorQuery,
+    OperatorQueryResult,
+};
 
 /// Run a dreaming cycle, or preview one. `apply = false` mutates nothing.
-pub async fn run(url: &str, apply: bool) -> anyhow::Result<()> {
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
-
-    // Both preview and apply route through a running gateway (which holds the db
-    // lock) when one is up, else open the db directly.
-    let gw = GatewayClient::try_connect().await;
-    let report = match &gw {
-        Some(gw) => {
-            let (promote, archive) = gw.dream_preview().await?;
-            DreamReport { promote, archive }
-        }
-        None => dream_classify(&MemoryDb::connect(url).await?.list().await?, now),
+pub async fn run(control: &OperatorControl, apply: bool) -> anyhow::Result<()> {
+    let OperatorQueryResult::DreamPreview(report) =
+        control.query(OperatorQuery::DreamPreview).await?
+    else {
+        unreachable!("DreamPreview query answers with DreamPreview");
     };
 
     if report.is_empty() {
@@ -48,13 +40,10 @@ pub async fn run(url: &str, apply: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let (promoted, archived) = match &gw {
-        Some(gw) => gw.dream_apply().await?,
-        None => {
-            let db = Arc::new(MemoryDb::connect(url).await?);
-            let summary = DreamSweep { memories: db }.apply().await?;
-            (summary.memories_promoted, summary.memories_archived)
-        }
+    let OperatorCommandResult::DreamApplied { promoted, archived } =
+        control.command(OperatorCommand::DreamApply).await?
+    else {
+        unreachable!("DreamApply answers with DreamApplied");
     };
     println!("\nApplied: promoted {promoted}, archived {archived}.");
     Ok(())

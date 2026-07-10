@@ -6,11 +6,9 @@
 //! gateway reads the same SQLite db, so approval takes effect on the
 //! sender's next message — no restart.
 
-use crate::{
-    domain::pairing::{ApproveOutcome, PairingRepository},
-    infra::gateway_client::{GatewayClient, PairApprove},
-    infra::persistence::db::Db,
-    services::operator_control::{PairingView, actions::pairing_views},
+use crate::services::operator_control::{
+    OperatorCommand, OperatorCommandResult, OperatorControl, OperatorQuery, OperatorQueryResult,
+    PairApproveOutcome,
 };
 
 fn local_time(unix: i64) -> String {
@@ -22,14 +20,10 @@ fn local_time(unix: i64) -> String {
 /// List all pairings: pending requests and approved senders. The code itself is
 /// stored only as a salted hash — get it from the sender and run
 /// `shion pair approve <code>` (or `/pair approve` in chat while the gateway runs).
-pub async fn list(db_url: &str) -> anyhow::Result<()> {
-    let pairings: Vec<PairingView> = match GatewayClient::try_connect().await {
-        Some(gw) => gw.pairings().await?,
-        None => {
-            let db = Db::connect(db_url).await?;
-            let now = time::OffsetDateTime::now_utc().unix_timestamp();
-            pairing_views(PairingRepository::list(&db).await?, now)
-        }
+pub async fn list(control: &OperatorControl) -> anyhow::Result<()> {
+    let OperatorQueryResult::Pairings(pairings) = control.query(OperatorQuery::Pairings).await?
+    else {
+        unreachable!("Pairings query answers with Pairings");
     };
 
     if pairings.is_empty() {
@@ -54,33 +48,23 @@ pub async fn list(db_url: &str) -> anyhow::Result<()> {
 /// Approve the pending request bearing `code`. Routes through a running gateway
 /// (which holds the db lock) when one is up, else opens the db directly. (The
 /// `/pair approve` chat command is the other in-gateway path.)
-pub async fn approve(db_url: &str, code: &str) -> anyhow::Result<()> {
+pub async fn approve(control: &OperatorControl, code: &str) -> anyhow::Result<()> {
     let code = code.trim().to_uppercase();
-    if let Some(gw) = GatewayClient::try_connect().await {
-        return match gw.pair_approve(&code).await? {
-            PairApprove::Approved(id) => {
-                println!("Paired {id} — they can chat now.");
-                Ok(())
-            }
-            PairApprove::NotFound => anyhow::bail!(
-                "no approvable pairing with code {code} — unknown or expired (see `shion pair list`)"
-            ),
-            PairApprove::Locked(retry_after_secs) => anyhow::bail!(
-                "too many failed attempts — approve is locked for {} more minutes",
-                (retry_after_secs + 59) / 60
-            ),
-        };
-    }
-    let db = Db::connect(db_url).await?;
-    match PairingRepository::approve_code(&db, &code).await? {
-        ApproveOutcome::Approved(request) => {
-            println!("Paired {} — they can chat now.", request.id);
+    let OperatorCommandResult::PairApproved(outcome) = control
+        .command(OperatorCommand::PairApprove { code: code.clone() })
+        .await?
+    else {
+        unreachable!("PairApprove answers with PairApproved");
+    };
+    match outcome {
+        PairApproveOutcome::Approved { id } => {
+            println!("Paired {id} — they can chat now.");
             Ok(())
         }
-        ApproveOutcome::NotFound => anyhow::bail!(
+        PairApproveOutcome::NotFound => anyhow::bail!(
             "no approvable pairing with code {code} — unknown or expired (see `shion pair list`)"
         ),
-        ApproveOutcome::Locked { retry_after_secs } => anyhow::bail!(
+        PairApproveOutcome::Locked { retry_after_secs } => anyhow::bail!(
             "too many failed attempts — approve is locked for {} more minutes",
             (retry_after_secs + 59) / 60
         ),
@@ -88,13 +72,12 @@ pub async fn approve(db_url: &str, code: &str) -> anyhow::Result<()> {
 }
 
 /// Remove a pairing (`{platform}:{sender_id}`, as printed by `pair list`).
-pub async fn revoke(db_url: &str, id: &str) -> anyhow::Result<()> {
-    let revoked = match GatewayClient::try_connect().await {
-        Some(gw) => gw.pair_revoke(id).await?,
-        None => {
-            let db = Db::connect(db_url).await?;
-            PairingRepository::revoke(&db, id).await?
-        }
+pub async fn revoke(control: &OperatorControl, id: &str) -> anyhow::Result<()> {
+    let OperatorCommandResult::PairRevoked { revoked } = control
+        .command(OperatorCommand::PairRevoke { id: id.to_string() })
+        .await?
+    else {
+        unreachable!("PairRevoke answers with PairRevoked");
     };
     if revoked {
         println!("Revoked {id}.");

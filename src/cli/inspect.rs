@@ -4,15 +4,10 @@
 //! runtime. They are the operator's view into what the gateway will act on.
 
 use crate::{
-    domain::{
-        reminder::ReminderRepository,
-        repository::SessionRepository,
-        run::RunRepository,
-        task::{TaskRepository, TaskStatus},
+    domain::task::TaskStatus,
+    services::operator_control::{
+        OperatorCommand, OperatorCommandResult, OperatorControl, OperatorQuery, OperatorQueryResult,
     },
-    infra::gateway_client::GatewayClient,
-    infra::persistence::{db::Db, kanban::KanbanDb},
-    services::operator_control::{SessionSummary, actions::session_summaries},
 };
 
 pub(crate) fn local_time(unix: i64) -> String {
@@ -23,10 +18,11 @@ pub(crate) fn local_time(unix: i64) -> String {
 
 /// List pending reminders with their schedules (recurring ones show the cron
 /// expression, one-shots are marked as such).
-pub async fn cron_list(db_url: &str) -> anyhow::Result<()> {
-    let mut pending = match GatewayClient::try_connect().await {
-        Some(gw) => gw.reminders().await?,
-        None => ReminderRepository::list_pending(&Db::connect(db_url).await?).await?,
+pub async fn cron_list(control: &OperatorControl) -> anyhow::Result<()> {
+    let OperatorQueryResult::Reminders(mut pending) =
+        control.query(OperatorQuery::Reminders).await?
+    else {
+        unreachable!("Reminders query answers with Reminders");
     };
     pending.sort_by_key(|r| r.run_at);
 
@@ -56,10 +52,9 @@ pub async fn cron_list(db_url: &str) -> anyhow::Result<()> {
 }
 
 /// List open tasks grouped by status (inbox first — it needs triage).
-pub async fn task_list(kanban_url: &str) -> anyhow::Result<()> {
-    let open = match GatewayClient::try_connect().await {
-        Some(gw) => gw.tasks().await?,
-        None => TaskRepository::list_open(&KanbanDb::connect(kanban_url).await?).await?,
+pub async fn task_list(control: &OperatorControl) -> anyhow::Result<()> {
+    let OperatorQueryResult::Tasks(open) = control.query(OperatorQuery::Tasks).await? else {
+        unreachable!("Tasks query answers with Tasks");
     };
 
     if open.is_empty() {
@@ -103,10 +98,10 @@ fn oneline(s: &str, n: usize) -> String {
 
 /// List recent runs (most recent first), one per line: id, status, time, plan,
 /// and a snippet of the input. The run ledger (roadmap §7).
-pub async fn run_list(db_url: &str, limit: usize) -> anyhow::Result<()> {
-    let runs = match GatewayClient::try_connect().await {
-        Some(gw) => gw.runs(limit).await?,
-        None => RunRepository::list(&Db::connect(db_url).await?, limit).await?,
+pub async fn run_list(control: &OperatorControl, limit: usize) -> anyhow::Result<()> {
+    let OperatorQueryResult::Runs(runs) = control.query(OperatorQuery::Runs { limit }).await?
+    else {
+        unreachable!("Runs query answers with Runs");
     };
 
     if runs.is_empty() {
@@ -128,19 +123,12 @@ pub async fn run_list(db_url: &str, limit: usize) -> anyhow::Result<()> {
 }
 
 /// Show one run in full: its input, plan, outcome, and every tool step in order.
-pub async fn run_inspect(db_url: &str, id: &str) -> anyhow::Result<()> {
-    let fetched = match GatewayClient::try_connect().await {
-        Some(gw) => gw.run(id).await?,
-        None => {
-            let db = Db::connect(db_url).await?;
-            match RunRepository::get(&db, id).await? {
-                Some(run) => {
-                    let steps = RunRepository::steps(&db, &run.id).await?;
-                    Some((run, steps))
-                }
-                None => None,
-            }
-        }
+pub async fn run_inspect(control: &OperatorControl, id: &str) -> anyhow::Result<()> {
+    let OperatorQueryResult::Run(fetched) = control
+        .query(OperatorQuery::Run { id: id.to_string() })
+        .await?
+    else {
+        unreachable!("Run query answers with Run");
     };
     let Some((run, steps)) = fetched else {
         println!("No run with id `{id}`.");
@@ -190,15 +178,13 @@ pub async fn run_inspect(db_url: &str, id: &str) -> anyhow::Result<()> {
 /// `cutoff` (unix seconds). The ledger accumulates like messages, so this is the
 /// operator's manual trim — `run prune` resolves either `--before` or `--keep`
 /// into a cutoff before calling this.
-pub async fn run_prune(db_url: &str, cutoff: i64) -> anyhow::Result<()> {
-    let db = Db::connect(db_url).await?;
-    let removed = RunRepository::prune(&db, cutoff).await?;
-    report_prune(removed, cutoff);
-    Ok(())
-}
-
-/// Print the prune outcome (shared by the direct-db and gateway-routed paths).
-pub fn report_prune(removed: usize, cutoff: i64) {
+pub async fn run_prune(control: &OperatorControl, cutoff: i64) -> anyhow::Result<()> {
+    let OperatorCommandResult::RunsPruned { removed } = control
+        .command(OperatorCommand::PruneRuns { cutoff })
+        .await?
+    else {
+        unreachable!("PruneRuns answers with RunsPruned");
+    };
     if removed == 0 {
         println!("No runs older than {}; nothing pruned.", local_time(cutoff));
     } else {
@@ -207,16 +193,24 @@ pub fn report_prune(removed: usize, cutoff: i64) {
             local_time(cutoff)
         );
     }
+    Ok(())
 }
 
 /// Resolve the `--keep N` form to a cutoff timestamp: keep the N most recent
 /// runs, returning the `started_at` of the first run to drop (everything older
 /// is pruned). `None` = fewer than N+1 runs exist, so there's nothing to prune.
-pub async fn run_keep_cutoff(db_url: &str, keep: usize) -> anyhow::Result<Option<i64>> {
-    let db = Db::connect(db_url).await?;
-    // `list` already returns most-recent-first; ask for one more than we keep so
+pub async fn run_keep_cutoff(
+    control: &OperatorControl,
+    keep: usize,
+) -> anyhow::Result<Option<i64>> {
+    // `Runs` already returns most-recent-first; ask for one more than we keep so
     // the (keep+1)-th run's start time becomes the cutoff.
-    let runs = RunRepository::list(&db, keep + 1).await?;
+    let OperatorQueryResult::Runs(runs) = control
+        .query(OperatorQuery::Runs { limit: keep + 1 })
+        .await?
+    else {
+        unreachable!("Runs query answers with Runs");
+    };
     Ok(runs.get(keep).map(|r| r.started_at))
 }
 
@@ -253,10 +247,10 @@ pub fn skill_list() -> anyhow::Result<()> {
 }
 
 /// List stored sessions with creation time and message counts.
-pub async fn session_list(db_url: &str) -> anyhow::Result<()> {
-    let sessions: Vec<SessionSummary> = match GatewayClient::try_connect().await {
-        Some(gw) => gw.sessions().await?,
-        None => session_summaries(SessionRepository::list(&Db::connect(db_url).await?).await?),
+pub async fn session_list(control: &OperatorControl) -> anyhow::Result<()> {
+    let OperatorQueryResult::Sessions(sessions) = control.query(OperatorQuery::Sessions).await?
+    else {
+        unreachable!("Sessions query answers with Sessions");
     };
 
     if sessions.is_empty() {
@@ -277,14 +271,11 @@ pub async fn session_list(db_url: &str) -> anyhow::Result<()> {
 
 /// Delete every session with zero messages. An operator action — run it by
 /// hand or from an external scheduler (launchd/cron), e.g. daily at 4am.
-pub async fn session_clean(db_url: &str) -> anyhow::Result<()> {
-    // Route through a running gateway (which holds the db lock) when up.
-    let removed = match GatewayClient::try_connect().await {
-        Some(gw) => gw.clean_sessions().await?,
-        None => {
-            let db = Db::connect(db_url).await?;
-            SessionRepository::delete_empty_sessions(&db).await?
-        }
+pub async fn session_clean(control: &OperatorControl) -> anyhow::Result<()> {
+    let OperatorCommandResult::SessionsCleaned { removed } =
+        control.command(OperatorCommand::CleanSessions).await?
+    else {
+        unreachable!("CleanSessions answers with SessionsCleaned");
     };
     println!("Removed {removed} empty session(s).");
     Ok(())
