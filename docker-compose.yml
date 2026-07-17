@@ -4,6 +4,15 @@
 #   docker compose up -d
 #   docker compose logs -f shion
 #
+# Credentials can live in either place:
+#   - ./data/.env — read by shion itself inside the container (dotenvy), or
+#   - the stack/shell environment (a Portainer/dockhand stack .env, or exported
+#     shell variables) — passed through via the credential entries below.
+# Note the compose project .env only interpolates ${VAR}s in this file; it
+# never reaches the container on its own, hence the explicit passthrough.
+# Omit unused credentials from the stack .env entirely — a blank `VAR=` line
+# still injects an empty string, which shadows the same key in ./data/.env.
+#
 # Override the image tag, timezone, or host directories with shell variables,
 # for example: SHION_TAG=v0.1.0 SHION_DATA_DIR=/srv/shion docker compose up -d
 
@@ -17,6 +26,20 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       SHION_HOME: /data
+      # Credential passthrough from the stack/shell environment. The null-value
+      # form matters: an unset variable is *removed* from the container env
+      # (rather than injected as ""), so it can never shadow ./data/.env —
+      # dotenvy skips variables that already exist, even empty ones.
+      DEEPSEEK_API_KEY:
+      OPENAI_API_KEY:
+      ANTHROPIC_API_KEY:
+      OPENROUTER_API_KEY:
+      FEISHU_APP_ID:
+      FEISHU_APP_SECRET:
+      TELEGRAM_BOT_TOKEN:
+      API_SERVER_KEY:
+      HASS_TOKEN:
+      HASS_URL:
     working_dir: /workspace
     volumes:
       # config.toml, .env, databases, logs, memories, and installed skills.
