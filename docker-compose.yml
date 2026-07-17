@@ -1,27 +1,38 @@
-# shion gateway on TrueNAS SCALE (or any Docker host).
+# Copy your Shion configuration to ./data/config.toml and secrets to
+# ./data/.env, then run:
 #
-# Usage in TrueNAS: Apps → Custom App → "Install via YAML" and paste this,
-# or `docker compose up -d` from a shell. The image is pulled from your
-# registry (see docs/truenas-docker.md for build + push).
+#   docker compose up -d
+#   docker compose logs -f shion
 #
-# No `ports:` — the gateway only makes outbound connections, so nothing needs
-# to be published or port-forwarded.
+# Override the image tag, timezone, or host directories with shell variables,
+# for example: SHION_TAG=v0.1.0 SHION_DATA_DIR=/srv/shion docker compose up -d
+
 services:
   shion:
-    image: ghcr.io/solren7/shion:latest
+    image: ghcr.io/solren7/shion:${SHION_TAG:-latest}
     container_name: shion
     restart: unless-stopped
+    pull_policy: always
+    init: true
     environment:
-      # Reminders, task-due notices, and the daily briefing fire on local time.
-      TZ: Asia/Shanghai
-      # SHION_HOME defaults to /data in the image. Put config.toml + .env on the
-      # mounted dataset below. Alternatively inject secrets here (these win over
-      # /data/.env — dotenvy never overwrites an already-set var), e.g.:
-      # DEEPSEEK_API_KEY: "sk-..."
-      # TELEGRAM_BOT_TOKEN: "..."
-      # HASS_TOKEN: "..."
-      # HASS_URL: "http://192.168.1.100:8123"
+      TZ: ${TZ:-Asia/Shanghai}
+      SHION_HOME: /data
+    working_dir: /workspace
     volumes:
-      # Replace <pool> with your TrueNAS pool/dataset path. This holds
-      # config.toml, .env, the three SQLite dbs, and logs/.
-      - /mnt/<pool>/apps/shion:/data
+      # config.toml, .env, databases, logs, memories, and installed skills.
+      - ${SHION_DATA_DIR:-./data}:/data
+      # Files that the agent's file and shell tools are allowed to work with.
+      - ${SHION_WORKSPACE_DIR:-./workspace}:/workspace
+    stop_grace_period: 30s
+
+    # The gateway needs no published port for Telegram, Feishu, WeChat, or
+    # Home Assistant. To expose Shion's HTTP API, first configure:
+    #
+    #   [channels.api]
+    #   enabled = true
+    #   bind = "0.0.0.0"
+    #   port = 8765
+    #
+    # in ./data/config.toml, set API_SERVER_KEY in ./data/.env, then uncomment:
+    # ports:
+    #   - "127.0.0.1:${SHION_API_PORT:-8765}:8765"
