@@ -22,24 +22,37 @@ incremental pushes recompile just what changed.
 ## 1. Git server (Forgejo)
 
 Deploy Forgejo as an ordinary Dockhand stack (Gitea works identically —
-Dockhand's webhook support names both):
+Dockhand's webhook support names both). The `15` tag tracks the current LTS
+line (supported into 2027); bump the major deliberately, not via `latest`:
 
 ```yaml
+# Set FORGEJO_HOST to the NAS's LAN IP (or hostname) in the stack's
+# environment — it only affects the clone/webhook URLs Forgejo displays.
 services:
   forgejo:
-    image: codeberg.org/forgejo/forgejo:latest
+    image: codeberg.org/forgejo/forgejo:15
+    container_name: forgejo
     restart: unless-stopped
     environment:
       USER_UID: "1000"
       USER_GID: "1000"
+      TZ: ${TZ:-Asia/Shanghai}
+      # Render correct clone URLs for the non-default ports.
+      FORGEJO__server__ROOT_URL: http://${FORGEJO_HOST:-nas.local}:3000/
+      FORGEJO__server__SSH_DOMAIN: ${FORGEJO_HOST:-nas.local}
+      FORGEJO__server__SSH_PORT: "2222"
+      # LAN git server for one person — no open signups. The first-run
+      # installer still creates the admin account.
+      FORGEJO__service__DISABLE_REGISTRATION: "true"
     volumes:
-      - /vol1/docker/forgejo:/data
+      - ${FORGEJO_DATA_DIR:-/vol1/docker/forgejo}:/data
     ports:
       - "3000:3000"   # web + http git
-      - "2222:22"     # ssh git
+      - "2222:22"     # ssh git (22 belongs to the NAS's own sshd)
 ```
 
-Create the `shion` repo in its web UI, then from the dev machine:
+Open `http://<nas>:3000`, finish the installer (SQLite is fine; create the
+admin account there), create the `shion` repo, then from the dev machine:
 
 ```bash
 git remote add nas ssh://git@<nas-ip>:2222/<user>/shion.git
