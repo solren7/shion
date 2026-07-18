@@ -1,4 +1,8 @@
-# syntax=docker/dockerfile:1
+# No `# syntax=docker/dockerfile:1` directive on purpose: it makes BuildKit
+# fetch the external dockerfile frontend image, which a locked-down registry
+# mirror (e.g. fnOS's docker.fnnas.com) 401s on. The daemon's built-in
+# frontend (Docker 23+) already supports the `RUN --mount=type=cache` used
+# below, so nothing here needs the external frontend.
 #
 # Multi-stage build for the shion gateway.
 #   builder : rust toolchain + protoc (feishu's protobuf is compiled at build
