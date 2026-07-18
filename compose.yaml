@@ -52,6 +52,13 @@ services:
       # Files that the agent's file and shell tools are allowed to work with.
       - ${SHION_WORKSPACE_DIR:-./workspace}:/workspace
     stop_grace_period: 30s
+    # Cap docker's own copy of stderr. The durable month of history lives in
+    # /data/logs/gateway.YYYY-MM-DD.log (daily files, 30 kept, self-pruning).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
     # The gateway needs no published port for Telegram, Feishu, WeChat, or
     # Home Assistant. To expose Shion's HTTP API, first configure:

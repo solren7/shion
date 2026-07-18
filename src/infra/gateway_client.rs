@@ -63,18 +63,22 @@ impl GatewayClient {
             .build()
             .ok()?;
         let base = info.base_url();
-        let ok = http
-            .get(format!("{base}/health"))
-            .timeout(PROBE_TIMEOUT)
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
-        ok.then(|| GatewayClient {
+        Self::health_ok(&http, &base).await.then(|| GatewayClient {
             base,
             key: info.key,
             http,
         })
+    }
+
+    /// One quick unauthenticated `/health` probe. Shared by [`from_info`] and
+    /// `shion health` (the Docker HEALTHCHECK command).
+    pub async fn health_ok(http: &reqwest::Client, base: &str) -> bool {
+        http.get(format!("{base}/health"))
+            .timeout(PROBE_TIMEOUT)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
     }
 
     fn url(&self, path: &str) -> String {

@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 
 use super::{
-    doctor, dream, gateway, init, inspect, journey, logs, memory, model, pair, policy, resume,
-    service, skill, upgrade, wechat, workday,
+    doctor, dream, gateway, health, init, inspect, journey, logs, memory, model, pair, policy,
+    resume, service, skill, upgrade, wechat, workday,
 };
 
 #[derive(Parser)]
@@ -83,6 +83,9 @@ enum Commands {
     },
     /// Config & gateway health: model, schedules, channels, home, recent failures
     Doctor,
+    /// One-line gateway liveness probe (exit 0 = healthy). This is the Docker
+    /// HEALTHCHECK command; `doctor` is the full human report.
+    Health,
     /// Manage channel pairing: unknown senders must be approved from this
     /// host before the agent talks to them
     Pair {
@@ -441,6 +444,7 @@ pub async fn run() -> anyhow::Result<()> {
             journey::journey(&operator(&config).await?, limit, since).await
         }
         Commands::Doctor => doctor::doctor(&config, &operator(&config).await?).await,
+        Commands::Health => health::run().await,
         Commands::Pair { action } => {
             let control = operator(&config).await?;
             match action {

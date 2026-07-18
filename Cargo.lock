@@ -4425,6 +4425,7 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "toml",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "turso",
  "unicode-width 0.2.2",

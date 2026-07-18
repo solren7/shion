@@ -53,14 +53,43 @@ fn init_tracing() {
     // The chat TUI owns the terminal (alternate screen): a stderr log line
     // would tear the display, so route tracing to a file for that mode.
     // Falls back to stderr if the log file can't be opened.
+    //
+    // The gateway tees stderr with a daily-rotated file in ~/.shion/logs
+    // (`gateway.YYYY-MM-DD.log`, 30 files kept, older ones auto-deleted):
+    // stderr keeps `docker logs` / launchd capture working, the dated files
+    // are the durable month of history `shion logs` reads.
     let writer = if will_run_tui() {
         open_tui_log()
             .map(|f| fmt::writer::BoxMakeWriter::new(std::sync::Mutex::new(f)))
             .unwrap_or_else(|| fmt::writer::BoxMakeWriter::new(std::io::stderr))
+    } else if std::env::args().nth(1).as_deref() == Some("gateway") {
+        match open_gateway_log() {
+            Some(daily) => {
+                use tracing_subscriber::fmt::writer::MakeWriterExt;
+                fmt::writer::BoxMakeWriter::new((std::io::stderr).and(daily))
+            }
+            None => fmt::writer::BoxMakeWriter::new(std::io::stderr),
+        }
     } else {
         fmt::writer::BoxMakeWriter::new(std::io::stderr)
     };
     let _ = fmt().with_env_filter(filter).with_writer(writer).try_init();
+}
+
+/// Daily-rotating gateway log under `~/.shion/logs`, one file per day
+/// (`gateway.YYYY-MM-DD.log`), a month of history kept — the appender deletes
+/// older files itself. `None` (e.g. unwritable dir) degrades to stderr-only.
+fn open_gateway_log() -> Option<tracing_appender::rolling::RollingFileAppender> {
+    const KEEP_DAYS: usize = 30;
+    let dir = config::ensure_shion_home().join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("gateway")
+        .filename_suffix("log")
+        .max_log_files(KEEP_DAYS)
+        .build(dir)
+        .ok()
 }
 
 /// Whether this invocation will run the full-screen chat TUI (`shion chat` /

@@ -47,6 +47,7 @@ shion skill audit <name>           # which turns loaded this skill (derived from
 shion policy list                  # resolved permission-policy rules (as the approver applies them)
 shion policy check <cat> <target>  # dry-run one action: verdict + deciding rule ([--channel c] [--dangerous] [--write])
 shion doctor                       # config & gateway health: model+key, schedules, policy, channels, home, recent failures
+shion health                       # one-line gateway liveness probe (exit 0 = healthy; the Docker HEALTHCHECK command)
 
 shion channel wechat login               # provision WeChat iLink creds by scanning a QR (run on the host)
 
@@ -56,7 +57,10 @@ shion workday [YYYY-MM-DD]          # is a date a Chinese working day? (statutor
 Logs: a `tracing` subscriber is installed in `main.rs` (`init_tracing`) — without
 it every `info!`/`warn!`/`debug!` is a silent no-op. Output goes to stderr
 (launchd captures the gateway's via the plist's `StandardErrorPath` →
-`~/.shion/logs/gateway.err.log`). Level is `SHION_LOG` (e.g. `SHION_LOG=debug`),
+`~/.shion/logs/gateway.err.log`; Docker reads it via `docker logs`), and the
+gateway additionally tees into a daily-rotated file
+(`~/.shion/logs/gateway.YYYY-MM-DD.log`, 30 files kept, the appender deletes
+older ones — `main.rs::open_gateway_log`), which is what `shion logs` reads. Level is `SHION_LOG` (e.g. `SHION_LOG=debug`),
 defaulting to `info,toasty=warn,rig_core=warn` (shion's own logs at info; ORM
 schema chatter muted; and rig's `prompt_request` INFO events muted — they log
 every tool call's *full result* verbatim, a wall of text for any list-returning

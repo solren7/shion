@@ -3,6 +3,7 @@ mod approver;
 mod doctor;
 mod dream;
 mod gateway;
+mod health;
 mod init;
 mod inspect;
 mod journey;

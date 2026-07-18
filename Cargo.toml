@@ -64,6 +64,7 @@ unicode-width = "0.2.2"
 # Markdown rendering for agent replies in the chat TUI (0.12 = what the local
 # registry cache holds; crates.io is unreachable from this network).
 pulldown-cmark = { version = "0.12", default-features = false }
+tracing-appender = "0.2.5"
 
 [dev-dependencies]
 # `test-util` (not part of tokio's `full`) enables `#[tokio::test(start_paused)]`,

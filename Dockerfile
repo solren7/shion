@@ -15,7 +15,8 @@
 #
 # Build for the NAS's architecture, NOT your laptop's. On Apple Silicon:
 #   docker buildx build --platform linux/amd64 -t ghcr.io/solren7/shion:latest --push .
-# See docs/truenas-docker.md.
+# Deployment lives in compose.yaml (registry pull by default; a Dockhand git
+# stack sets SHION_PULL_POLICY=build to build natively on the NAS).
 
 # ---- builder ----------------------------------------------------------------
 FROM rust:trixie AS builder
@@ -57,5 +58,11 @@ VOLUME ["/data"]
 # — no inbound port to EXPOSE. `shion gateway` runs in the foreground; Docker's
 # restart policy replaces launchd. One-off CLI ops bypass the entrypoint, e.g.
 #   docker exec shion shion pair approve <code>
+
+# "Running" ≠ alive: probe the gateway's loopback /health (via the rendezvous
+# file in $SHION_HOME) so a wedged gateway flips the container unhealthy.
+HEALTHCHECK --interval=60s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["shion", "health"]
+
 ENTRYPOINT ["shion"]
 CMD ["gateway"]
