@@ -14,7 +14,7 @@
 # See docs/truenas-docker.md.
 
 # ---- builder ----------------------------------------------------------------
-FROM rust:1-bookworm AS builder
+FROM rust:trixie AS builder
 
 # protoc for lark-websocket-protobuf's build script. `libprotobuf-dev` is
 # required too: it ships the well-known protos (google/protobuf/descriptor.proto)
@@ -36,7 +36,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/shion /usr/local/bin/shion
 
 # ---- runtime ----------------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tzdata libssl3 \
