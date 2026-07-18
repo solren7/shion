@@ -34,7 +34,7 @@ Everything boots without a key — the gateway starts and channels serve — but
 agent turns reply with a "key not set" pointer until one is configured.
 
 Inside chat, `/new` (or `/clear` / `/reset`) starts a fresh session. History and
-the run ledger are stored in `~/.shion/shion.db`.
+the run ledger are stored in `~/.shion/state.db`.
 
 ```bash
 shion session list               # stored sessions with message counts
@@ -95,14 +95,14 @@ Everything lives in `~/.shion/` by default, or under `SHION_HOME` when set.
 
 | File | Purpose |
 |---|---|
-| `shion.db` | disposable session state: messages, todos, pairings, settings, reminders, run ledger |
+| `state.db` | disposable session state: messages, todos, pairings, settings, reminders, run ledger |
 | `kanban.db` | durable cross-session tasks |
 | `memory.db` | durable long-term memories |
 | `skills/` | durable governed skills (`SKILL.md` files; reviewer proposals in `skills/.candidates/`) |
 | `config.toml` | provider/model/channel behavior |
 | `.env` | API keys and channel credentials |
 
-Delete `shion.db` freely to reset development state. Do not delete `kanban.db`,
+Delete `state.db` freely to reset development state. Do not delete `kanban.db`,
 `memory.db`, or `skills/` unless you intend to wipe durable personal data.
 
 ## Configuration
@@ -231,7 +231,7 @@ src/
 │   └── skill_registry.rs  # live runtime view over the skill dirs
 ├── infra/                 # I/O implementations
 │   ├── llm.rs · codex.rs · rig_tool.rs       # rig backend + Codex OAuth provider
-│   ├── persistence/       # toasty/Turso: shion.db + kanban.db
+│   ├── persistence/       # toasty/Turso: state.db + kanban.db
 │   ├── memory/            # memory.db (+ legacy markdown import)
 │   ├── messaging/         # feishu · telegram · wechat · homeassistant · api · notifiers
 │   └── skills.rs · skill_install.rs · gateway_client.rs · rendezvous.rs · workday.rs
@@ -258,7 +258,7 @@ To reset after schema changes, delete the affected database file:
 
 - `TaskRecord` changes: `~/.shion/kanban.db`
 - `MemoryRecord` changes: `~/.shion/memory.db`
-- other toasty models: `~/.shion/shion.db`
+- other toasty models: `~/.shion/state.db`
 
 ## Roadmap
 

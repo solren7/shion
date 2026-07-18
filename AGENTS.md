@@ -9,7 +9,7 @@ Guidance for coding agents (Claude Code and others) working in this repository.
 cargo check                        # fast compile check
 cargo build                        # build
 shion init                         # bootstrap ~/.shion: default config.toml + .env template (never overwrites)
-cargo run -- chat                  # interactive chat: full-screen TUI (needs a terminal; scripts use the api channel) (db at ~/.shion/shion.db)
+cargo run -- chat                  # interactive chat: full-screen TUI (needs a terminal; scripts use the api channel) (db at ~/.shion/state.db)
 cargo run -- gateway               # always-on process: maintenance sweeps + ingress channels (feishu, telegram, wechat)
 cargo test                         # run all tests
 cargo test tools::time             # run a single test module
@@ -70,21 +70,21 @@ line (name/seq/elapsed, no result), so live logs still line up with the
 persisted run ledger. Set `SHION_LOG=debug` (or `rig_core=info`) to see the full
 tool results again.
 
-`~/.shion/shion.db` is disposable developer state (sessions, messages, session
+`~/.shion/state.db` is disposable developer state (sessions, messages, session
 todos, skills, reminders, pairings, settings, **run ledger**) — delete it freely
 to reset.
 Two kinds of **durable personal data live in their own files** so resetting
-`shion.db` never wipes them: cross-session **tasks in `~/.shion/kanban.db`**
+`state.db` never wipes them: cross-session **tasks in `~/.shion/kanban.db`**
 (`infra/persistence/kanban.rs`) and long-term **memories in `~/.shion/memory.db`**
 (`infra/memory/memory_db.rs`). After a schema change on **disposable** state,
 delete the affected file — `push_schema` only runs for newly created database
 files: a `TaskRecord` change means deleting `kanban.db`, any other model means
-`shion.db` (e.g. a `RunRecord`/`RunStepRecord` change — the run ledger lives in
-`shion.db`). **Column additions can skip the reset**: the shared
+`state.db` (e.g. a `RunRecord`/`RunStepRecord` change — the run ledger lives in
+`state.db`). **Column additions can skip the reset**: the shared
 `infra/persistence/mod.rs::ensure_columns` runs an additive `ALTER TABLE ADD
 COLUMN` in place on connect — `memory.db` uses it for every `MemoryRecord`
 column (durable data must never need a reset; extend the `EXPECTED` list in
-`memory_db.rs`), and `shion.db` uses it for `SessionRecord` columns (see
+`memory_db.rs`), and `state.db` uses it for `SessionRecord` columns (see
 `SESSION_COLUMNS` in `db.rs::connect` — extend it when adding a column, so an
 upgraded gateway doesn't hard-fail on the old file until someone remembers to
 delete it). Columns must be NOT NULL with a DEFAULT, or nullable. A new *table*
@@ -270,17 +270,17 @@ clarify/resume next) live.
 
 `infra/` is layered by concern: `infra/messaging/` (ingress channels, outbound
 senders, proactive notifiers), `infra/memory/` (the memory.db connection +
-legacy markdown store), `infra/persistence/` (the toasty-backed shion.db /
+legacy markdown store), `infra/persistence/` (the toasty-backed state.db /
 kanban.db connections), and two cross-cutting files at the top level —
 `infra/llm.rs` (LLM backend) and `infra/rig_tool.rs` (the Tool→rig adapter).
 
 `infra/persistence/db.rs` + `infra/persistence/kanban.rs` + `infra/memory/memory_db.rs` — the only places toasty (ORM) appears. The backend is the **Turso engine** (`toasty-driver-turso`, the pure-Rust SQLite rewrite — no `rusqlite`/C dep), opened in **MVCC concurrent-write mode** (`Turso::file(p).concurrent_writes()`)
-- `Db` (`infra/persistence/db.rs`) holds `Arc<toasty::Db>` over `shion.db`; implements every repository trait *except* `TaskRepository`/`MemoryRepository`/`SkillRepository` (sessions, messages, reminders, session todos, pairings, settings, the **run ledger** `RunRepository`). Skills moved to files (`infra/skills.rs`); the `SkillRecord` table stays in the schema only so `export_legacy_skills` can read old dbs for the one-time candidate import
-- `KanbanDb` (`infra/persistence/kanban.rs`) is a second, independent connection over `kanban.db`; it holds only `TaskRecord` and implements `TaskRepository`. Separate file = durable tasks survive a `shion.db` reset
+- `Db` (`infra/persistence/db.rs`) holds `Arc<toasty::Db>` over `state.db`; implements every repository trait *except* `TaskRepository`/`MemoryRepository`/`SkillRepository` (sessions, messages, reminders, session todos, pairings, settings, the **run ledger** `RunRepository`). Skills moved to files (`infra/skills.rs`); the `SkillRecord` table stays in the schema only so `export_legacy_skills` can read old dbs for the one-time candidate import
+- `KanbanDb` (`infra/persistence/kanban.rs`) is a second, independent connection over `kanban.db`; it holds only `TaskRecord` and implements `TaskRepository`. Separate file = durable tasks survive a `state.db` reset
 - `MemoryDb` (`infra/memory/memory_db.rs`) is a third, independent connection over `memory.db`; it holds only `MemoryRecord` and implements `MemoryRepository`. On first run it seeds itself from legacy `~/.shion/memory/*.md` via `import_legacy_markdown` (no-op once populated)
 - **connection pool, no global lock**: `toasty::Db` is itself a deadpool-backed pool, so each repository method does `self.inner.connection().await?` and runs on its own pooled `Connection` (`Connection: Executor`) — independent reads/writes run concurrently. No `Arc<Mutex>`. Pool size is `DEFAULT_POOL_SIZE` (`infra/persistence/mod.rs`)
 - **MVCC writes retry**: under `concurrent_writes`, conflicting commits fail and must be retried by the caller. Every **single-write** mutating repository method (the run ledger — a round's tool calls run in parallel — plus message/task/memory saves, and the skill/reminder/session-todo/pairing/home upserts) wraps its body in `with_write_retry` (`infra/persistence/mod.rs`), which re-runs the whole closure on a busy/conflict error. **Multi-write** methods (`rotate`, `prune`, `reconcile_interrupted`, pairing `approve_code`) wrap their statements in a real toasty transaction (`conn.transaction()` → `.commit()`; drop = rollback) *inside* `with_write_retry` — so a mid-sequence failure or lost MVCC commit rolls the whole sequence back and the retry re-runs it cleanly, never double-applying. (`delete_empty_sessions` stays a plain loop — its per-row deletes are independent and idempotent.) `SessionRepository::save` is an idempotent create: it pre-checks existence and inserts only when absent (retrying conflicts), rather than the old `let _ = create!(…)` that swallowed *every* error — including a conflict that left the session uncreated and the next message save failing with a phantom "session not found". MVCC rejects `AUTOINCREMENT`, so every key is a `String` (UUIDv7 via `uuid::Uuid::now_v7()`), never `#[auto]`
-- **sqlite→turso migration**: a legacy rusqlite-written file is staged aside to `<name>.sqlite-backup` (`stage_sqlite_backup`), its rows extracted via the still-enabled `sqlite` driver and reloaded into a fresh Turso db, then a `<name>.turso` marker is written so it never re-migrates. Durable data (memory.db, kanban.db) migrates its rows; disposable `shion.db` is just staged aside and rebuilt. Both `sqlite` and `turso` toasty features stay enabled (the former only to read backups)
+- **sqlite→turso migration**: a legacy rusqlite-written file is staged aside to `<name>.sqlite-backup` (`stage_sqlite_backup`), its rows extracted via the still-enabled `sqlite` driver and reloaded into a fresh Turso db, then a `<name>.turso` marker is written so it never re-migrates. Durable data (memory.db, kanban.db) migrates its rows; disposable `state.db` is just staged aside and rebuilt. Both `sqlite` and `turso` toasty features stay enabled (the former only to read backups)
 - all: `connect(url)` checks if the db file exists; calls `push_schema()` only for new databases (toasty's `push_schema` is not idempotent — no `IF NOT EXISTS`; adding a table to an existing file means deleting it, or the `.sqlite-backup`/`.turso` sidecars, to rebuild)
 - toasty model structs are private to their file
 - DB URL format: `turso:<path>` (single colon); `turso::memory:` for in-memory. The old `sqlite:<path>` form is still understood by the migration's backup reader
@@ -343,10 +343,10 @@ kanban.db connections), and two cross-cutting files at the top level —
 - **Dreaming / consolidation** (OpenClaw-borrowed, on by default — nightly `0 3 * * *`, set `dream_schedule = "off"` to disable): `domain::memory::dream_verdict`/`dream_score` decide each **candidate**'s fate purely from accumulated usage — recalled ≥`DREAM_MIN_RECALL_COUNT`(3) **by ≥`DREAM_MIN_UNIQUE_QUERIES`(2) lexically-distinct queries** (the `recall_query_hashes` fingerprints — OpenClaw's `minUniqueQueries`; one repeated question can no longer pump a candidate to active on count alone, and pre-fingerprint candidates wait until diversity accrues) within `DREAM_FORGET_AGE_DAYS`(30) and scoring ≥`DREAM_PROMOTE_MIN_SCORE` → promote to `Active`+`Inferred` (recallable, but still **not** L1-pinnable — pinning stays confirmed-only/manual); old + never recalled → `Archived`. `agent::daemon::DreamSweep` applies it (scheduled via `dream_schedule`, wired in `cli/gateway.rs`; `shion dream [--apply]` is the operator preview/run, showing `recalls=/queries=` per candidate). Only candidates are touched — active/user-saved memories are left to the operator (`shion memory report`). Importance is proven by use, not guessed at write time. Reviewer/`memory`-tool write guidance follows Hermes: declarative facts not instructions, nothing stale-in-a-week; the `memory` tool reports the L1 pinned-budget usage% on save/list to nudge self-curation
 
 `domain/run.rs` + `RunRepository` (impl in `infra/persistence/db.rs`) — the **run ledger**: an execution/audit record of every agent turn (roadmap §7)
-- one `Run` per turn (`id`, `session_id`, `input`, `plan` summary, `status` running/done/failed, `final_output`, `error`, timestamps) and one `RunStep` per tool call (`seq`, `tool_name`, `args`, `result`, `error`, `ok`, timestamps). Lives in `shion.db` — execution state bound to a session, disposable like messages, **not** durable personal data
+- one `Run` per turn (`id`, `session_id`, `input`, `plan` summary, `status` running/done/failed, `final_output`, `error`, timestamps) and one `RunStep` per tool call (`seq`, `tool_name`, `args`, `result`, `error`, `ok`, timestamps). Lives in `state.db` — execution state bound to a session, disposable like messages, **not** durable personal data
 - steps are captured inside the tool executor (see `services/tool_execution/`), so the ledger covers every executed call. `RunContext` carries a shared `seq` counter so steps order stably even across the tool's spawned task
 - every write is best-effort (warn-logged, never fails a turn or a tool) — same contract as memory `mark_used`
-- **redaction**: step `args` are stored verbatim *except* each `Tool` may scrub its own via `Tool::redact_args` (default identity) — `shell` strips secret-looking substrings (`key=value`, `Bearer`, `--password`, high-entropy tokens), `file` drops the write `content` body. `result` is truncated but not scrubbed (shell *output* can still contain secrets — accepted, `shion.db` is local/disposable). Fields are length-capped (`RUN_FIELD_CAP`/`STEP_FIELD_CAP`)
+- **redaction**: step `args` are stored verbatim *except* each `Tool` may scrub its own via `Tool::redact_args` (default identity) — `shell` strips secret-looking substrings (`key=value`, `Bearer`, `--password`, high-entropy tokens), `file` drops the write `content` body. `result` is truncated but not scrubbed (shell *output* can still contain secrets — accepted, `state.db` is local/disposable). Fields are length-capped (`RUN_FIELD_CAP`/`STEP_FIELD_CAP`)
 - aux sub-agents and maintenance sweeps run without a `RunContext`, so their tool use never enters the ledger
 - operator view: `shion run list [--limit N]` / `shion run inspect <id>` (`cli/inspect.rs`)
 - **resume** (roadmap §6): the ledger is an audit record, not a checkpoint — intermediate assistant turns are never persisted and step args are redacted/truncated, so faithful mid-loop replay is impossible by design. Instead `shion run resume [<id>]` (`cli/resume.rs`) re-dispatches one *fresh* turn in the interrupted run's session, primed by `domain::run::resume_prompt` (original input + a digest of completed steps, elided past `RESUME_DIGEST_CAP`); the model judges which side effects took hold, and new side effects go through approval as usual. `recoverable` is the resumable marker: set by `reconcile_interrupted` (gateway startup flips crash-residue `Running` runs to `Failed`/interrupted), cleared by `mark_resumed` after a resume dispatches (at-most-once), shown as `⟲` in `run list`. Only interruption makes a run recoverable — an ordinary `Failed` has no half-done steps worth handing over. While the gateway holds the db lock the whole action routes to `POST /api/runs/{id}/resume` (trusted for loopback callers, same rule as chat); otherwise the turn runs in-process like `shion chat` with `CliApprover`. No automatic resume: replaying half-done side effects unattended is not acceptable — resume is always an explicit operator action

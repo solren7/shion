@@ -1,4 +1,4 @@
-//! Persistence infra: the toasty-backed connections (shion.db, kanban.db),
+//! Persistence infra: the toasty-backed connections (state.db, kanban.db),
 //! now over the Turso engine with a per-operation connection pool.
 pub mod db;
 pub mod kanban;
@@ -106,7 +106,7 @@ pub(crate) fn prepare_turso_path(url: &str) -> anyhow::Result<(Option<PathBuf>, 
 /// move it aside to its `.sqlite-backup` so Turso opens a fresh db at `path`.
 /// Idempotent: a no-op once a marker or backup exists, or the file is absent.
 /// Callers that preserve data re-import from the backup afterward (memory db);
-/// callers over disposable data (shion.db) just leave the backup as a safety net.
+/// callers over disposable data (state.db) just leave the backup as a safety net.
 pub(crate) fn stage_sqlite_backup(path: &Path) -> anyhow::Result<()> {
     let marker = turso_marker_path(path);
     let backup = sqlite_backup_path(path);

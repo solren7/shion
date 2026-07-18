@@ -13,7 +13,7 @@
 - `reminder` 支持一次性提醒和 5 字段 cron 周期提醒，由 gateway 每分钟扫描投递。
 - `gateway` 已具备常驻进程、launchd 安装、维护任务调度、chat 交互式审批和 proactive home channel。
 - ingress channel 已落地：Feishu、Telegram、WeChat、Home Assistant 事件通道；聊天通道带 pairing / allowlist，HA 是受 `HASS_TOKEN` 保护的本地事件入口。
-- durable task 存在独立 `~/.shion/kanban.db`；long-term memory 存在独立 `~/.shion/memory.db`；session/message/run/todo 等 disposable 状态仍在 `~/.shion/shion.db`。
+- durable task 存在独立 `~/.shion/kanban.db`；long-term memory 存在独立 `~/.shion/memory.db`；session/message/run/todo 等 disposable 状态仍在 `~/.shion/state.db`。
 - reflective reviewer 已能提取 candidate memories 和 commitments；承诺会进入 task inbox。
 - memory 已有 L1 pinned profile、L2 governance tool、L3 active recall。
 - run ledger 已记录每个 turn 和每次工具调用，CLI 可 `shion run list/inspect`。

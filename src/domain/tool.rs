@@ -80,7 +80,7 @@ pub trait Tool: Send + Sync {
     /// Sanitize the raw arguments before they are written to the run ledger
     /// (`services::tool_execution`). The ledger stores tool
     /// args verbatim by default (this identity impl); tools carrying sensitive
-    /// payloads override it so secrets/large bodies never land in `shion.db`.
+    /// payloads override it so secrets/large bodies never land in `state.db`.
     /// `shell` scrubs secret-looking substrings, `file` drops write bodies.
     fn redact_args(&self, args: &str) -> String {
         args.to_string()

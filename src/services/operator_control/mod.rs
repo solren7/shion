@@ -186,7 +186,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         StoreUrls {
-            db: format!("turso:{}", dir.join("shion.db").display()),
+            db: format!("turso:{}", dir.join("state.db").display()),
             kanban: format!("turso:{}", dir.join("kanban.db").display()),
             memory: format!("turso:{}", dir.join("memory.db").display()),
         }

@@ -49,7 +49,7 @@ RUN apt-get update \
 
 COPY --from=builder /usr/local/bin/shion /usr/local/bin/shion
 
-# All durable state (config.toml, .env, shion.db / kanban.db / memory.db, logs)
+# All durable state (config.toml, .env, state.db / kanban.db / memory.db, logs)
 # lives here — mount a TrueNAS dataset to it so nothing is lost on redeploy.
 ENV SHION_HOME=/data
 VOLUME ["/data"]

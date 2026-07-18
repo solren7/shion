@@ -1,8 +1,8 @@
 //! The kanban store: durable cross-session tasks, in their **own** SQLite file
-//! (`~/.shion/kanban.db`), separate from the session/message db (`shion.db`).
+//! (`~/.shion/kanban.db`), separate from the session/message db (`state.db`).
 //!
 //! Sessions, messages, and the session-scoped todo are disposable developer
-//! state — `shion.db` is documented as deletable to reset, and a toasty schema
+//! state — `state.db` is documented as deletable to reset, and a toasty schema
 //! change forces deleting it. Kanban tasks are real personal data that must
 //! survive that reset, so they live in a separate file with an independent
 //! lifecycle. `KanbanDb` is the only place toasty appears for tasks (mirroring

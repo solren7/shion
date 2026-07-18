@@ -180,7 +180,7 @@ pub struct Db {
 
 impl Db {
     pub async fn connect(url: &str) -> anyhow::Result<Self> {
-        // `url` is `turso:<path>` (or `turso::memory:`). shion.db is disposable
+        // `url` is `turso:<path>` (or `turso::memory:`). state.db is disposable
         // (sessions, messages, runs, pairings, settings): a legacy SQLite file
         // can't be reopened under Turso's MVCC mode, so `prepare_turso_path`
         // stages it aside to a `.sqlite-backup` (kept as a safety net) and we
@@ -1762,7 +1762,7 @@ mod tests {
         );
     }
 
-    /// A shion.db created before `reviewed_through` existed must gain the
+    /// A state.db created before `reviewed_through` existed must gain the
     /// column **in place** on connect (additive ALTER, like memory.db's
     /// ensure_columns) — an upgraded gateway must not hard-fail every session
     /// query until the operator remembers the delete-to-reset convention.
@@ -1834,7 +1834,7 @@ mod tests {
         assert_eq!(c.reviewed_through, 1);
     }
 
-    /// A shion.db created before `recoverable` existed must gain the column
+    /// A state.db created before `recoverable` existed must gain the column
     /// **in place** on connect, like `reviewed_through` above — otherwise an
     /// upgraded gateway 500s every run-ledger read ("no such column:
     /// recoverable") until the operator remembers the delete-to-reset.

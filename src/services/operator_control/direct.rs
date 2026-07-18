@@ -46,7 +46,7 @@ impl DirectOperatorAdapter {
         }
     }
 
-    /// The session/run/pairing store (`shion.db`), opened on first use.
+    /// The session/run/pairing store (`state.db`), opened on first use.
     pub(super) async fn db(&self) -> anyhow::Result<&Arc<Db>> {
         self.db
             .get_or_try_init(|| async { Ok(Arc::new(Db::connect(&self.urls.db).await?)) })

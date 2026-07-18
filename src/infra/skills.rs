@@ -3,7 +3,7 @@
 //!
 //! Skills are durable personal data (peers of memory/kanban), so they live as
 //! `SKILL.md` files under `~/.shion/skills/<name>/`, not in the disposable
-//! `shion.db`. Files are editable, shareable, and lock-free: every governance
+//! `state.db`. Files are editable, shareable, and lock-free: every governance
 //! action works while the gateway holds the Turso db lock.
 //!
 //! Layout under the root:

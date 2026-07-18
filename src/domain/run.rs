@@ -3,7 +3,7 @@
 //! [`RunStep`] per tool invocation (captured at the single choke point every
 //! tool call funnels through, the tool executor (`services::tool_execution`)).
 //!
-//! Runs are execution state bound to a session, so they live in `shion.db`
+//! Runs are execution state bound to a session, so they live in `state.db`
 //! (disposable dev state) alongside sessions/messages — not in the durable
 //! kanban/memory files. Every ledger write is best-effort: it must never fail a
 //! turn or a tool call (same contract as memory `mark_used`).

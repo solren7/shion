@@ -1,8 +1,8 @@
 //! The memory store: durable long-term memories in their **own** SQLite file
-//! (`~/.shion/memory.db`), separate from the disposable session db (`shion.db`)
+//! (`~/.shion/memory.db`), separate from the disposable session db (`state.db`)
 //! and the task db (`kanban.db`).
 //!
-//! Memories are real personal data that must survive a `shion.db` reset, so —
+//! Memories are real personal data that must survive a `state.db` reset, so —
 //! like `KanbanDb` — they live in an independent file. `MemoryDb` is the only
 //! place toasty appears for memories. Markdown (`infra/md_memory.rs`) is kept
 //! as an import/export format, not the canonical backend.

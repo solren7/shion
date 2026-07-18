@@ -59,7 +59,7 @@ const DEFAULT_API_PORT: u16 = 8765;
 pub struct RuntimeConfig {
     /// The `~/.shion` home directory the snapshot was resolved against.
     pub home: PathBuf,
-    /// `turso:` URL of the disposable session/state db (`shion.db`).
+    /// `turso:` URL of the disposable session/state db (`state.db`).
     pub db_url: String,
     /// `turso:` URL of the durable task db (`kanban.db`).
     pub kanban_db_url: String,
@@ -448,7 +448,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
 
     let db_url = |file: &str| format!("turso:{}", home.join(file).display());
     let runtime = RuntimeConfig {
-        db_url: db_url("shion.db"),
+        db_url: db_url("state.db"),
         kanban_db_url: db_url("kanban.db"),
         memory_db_url: db_url("memory.db"),
         home,
@@ -885,7 +885,7 @@ mod tests {
     #[test]
     fn db_urls_derive_from_home() {
         let snap = ConfigSnapshot::from_sources(with_deepseek_key(sources()));
-        assert_eq!(snap.runtime.db_url, "turso:/tmp/shion-test-home/shion.db");
+        assert_eq!(snap.runtime.db_url, "turso:/tmp/shion-test-home/state.db");
         assert_eq!(
             snap.runtime.kanban_db_url,
             "turso:/tmp/shion-test-home/kanban.db"

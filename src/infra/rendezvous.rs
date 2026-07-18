@@ -1,7 +1,7 @@
 //! Gateway rendezvous file (`~/.shion/gateway.json`).
 //!
 //! Turso takes an exclusive cross-process lock on each db file, so while the
-//! gateway runs it is the *sole* owner of `shion.db` / `kanban.db` /
+//! gateway runs it is the *sole* owner of `state.db` / `kanban.db` /
 //! `memory.db`. The CLI therefore can't open them directly — it has to route
 //! requests to the running gateway over the api channel's loopback HTTP. This
 //! file is how the CLI *discovers* that gateway: the gateway writes its bind
