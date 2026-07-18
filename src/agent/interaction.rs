@@ -38,6 +38,7 @@ use crate::{
         repository::SessionRepository,
         todo::SessionTodoRepository,
     },
+    services::clarify::ClarifyState,
     services::tool_execution::{SessionContext, current_session, with_session},
 };
 
@@ -331,6 +332,9 @@ pub fn classify(text: &str) -> Command {
 pub struct GatewayDispatcher {
     handler: Arc<dyn MessageHandler>,
     approvals: Arc<ApprovalState>,
+    /// Pending `ask_user` questions (mirrors `approvals`): a plain inbound
+    /// message resolves a pending question instead of starting a new turn.
+    clarify: Arc<ClarifyState>,
     sessions: Arc<dyn SessionRepository>,
     home: Arc<dyn HomeRepository>,
     todos: Arc<dyn SessionTodoRepository>,
@@ -360,6 +364,7 @@ impl GatewayDispatcher {
     pub fn new(
         handler: Arc<dyn MessageHandler>,
         approvals: Arc<ApprovalState>,
+        clarify: Arc<ClarifyState>,
         sessions: Arc<dyn SessionRepository>,
         home: Arc<dyn HomeRepository>,
         todos: Arc<dyn SessionTodoRepository>,
@@ -369,6 +374,7 @@ impl GatewayDispatcher {
         Self {
             handler,
             approvals,
+            clarify,
             sessions,
             home,
             todos,
@@ -406,6 +412,9 @@ impl GatewayDispatcher {
             }
             Command::New => {
                 self.approvals.clear(session_id);
+                // A pending clarify question belongs to the old conversation;
+                // its waiter reads the dropped sender as "no answer".
+                self.clarify.clear(session_id);
                 // The working todo list is session-scoped; a fresh conversation
                 // starts with an empty one. (The session id is reused across the
                 // rotate, so the row must be cleared explicitly.)
@@ -440,7 +449,17 @@ impl GatewayDispatcher {
                 let reply = self.handle_pair(action).await;
                 let _ = sink.send(&reply).await;
             }
-            Command::Plain(input) => self.spawn_turn(session_id, input, sink),
+            Command::Plain(input) => {
+                // A pending `ask_user` question eats the next plain message as
+                // its answer — the suspended turn continues with it; no new
+                // turn starts. Control commands above keep priority (`/deny`
+                // etc. never reach here), and a second message while the turn
+                // keeps running queues as usual via `spawn_turn`.
+                if self.clarify.resolve(session_id, &input) {
+                    return;
+                }
+                self.spawn_turn(session_id, input, sink)
+            }
         }
     }
 
@@ -592,6 +611,8 @@ impl GatewayDispatcher {
                 session: session.clone(),
                 armed: true,
             };
+            // Fresh clarify budget for this turn (and drop any stale question).
+            this.clarify.begin_turn(&session);
             // Catch a panic in the turn (LLM client, a repository, etc.) so a
             // single bad turn neither wedges the session nor loses the queued
             // follow-ups: the session is advanced normally below either way.
@@ -627,6 +648,8 @@ impl GatewayDispatcher {
         // "approved for session" set stays until `/new`).
         self.approvals.forget_pending(session);
         self.approvals.release_gate(session);
+        // Same for a clarify question the turn never resolved (+ its budget).
+        self.clarify.clear(session);
         let next = {
             let mut inflight = self.inflight.lock().unwrap();
             let Some(queue) = inflight.get_mut(session) else {
@@ -665,6 +688,7 @@ impl Drop for TurnGuard {
         if self.armed {
             self.dispatcher.approvals.forget_pending(&self.session);
             self.dispatcher.approvals.release_gate(&self.session);
+            self.dispatcher.clarify.clear(&self.session);
             let dropped = self
                 .dispatcher
                 .inflight
@@ -889,15 +913,75 @@ mod tests {
     }
 
     fn dispatcher_with(handler: Arc<GateHandler>) -> Arc<GatewayDispatcher> {
+        dispatcher_with_clarify(handler, Arc::new(ClarifyState::new()))
+    }
+
+    fn dispatcher_with_clarify(
+        handler: Arc<GateHandler>,
+        clarify: Arc<ClarifyState>,
+    ) -> Arc<GatewayDispatcher> {
         Arc::new(GatewayDispatcher::new(
             handler,
             Arc::new(ApprovalState::new()),
+            clarify,
             Arc::new(UnusedSessions),
             Arc::new(UnusedHome),
             Arc::new(UnusedTodos),
             None,
             Arc::new(UnusedPairings),
         ))
+    }
+
+    // A plain message answers a pending clarify question instead of starting a
+    // new turn; once nothing is pending, plain messages dispatch normally.
+    #[tokio::test]
+    async fn plain_message_resolves_pending_clarify_not_a_new_turn() {
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let permits = Arc::new(Semaphore::new(0));
+        let handler = Arc::new(GateHandler {
+            entered: entered_tx,
+            permits: permits.clone(),
+        });
+        let clarify = Arc::new(ClarifyState::new());
+        let dispatcher = dispatcher_with_clarify(handler, clarify.clone());
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
+
+        // A turn is suspended on a question.
+        let rx = clarify.register("s1");
+        dispatcher.handle("s1", "蓝色的".into(), sink.clone()).await;
+        assert_eq!(rx.await.unwrap(), "蓝色的", "message became the answer");
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "the answer must not start a new turn"
+        );
+
+        // With nothing pending, the next message dispatches a turn as usual.
+        dispatcher.handle("s1", "next".into(), sink.clone()).await;
+        assert_eq!(next_entered(&mut entered_rx).await, "next");
+        permits.add_permits(1);
+    }
+
+    // Control commands keep priority over a pending clarify: `/deny` resolves
+    // the approval path and is never eaten as the question's answer.
+    #[tokio::test]
+    async fn commands_keep_priority_over_pending_clarify() {
+        let (entered_tx, _entered_rx) = mpsc::unbounded_channel();
+        let handler = Arc::new(GateHandler {
+            entered: entered_tx,
+            permits: Arc::new(Semaphore::new(0)),
+        });
+        let clarify = Arc::new(ClarifyState::new());
+        let dispatcher = dispatcher_with_clarify(handler, clarify.clone());
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
+
+        let _rx = clarify.register("s1");
+        dispatcher.handle("s1", "/deny".into(), sink.clone()).await;
+        assert!(
+            clarify.has_pending("s1"),
+            "/deny must not consume the clarify question"
+        );
     }
 
     /// Wait for the next entered input, failing the test on timeout so a wedge

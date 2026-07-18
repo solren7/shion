@@ -53,6 +53,13 @@ const REMINDER_GUIDANCE: &str = "You CAN schedule reminders: call the `reminder`
     expression via the `cron` parameter (e.g. \"0 9 * * *\"); times are the user's \
     local timezone. One-shot reminders use `after` or `at` as before.";
 
+/// Gated on the `ask_user` tool.
+const CLARIFY_GUIDANCE: &str = "When a key parameter is ambiguous, the target of an \
+    action is unclear, or an irreversible action's intent is uncertain, ask first: \
+    call `ask_user` with one specific question (mid-task — your progress is kept) \
+    instead of guessing. Do NOT ask about things you can safely infer, look up with \
+    your tools, or that barely matter — never interrogate.";
+
 /// Project instruction files searched in the working directory, first found wins.
 const CONTEXT_FILES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", ".cursorrules"];
 
@@ -157,6 +164,9 @@ impl SystemPromptBuilder {
         }
         if self.has("reminder") {
             parts.push(REMINDER_GUIDANCE.to_string());
+        }
+        if self.has("ask_user") {
+            parts.push(CLARIFY_GUIDANCE.to_string());
         }
 
         if let Some(note) = &self.skills_note {

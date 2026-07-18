@@ -81,7 +81,18 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
-    let status = if app.in_flight {
+    let status = if app.in_flight && app.awaiting_answer {
+        Line::from(vec![
+            Span::styled(
+                " ❓ 等待你的回答 — 直接输入并回车 ",
+                Style::new().fg(Color::Cyan),
+            ),
+            Span::styled(
+                format!("session {}", app.session_id),
+                Style::new().fg(Color::DarkGray),
+            ),
+        ])
+    } else if app.in_flight {
         Line::from(vec![
             Span::styled(
                 format!(" {} thinking… ", SPINNER[app.spinner % SPINNER.len()]),

@@ -184,6 +184,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     let dispatcher = Arc::new(GatewayDispatcher::new(
         handler.clone(),
         approvals,
+        wired.clarify.clone(),
         sessions,
         home_repo,
         todos,

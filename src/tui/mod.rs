@@ -29,10 +29,16 @@ use crate::{
     agent::runtime::AgentRuntime,
     cli::wiring,
     config::ConfigSnapshot,
-    domain::{approval::Approver, repository::SessionRepository, session::Session},
+    domain::{
+        approval::Approver, gateway::ReplySink, repository::SessionRepository, session::Session,
+    },
     infra::{
         gateway_client::GatewayClient,
         persistence::{db::Db, kanban::KanbanDb},
+    },
+    services::{
+        clarify::ClarifyState,
+        tool_execution::{SessionContext, with_session},
     },
 };
 
@@ -53,26 +59,52 @@ enum Backend {
 }
 
 impl Backend {
-    async fn turn(&self, session_id: &str, input: String) -> anyhow::Result<String> {
+    /// Run one turn. In local mode, `ctx` carries an interactive session
+    /// context (its sink feeds mid-turn messages — `ask_user` questions —
+    /// into the transcript); remote turns are handled server-side.
+    async fn turn(
+        &self,
+        session_id: &str,
+        input: String,
+        ctx: Option<SessionContext>,
+    ) -> anyhow::Result<String> {
         match self {
             Backend::Remote(gw) => gw.chat(session_id, &input).await,
-            Backend::Local { runtime, .. } => runtime.handle_input(session_id, input).await,
+            Backend::Local { runtime, .. } => match ctx {
+                Some(ctx) => with_session(ctx, runtime.handle_input(session_id, input)).await,
+                None => runtime.handle_input(session_id, input).await,
+            },
         }
+    }
+}
+
+/// A [`ReplySink`] that feeds mid-turn agent messages (the `ask_user`
+/// question) into the TUI event loop's channel for transcript rendering.
+struct ChannelSink {
+    tx: mpsc::UnboundedSender<String>,
+}
+
+#[async_trait::async_trait]
+impl ReplySink for ChannelSink {
+    async fn send(&self, text: &str) -> anyhow::Result<()> {
+        self.tx
+            .send(text.to_string())
+            .map_err(|_| anyhow::anyhow!("TUI sink closed"))
     }
 }
 
 /// Start the TUI on a fresh session: a running gateway holds the db lock, so
 /// route turns to it; otherwise run in-process.
 pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
-    let Connected { backend, approvals } = connect(config).await?;
-    drive(backend, approvals, new_session_id(), false).await
+    let connected = connect(config).await?;
+    drive(connected, new_session_id(), false).await
 }
 
 /// Continue an existing session (`shion session resume <id>` on a TTY). Errors
 /// if the session doesn't exist — resume never creates one.
 pub async fn resume(config: &ConfigSnapshot, session_id: &str) -> anyhow::Result<()> {
-    let Connected { backend, approvals } = connect(config).await?;
-    match &backend {
+    let connected = connect(config).await?;
+    match &connected.backend {
         Backend::Remote(gw) => {
             let known = gw.sessions().await?.iter().any(|s| s.id == session_id);
             if !known {
@@ -85,7 +117,7 @@ pub async fn resume(config: &ConfigSnapshot, session_id: &str) -> anyhow::Result
             }
         }
     }
-    drive(backend, approvals, session_id.to_string(), true).await
+    drive(connected, session_id.to_string(), true).await
 }
 
 struct Connected {
@@ -97,6 +129,10 @@ struct Connected {
         mpsc::UnboundedSender<ApprovalPrompt>,
         mpsc::UnboundedReceiver<ApprovalPrompt>,
     ),
+    /// Mid-turn clarify state (local mode only): the `ask_user` tool waits on
+    /// it, the event loop resolves the user's answer into it. Remote turns
+    /// clarify server-side (where the gateway dispatcher owns routing).
+    clarify: Option<Arc<ClarifyState>>,
 }
 
 async fn connect(config: &ConfigSnapshot) -> anyhow::Result<Connected> {
@@ -105,52 +141,49 @@ async fn connect(config: &ConfigSnapshot) -> anyhow::Result<Connected> {
         return Ok(Connected {
             backend: Backend::Remote(Arc::new(gw)),
             approvals: (tx, rx),
+            clarify: None,
         });
     }
     let db = Arc::new(Db::connect(&config.runtime.db_url).await?);
     let kanban = Arc::new(KanbanDb::connect(&config.runtime.kanban_db_url).await?);
     let approver: Arc<dyn Approver> = Arc::new(TuiApprover::new(tx.clone()));
-    let runtime = Arc::new(
-        wiring::build(config, db.clone(), kanban, approver)
-            .await?
-            .runtime,
-    );
+    let wired = wiring::build(config, db.clone(), kanban, approver).await?;
     Ok(Connected {
-        backend: Backend::Local { runtime, db },
+        backend: Backend::Local {
+            runtime: Arc::new(wired.runtime),
+            db,
+        },
         approvals: (tx, rx),
+        clarify: Some(wired.clarify),
     })
 }
 
 /// Set up the terminal, run the event loop, and always restore — including on
 /// an error path (the panic path is covered by `ratatui::init`'s hook).
-async fn drive(
-    backend: Backend,
-    approvals: (
-        mpsc::UnboundedSender<ApprovalPrompt>,
-        mpsc::UnboundedReceiver<ApprovalPrompt>,
-    ),
-    session: String,
-    resuming: bool,
-) -> anyhow::Result<()> {
+async fn drive(connected: Connected, session: String, resuming: bool) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, backend, approvals, session, resuming).await;
+    let result = event_loop(&mut terminal, connected, session, resuming).await;
     ratatui::restore();
     result
 }
 
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
-    backend: Backend,
-    approvals: (
-        mpsc::UnboundedSender<ApprovalPrompt>,
-        mpsc::UnboundedReceiver<ApprovalPrompt>,
-    ),
+    connected: Connected,
     session: String,
     resuming: bool,
 ) -> anyhow::Result<()> {
+    let Connected {
+        backend,
+        approvals,
+        clarify,
+    } = connected;
     // Keep the sender alive for the whole loop (remote mode has no other
     // holder) so `approval_rx.recv()` pends instead of returning None forever.
     let (_approval_tx, mut approval_rx) = approvals;
+    // Mid-turn agent messages (the `ask_user` question) from the local turn's
+    // sink; the sender is also parked so the arm pends in remote mode.
+    let (sink_tx, mut sink_rx) = mpsc::unbounded_channel::<String>();
 
     let mut app = App::new(session);
     let mode = match &backend {
@@ -198,9 +231,21 @@ async fn event_loop(
                         let backend = backend.clone();
                         let session_id = app.session_id.clone();
                         let turn_tx = turn_tx.clone();
+                        // Local mode: an interactive context whose sink feeds
+                        // mid-turn messages into this loop, so `ask_user` can
+                        // question the user; fresh clarify budget per turn.
+                        let ctx = clarify.as_ref().map(|cl| {
+                            cl.begin_turn(&session_id);
+                            SessionContext {
+                                session_id: session_id.clone(),
+                                sink: Arc::new(ChannelSink { tx: sink_tx.clone() }),
+                                interactive: true,
+                                auto_approve: false,
+                            }
+                        });
                         tokio::spawn(async move {
                             let result = backend
-                                .turn(&session_id, text)
+                                .turn(&session_id, text, ctx)
                                 .await
                                 .map_err(|e| format!("{e:#}"));
                             let _ = turn_tx.send(result);
@@ -209,6 +254,11 @@ async fn event_loop(
                     Some(Action::NewSession) => {
                         // Turns are keyed by session id, so an in-flight turn
                         // for the old id can finish and render harmlessly.
+                        if let Some(cl) = &clarify {
+                            // A pending question belongs to the old session.
+                            cl.clear(&app.session_id);
+                        }
+                        app.awaiting_answer = false;
                         app.session_id = new_session_id();
                         if let Backend::Local { db, .. } = &backend {
                             ensure_session(db, &app.session_id).await?;
@@ -218,15 +268,35 @@ async fn event_loop(
                             format!("Started new session `{}`", app.session_id),
                         );
                     }
+                    Some(Action::Answer(text)) => {
+                        if let Some(cl) = &clarify
+                            && cl.resolve(&app.session_id, &text)
+                        {
+                            app.push(Role::You, text);
+                        } else {
+                            app.push(Role::Info, "问题已失效（超时或会话已重置）。".to_string());
+                        }
+                    }
                     Some(Action::Answered(_)) | None => {}
                 }
             }
             Some(result) = turn_rx.recv() => {
                 app.in_flight = false;
+                // A question the turn never resolved dies with it.
+                app.awaiting_answer = false;
                 match result {
                     Ok(reply) => app.push(Role::Agent, reply),
                     Err(error) => app.push(Role::Error, error),
                 }
+            }
+            // Mid-turn agent message (local mode): render it, and if the turn
+            // is now waiting on `ask_user`, unlock the input as its answer.
+            // The tool registers before sending, so this check can't race.
+            Some(text) = sink_rx.recv() => {
+                app.push(Role::Agent, text);
+                app.awaiting_answer = clarify
+                    .as_ref()
+                    .is_some_and(|cl| cl.has_pending(&app.session_id));
             }
             // Show one approval at a time; further prompts wait in the channel
             // until the current modal is answered.

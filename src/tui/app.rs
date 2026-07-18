@@ -31,6 +31,9 @@ pub enum Action {
     NewSession,
     /// The user answered the approval modal.
     Answered(Answer),
+    /// The user answered a mid-turn `ask_user` question (local mode): resolve
+    /// it into the suspended turn instead of starting a new one.
+    Answer(String),
     Quit,
 }
 
@@ -43,6 +46,9 @@ pub struct App {
     /// Scroll offset in wrapped lines from the bottom; 0 = follow the tail.
     pub scroll_from_bottom: u16,
     pub in_flight: bool,
+    /// A mid-turn `ask_user` question is pending: the next submit is its
+    /// answer (allowed through even though a turn is in flight).
+    pub awaiting_answer: bool,
     pub spinner: usize,
     pub modal: Option<ApprovalPrompt>,
 }
@@ -56,6 +62,7 @@ impl App {
             cursor: 0,
             scroll_from_bottom: 0,
             in_flight: false,
+            awaiting_answer: false,
             spinner: 0,
             modal: None,
         }
@@ -117,6 +124,13 @@ impl App {
                     return Some(Action::NewSession);
                 }
                 if self.in_flight {
+                    // A pending clarify question lets the input through as its
+                    // answer — the suspended turn continues with it.
+                    if self.awaiting_answer {
+                        self.clear_input();
+                        self.awaiting_answer = false;
+                        return Some(Action::Answer(text));
+                    }
                     // One turn at a time; keep the draft so nothing is lost.
                     return None;
                 }
@@ -243,6 +257,23 @@ mod tests {
         type_str(&mut app, "queued?");
         assert_eq!(app.on_key(key(KeyCode::Enter)), None, "one turn at a time");
         assert_eq!(app.input, "queued?", "draft preserved");
+    }
+
+    #[test]
+    fn pending_clarify_lets_a_mid_turn_submit_through_as_answer() {
+        let mut app = App::new("s".into());
+        app.in_flight = true;
+        app.awaiting_answer = true;
+        type_str(&mut app, "蓝色");
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::Answer("蓝色".into()))
+        );
+        assert!(app.input.is_empty());
+        assert!(!app.awaiting_answer, "one answer per question");
+        // The next mid-turn submit is back to being blocked.
+        type_str(&mut app, "more");
+        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
     }
 
     #[test]

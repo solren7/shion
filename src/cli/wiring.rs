@@ -24,15 +24,16 @@ use crate::{
         skills::FsSkillStore,
     },
     services::{
+        clarify::ClarifyState,
         memory_enrichment::MemoryEnricher,
         skill_registry::SkillRegistry,
         tool_execution::{ToolExecutionConfig, ToolExecutor},
     },
     tools::{
-        delegate::DelegateTool, file::FileTool, homeassistant::HomeAssistantTool,
-        memory::MemoryTool, reminder::ReminderTool, session::SessionTool, shell::ShellTool,
-        skill::SkillTool, task::TaskTool, time::TimeTool, todo::TodoTool, web_fetch::WebFetchTool,
-        web_search::WebSearchTool,
+        ask_user::AskUserTool, delegate::DelegateTool, file::FileTool,
+        homeassistant::HomeAssistantTool, memory::MemoryTool, reminder::ReminderTool,
+        session::SessionTool, shell::ShellTool, skill::SkillTool, task::TaskTool, time::TimeTool,
+        todo::TodoTool, web_fetch::WebFetchTool, web_search::WebSearchTool,
     },
 };
 
@@ -50,6 +51,9 @@ pub struct Wiring {
     /// The governed skill store (`~/.shion/skills`, files — roadmap §9), shared
     /// with the gateway's api channel.
     pub skills: Arc<FsSkillStore>,
+    /// Mid-turn clarify state: the `ask_user` tool waits on it; the gateway
+    /// dispatcher (and the TUI) resolve an inbound message into it.
+    pub clarify: Arc<ClarifyState>,
 }
 
 /// Build the agent against `db` (sessions/messages/etc.) and `kanban` (durable
@@ -97,6 +101,12 @@ pub async fn build(
     tools.register(Arc::new(ReminderTool::new(db.clone())));
     tools.register(Arc::new(TaskTool::new(kanban.clone())));
     tools.register(Arc::new(TodoTool::new(db.clone())));
+
+    // Mid-turn clarification (roadmap §7): the sentinel tool suspends the turn
+    // on a question; whoever routes inbound messages (gateway dispatcher, TUI)
+    // resolves the answer through this shared state.
+    let clarify = Arc::new(ClarifyState::new());
+    tools.register(Arc::new(AskUserTool::new(clarify.clone())));
 
     // Home Assistant tool, only when configured (HASS_TOKEN set; HASS_URL
     // optional, defaults to homeassistant.local:8123).
@@ -245,5 +255,6 @@ pub async fn build(
         aux_llm,
         memories: memory_repo,
         skills: skill_store,
+        clarify,
     })
 }
