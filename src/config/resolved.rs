@@ -102,7 +102,9 @@ pub enum ChannelState<T> {
     /// Enabled and fully configured.
     Ready(T),
     /// Enabled but unusable; the message names what is missing. Resolution
-    /// also records a fatal [`ConfigIssue`], so `validate_gateway` fails.
+    /// also records a [`ConfigIssue`] — fatal for the chat channels (so
+    /// `validate_gateway` fails), a warning for homeassistant (the gateway
+    /// boots and the channel stays offline).
     Misconfigured(String),
 }
 
@@ -408,13 +410,21 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
                 watch_all: cfg.watch_all,
                 cooldown_seconds: cfg.cooldown_seconds.unwrap_or(30),
             }),
-            None => misconfigured(
-                &mut issues,
-                "channels.homeassistant",
-                "[channels.homeassistant] is enabled but HASS_TOKEN is not set \
-                 (put it in ~/.komo/.env)"
-                    .to_string(),
-            ),
+            // A warning, not fatal: HA is a local convenience integration whose
+            // credential lives outside config.toml, so an enabled-but-tokenless
+            // channel must not crash-loop the whole gateway (same principle as
+            // the missing model API key). The channel just stays offline.
+            None => {
+                let message = "[channels.homeassistant] is enabled but HASS_TOKEN is not set \
+                 (put it in ~/.komo/.env); the channel stays offline"
+                    .to_string();
+                issues.push(ConfigIssue {
+                    path: "channels.homeassistant",
+                    severity: IssueSeverity::Warning,
+                    message: message.clone(),
+                });
+                ChannelState::Misconfigured(message)
+            }
         },
     };
     let api_file = channels.api.unwrap_or_default();
@@ -616,7 +626,8 @@ fn build_rule(r: PolicyRuleFileConfig) -> Option<crate::domain::policy::Rule> {
 mod tests {
     use super::super::ConfigSnapshot;
     use super::super::sources::{
-        ApiFileConfig, ChannelsFileConfig, FileConfig, Secrets, TelegramFileConfig,
+        ApiFileConfig, ChannelsFileConfig, FileConfig, HomeAssistantChannelFileConfig, Secrets,
+        TelegramFileConfig,
     };
     use super::*;
     use std::path::PathBuf;
@@ -784,6 +795,33 @@ mod tests {
         // The gateway fails fast; a chat turn doesn't need the channel.
         assert!(snap.validate_gateway().is_err());
         assert!(snap.validate_agent().is_ok());
+    }
+
+    #[test]
+    fn homeassistant_without_token_warns_but_does_not_block_startup() {
+        let mut s = with_deepseek_key(sources());
+        s.file.channels = Some(ChannelsFileConfig {
+            homeassistant: Some(HomeAssistantChannelFileConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let snap = ConfigSnapshot::from_sources(s);
+        let ChannelState::Misconfigured(msg) = &snap.runtime.homeassistant_channel else {
+            panic!("enabled without HASS_TOKEN must be misconfigured");
+        };
+        assert!(msg.contains("HASS_TOKEN"));
+        // Degraded, not dead: the gateway boots with the HA channel offline.
+        let issue = snap
+            .report
+            .issues
+            .iter()
+            .find(|i| i.path == "channels.homeassistant")
+            .expect("missing token is reported");
+        assert_eq!(issue.severity, IssueSeverity::Warning);
+        assert!(snap.report.fatal().is_none());
+        assert!(snap.validate_gateway().is_ok());
     }
 
     #[test]
