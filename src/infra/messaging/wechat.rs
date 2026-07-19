@@ -9,8 +9,8 @@
 //! thread to `run()` under a shutdown `select!`.
 //!
 //! Login is QR-based. Two ways to provision the credentials
-//! (`~/.shion/wechat/credentials.json`):
-//!   - on a host with a terminal: `shion wechat login` (renders the QR in-term);
+//! (`~/.komo/wechat/credentials.json`):
+//!   - on a host with a terminal: `komo wechat login` (renders the QR in-term);
 //!   - from chat: `/wechat login` on an already-working channel (e.g. Telegram)
 //!     drives [`WeChatQrLogin`], which delivers the QR back as a photo. This is
 //!     how a headless gateway (TrueNAS/Docker) is set up without shell access.
@@ -63,7 +63,7 @@ pub fn build_bot(cred_path: &std::path::Path) -> Arc<WeChatBot> {
         on_qr_url: Some(Box::new(|_| {
             warn!(
                 "wechat: QR login required but the gateway has no terminal — \
-                 run `shion wechat login` on the host, or `/wechat login` from chat"
+                 run `komo wechat login` on the host, or `/wechat login` from chat"
             );
         })),
         on_error: Some(Box::new(|e| warn!(error = %e, "wechat bot error"))),
@@ -174,7 +174,7 @@ impl WeChatLogin for WeChatQrLogin {
                 match render_qr_png(content) {
                     Ok(png) => {
                         tokio::spawn(async move {
-                            if let Err(error) = sink.send_photo(png, "用微信扫码登录 shion").await
+                            if let Err(error) = sink.send_photo(png, "用微信扫码登录 komo").await
                             {
                                 let _ =
                                     sink.send(&format!("二维码已生成但发送失败：{error}")).await;
@@ -333,14 +333,14 @@ impl Channel for WeChatChannel {
 
         loop {
             // Wait until credentials exist. They may be provisioned later via
-            // `/wechat login` (which pulses `ready`) or `shion wechat login`.
+            // `/wechat login` (which pulses `ready`) or `komo wechat login`.
             while !self.cred_path.exists() || self.provisioning.load(Ordering::SeqCst) {
                 if self.provisioning.load(Ordering::SeqCst) {
                     info!("wechat channel: waiting for manual QR login to finish");
                 } else {
                     info!(
                         "wechat channel: waiting for credentials — run `/wechat login` from chat \
-                         or `shion wechat login` on the host"
+                         or `komo wechat login` on the host"
                     );
                 }
                 tokio::select! {

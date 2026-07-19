@@ -29,7 +29,7 @@ pub struct AgentRuntime {
     /// Run ledger: every turn is recorded here, with one step per tool call
     /// (captured by the tool executor). See `domain/run.rs`, roadmap §7.
     pub runs: Arc<dyn RunRepository>,
-    /// Tool catalog the in-house loop dispatches against. shion (not rig) now
+    /// Tool catalog the in-house loop dispatches against. komo (not rig) now
     /// owns the multi-step loop and hands each round of requested calls to the
     /// executor, which owns lookup/retry/ledger/cap. See `run_agent_loop`.
     pub tool_executor: ToolExecutor,
@@ -115,7 +115,7 @@ impl AgentRuntime {
     }
 
     /// The turn's actual work: persist the user message, drive the agent loop
-    /// (shion owns it — model round-trip, execute requested tools, feed results
+    /// (komo owns it — model round-trip, execute requested tools, feed results
     /// back, repeat), persist the reply, and kick off the periodic reviewer.
     async fn turn_body(
         &self,
@@ -171,7 +171,7 @@ impl AgentRuntime {
         Ok(reply)
     }
 
-    /// shion's own tool-calling loop (roadmap §7 — the loop lives here, not in
+    /// komo's own tool-calling loop (roadmap §7 — the loop lives here, not in
     /// rig, so control points can sit between rounds). Drive the model a round
     /// at a time: a [`Step::Final`] ends the turn; [`Step::ToolCalls`] go to the
     /// tool executor as one round (it owns lookup, retry, the per-call budget,
@@ -370,7 +370,7 @@ mod tests {
     #[tokio::test]
     async fn turn_with_a_tool_call_records_a_run_with_a_step() {
         let db = Arc::new(
-            Db::connect(&sqlite_url("shion_rt_tool_run.db"))
+            Db::connect(&sqlite_url("komo_rt_tool_run.db"))
                 .await
                 .unwrap(),
         );
@@ -400,7 +400,7 @@ mod tests {
     #[tokio::test]
     async fn turn_without_tools_records_a_run_without_steps() {
         let db = Arc::new(
-            Db::connect(&sqlite_url("shion_rt_direct_run.db"))
+            Db::connect(&sqlite_url("komo_rt_direct_run.db"))
                 .await
                 .unwrap(),
         );
@@ -427,7 +427,7 @@ mod tests {
     #[tokio::test]
     async fn multi_round_threads_tool_results_back() {
         let db = Arc::new(
-            Db::connect(&sqlite_url("shion_rt_threading.db"))
+            Db::connect(&sqlite_url("komo_rt_threading.db"))
                 .await
                 .unwrap(),
         );
@@ -455,7 +455,7 @@ mod tests {
     #[tokio::test]
     async fn tool_error_feeds_back_without_aborting() {
         let db = Arc::new(
-            Db::connect(&sqlite_url("shion_rt_toolerr.db"))
+            Db::connect(&sqlite_url("komo_rt_toolerr.db"))
                 .await
                 .unwrap(),
         );
@@ -480,7 +480,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_tool_feeds_back_without_aborting() {
         let db = Arc::new(
-            Db::connect(&sqlite_url("shion_rt_unknown.db"))
+            Db::connect(&sqlite_url("komo_rt_unknown.db"))
                 .await
                 .unwrap(),
         );
@@ -505,11 +505,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_budget_forces_a_final_answer() {
-        let db = Arc::new(
-            Db::connect(&sqlite_url("shion_rt_budget.db"))
-                .await
-                .unwrap(),
-        );
+        let db = Arc::new(Db::connect(&sqlite_url("komo_rt_budget.db")).await.unwrap());
         // Driver keeps requesting tools; with max_turns=2 the loop must stop.
         let (rt, _) = scripted_runtime(
             db.clone(),

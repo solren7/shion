@@ -1,11 +1,11 @@
-# Copy your Shion configuration to ./data/config.toml and secrets to
+# Copy your Komo configuration to ./data/config.toml and secrets to
 # ./data/.env, then run:
 #
 #   docker compose up -d
-#   docker compose logs -f shion
+#   docker compose logs -f komo
 #
 # Credentials can live in either place:
-#   - ./data/.env — read by shion itself inside the container (dotenvy), or
+#   - ./data/.env — read by komo itself inside the container (dotenvy), or
 #   - the stack/shell environment (a Portainer/dockhand stack .env, or exported
 #     shell variables) — passed through via the credential entries below.
 # Note the compose project .env only interpolates ${VAR}s in this file; it
@@ -14,23 +14,23 @@
 # still injects an empty string, which shadows the same key in ./data/.env.
 #
 # Override the image tag, timezone, or host directories with shell variables,
-# for example: SHION_TAG=v0.1.0 SHION_DATA_DIR=/srv/shion docker compose up -d
+# for example: KOMO_TAG=v0.1.0 KOMO_DATA_DIR=/srv/komo docker compose up -d
 
 services:
-  shion:
-    image: ghcr.io/solren7/shion:${SHION_TAG:-latest}
+  komo:
+    image: ghcr.io/solren7/komo:${KOMO_TAG:-latest}
     # For a local-CI deployment that builds on the Docker host instead of
     # pulling from ghcr (e.g. a Dockhand git stack on the NAS), set
-    # SHION_PULL_POLICY=build and a non-clashing SHION_TAG such as `local`.
+    # KOMO_PULL_POLICY=build and a non-clashing KOMO_TAG such as `local`.
     # The default remains pull-from-registry.
     build: .
-    container_name: shion
+    container_name: komo
     restart: unless-stopped
-    pull_policy: ${SHION_PULL_POLICY:-always}
+    pull_policy: ${KOMO_PULL_POLICY:-always}
     init: true
     environment:
       TZ: ${TZ:-Asia/Shanghai}
-      SHION_HOME: /data
+      KOMO_HOME: /data
       # Credential passthrough from the stack/shell environment. The null-value
       # form matters: an unset variable is *removed* from the container env
       # (rather than injected as ""), so it can never shadow ./data/.env —
@@ -48,9 +48,9 @@ services:
     working_dir: /workspace
     volumes:
       # config.toml, .env, databases, logs, memories, and installed skills.
-      - ${SHION_DATA_DIR:-./data}:/data
+      - ${KOMO_DATA_DIR:-./data}:/data
       # Files that the agent's file and shell tools are allowed to work with.
-      - ${SHION_WORKSPACE_DIR:-./workspace}:/workspace
+      - ${KOMO_WORKSPACE_DIR:-./workspace}:/workspace
     stop_grace_period: 30s
     # Cap docker's own copy of stderr. The durable month of history lives in
     # /data/logs/gateway.YYYY-MM-DD.log (daily files, 30 kept, self-pruning).
@@ -61,7 +61,7 @@ services:
         max-file: "3"
 
     # The gateway needs no published port for Telegram, Feishu, WeChat, or
-    # Home Assistant. To expose Shion's HTTP API, first configure:
+    # Home Assistant. To expose Komo's HTTP API, first configure:
     #
     #   [channels.api]
     #   enabled = true
@@ -70,4 +70,4 @@ services:
     #
     # in ./data/config.toml, set API_SERVER_KEY in ./data/.env, then uncomment:
     # ports:
-    #   - "127.0.0.1:${SHION_API_PORT:-8765}:8765"
+    #   - "127.0.0.1:${KOMO_API_PORT:-8765}:8765"

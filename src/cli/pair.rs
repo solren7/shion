@@ -1,7 +1,7 @@
-//! Pairing operator commands (`shion pair list/approve/revoke`).
+//! Pairing operator commands (`komo pair list/approve/revoke`).
 //!
 //! Approval deliberately lives here and nowhere else: typing
-//! `shion pair approve <code>` in a shell on this machine is the proof of
+//! `komo pair approve <code>` in a shell on this machine is the proof of
 //! ownership that lets a new chat-platform sender talk to the agent. The
 //! gateway reads the same SQLite db, so approval takes effect on the
 //! sender's next message — no restart.
@@ -19,7 +19,7 @@ fn local_time(unix: i64) -> String {
 
 /// List all pairings: pending requests and approved senders. The code itself is
 /// stored only as a salted hash — get it from the sender and run
-/// `shion pair approve <code>` (or `/pair approve` in chat while the gateway runs).
+/// `komo pair approve <code>` (or `/pair approve` in chat while the gateway runs).
 pub async fn list(control: &OperatorControl) -> anyhow::Result<()> {
     let OperatorQueryResult::Pairings(pairings) = control.query(OperatorQuery::Pairings).await?
     else {
@@ -62,7 +62,7 @@ pub async fn approve(control: &OperatorControl, code: &str) -> anyhow::Result<()
             Ok(())
         }
         PairApproveOutcome::NotFound => anyhow::bail!(
-            "no approvable pairing with code {code} — unknown or expired (see `shion pair list`)"
+            "no approvable pairing with code {code} — unknown or expired (see `komo pair list`)"
         ),
         PairApproveOutcome::Locked { retry_after_secs } => anyhow::bail!(
             "too many failed attempts — approve is locked for {} more minutes",
@@ -82,7 +82,7 @@ pub async fn revoke(control: &OperatorControl, id: &str) -> anyhow::Result<()> {
     if revoked {
         println!("Revoked {id}.");
     } else {
-        println!("No pairing {id} (see `shion pair list`).");
+        println!("No pairing {id} (see `komo pair list`).");
     }
     Ok(())
 }

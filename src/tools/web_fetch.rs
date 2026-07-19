@@ -10,7 +10,7 @@ use crate::domain::{
 };
 
 const MAX_BYTES: usize = 8 * 1024;
-const USER_AGENT: &str = "shion-agent/0.1";
+const USER_AGENT: &str = "komo-agent/0.1";
 
 #[derive(Deserialize)]
 struct FetchArgs {

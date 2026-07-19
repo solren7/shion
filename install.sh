@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Install shion from GitHub release binaries.
+# Install komo from GitHub release binaries.
 
 set -euo pipefail
 
-REPO="${SHION_REPO:-solren7/shion}"
+REPO="${KOMO_REPO:-solren7/komo}"
 INSTALL_DIR="/usr/local/bin"
-VERSION="${SHION_VERSION:-latest}"
+VERSION="${KOMO_VERSION:-latest}"
 
 if [[ -n "${NO_COLOR:-}" ]]; then
     GREEN=""
@@ -23,7 +23,7 @@ fi
 
 usage() {
     cat <<EOF
-Install shion from GitHub releases.
+Install komo from GitHub releases.
 
 Usage:
   install.sh [version] [--prefix DIR]
@@ -34,8 +34,8 @@ Examples:
   curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- v0.1.0
 
 Environment:
-  SHION_REPO       GitHub repo, default: ${REPO}
-  SHION_VERSION    Release tag, default: latest
+  KOMO_REPO       GitHub repo, default: ${REPO}
+  KOMO_VERSION    Release tag, default: latest
 EOF
 }
 
@@ -172,12 +172,12 @@ run_install_cmd() {
 
 PLATFORM="$(detect_platform)"
 TAG="$(resolve_tag)"
-ASSET="shion-${PLATFORM}.tar.gz"
+ASSET="komo-${PLATFORM}.tar.gz"
 BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/shion-install.XXXXXX")"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/komo-install.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-info "Installing shion ${TAG} for ${PLATFORM}"
+info "Installing komo ${TAG} for ${PLATFORM}"
 
 curl -fsSL -o "${TMP_DIR}/${ASSET}" "${BASE_URL}/${ASSET}"
 curl -fsSL -o "${TMP_DIR}/SHA256SUMS" "${BASE_URL}/SHA256SUMS"
@@ -191,8 +191,8 @@ fi
 success "Verified checksum"
 
 tar -xzf "${TMP_DIR}/${ASSET}" -C "$TMP_DIR"
-if [[ ! -x "${TMP_DIR}/shion" ]]; then
-    error "release archive did not contain an executable shion binary"
+if [[ ! -x "${TMP_DIR}/komo" ]]; then
+    error "release archive did not contain an executable komo binary"
     exit 1
 fi
 
@@ -200,17 +200,17 @@ if [[ ! -d "$INSTALL_DIR" ]]; then
     run_install_cmd mkdir -p "$INSTALL_DIR"
 fi
 
-run_install_cmd cp "${TMP_DIR}/shion" "${INSTALL_DIR}/shion.new"
-run_install_cmd chmod +x "${INSTALL_DIR}/shion.new"
-run_install_cmd mv -f "${INSTALL_DIR}/shion.new" "${INSTALL_DIR}/shion"
-xattr -c "${INSTALL_DIR}/shion" >/dev/null 2>&1 || true
+run_install_cmd cp "${TMP_DIR}/komo" "${INSTALL_DIR}/komo.new"
+run_install_cmd chmod +x "${INSTALL_DIR}/komo.new"
+run_install_cmd mv -f "${INSTALL_DIR}/komo.new" "${INSTALL_DIR}/komo"
+xattr -c "${INSTALL_DIR}/komo" >/dev/null 2>&1 || true
 
-if ! "${INSTALL_DIR}/shion" --version >/dev/null 2>&1; then
-    warn "Installed shion, but post-install version check failed."
+if ! "${INSTALL_DIR}/komo" --version >/dev/null 2>&1; then
+    warn "Installed komo, but post-install version check failed."
 else
-    success "Installed $("${INSTALL_DIR}/shion" --version) to ${INSTALL_DIR}/shion"
+    success "Installed $("${INSTALL_DIR}/komo" --version) to ${INSTALL_DIR}/komo"
 fi
 
 if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
-    warn "${INSTALL_DIR} is not in PATH. Add it to your shell profile before running shion globally."
+    warn "${INSTALL_DIR} is not in PATH. Add it to your shell profile before running komo globally."
 fi

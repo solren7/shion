@@ -1,4 +1,4 @@
-//! Operator subcommands (`shion cron list`, `shion session list/clean`).
+//! Operator subcommands (`komo cron list`, `komo session list/clean`).
 //!
 //! These query the database directly and print to stdout — no LLM, no agent
 //! runtime. They are the operator's view into what the gateway will act on.
@@ -150,7 +150,7 @@ pub async fn run_inspect(control: &OperatorControl, id: &str) -> anyhow::Result<
         println!("error   {}", run.error);
     }
     if run.recoverable {
-        println!("resume  recoverable — `shion run resume {}`", run.id);
+        println!("resume  recoverable — `komo run resume {}`", run.id);
     }
     if !run.final_output.is_empty() {
         println!("output  {}", oneline(&run.final_output, 200));
@@ -214,7 +214,7 @@ pub async fn run_keep_cutoff(
     Ok(runs.get(keep).map(|r| r.started_at))
 }
 
-/// List the governed skill store (`~/.shion/skills`): active skills first,
+/// List the governed skill store (`~/.komo/skills`): active skills first,
 /// then reviewer candidates awaiting triage. Pure file reads — works whether
 /// or not the gateway is running (no db lock involved). Workspace-local skill
 /// dirs are per-repo and listed by the agent's own `skill` tool instead.
@@ -233,7 +233,7 @@ pub fn skill_list() -> anyhow::Result<()> {
         println!("{}{}{}  {}", s.name, lock, off, oneline(&s.description, 80));
     }
     if !candidates.is_empty() {
-        println!("\ncandidates (`shion skill promote|reject <name>`):");
+        println!("\ncandidates (`komo skill promote|reject <name>`):");
         for s in &candidates {
             println!(
                 "  {}  [{}]  {}",

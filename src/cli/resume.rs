@@ -1,4 +1,4 @@
-//! `shion run resume` — re-dispatch an interrupted turn from the run ledger.
+//! `komo run resume` — re-dispatch an interrupted turn from the run ledger.
 //!
 //! The ledger is an audit record, not a checkpoint, so resume runs one *fresh*
 //! turn in the interrupted run's session, primed with the original input and a

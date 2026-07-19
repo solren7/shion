@@ -1,5 +1,5 @@
 //! The kanban store: durable cross-session tasks, in their **own** SQLite file
-//! (`~/.shion/kanban.db`), separate from the session/message db (`state.db`).
+//! (`~/.komo/kanban.db`), separate from the session/message db (`state.db`).
 //!
 //! Sessions, messages, and the session-scoped todo are disposable developer
 //! state — `state.db` is documented as deletable to reset, and a toasty schema
@@ -233,7 +233,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_roundtrip_and_update() {
-        let db = KanbanDb::connect(&sqlite_url("shion_kanban_repo_test.db"))
+        let db = KanbanDb::connect(&sqlite_url("komo_kanban_repo_test.db"))
             .await
             .unwrap();
         let mut task = Task::new("send weekly report".to_string());
@@ -264,7 +264,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_returns_none_for_unknown_id() {
-        let db = KanbanDb::connect(&sqlite_url("shion_kanban_find_test.db"))
+        let db = KanbanDb::connect(&sqlite_url("komo_kanban_find_test.db"))
             .await
             .unwrap();
         assert!(db.find("task-nope").await.unwrap().is_none());
@@ -272,7 +272,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_by_source_message_id_matches_source_and_key() {
-        let db = KanbanDb::connect(&sqlite_url("shion_kanban_dedup_test.db"))
+        let db = KanbanDb::connect(&sqlite_url("komo_kanban_dedup_test.db"))
             .await
             .unwrap();
         let mut task = Task::new("call Bob".to_string());

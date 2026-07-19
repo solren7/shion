@@ -10,8 +10,8 @@ use rig::{
 use crate::domain::tool::Tool;
 use crate::services::tool_execution::ToolExecutionCore;
 
-/// Adapts a shion [`Tool`] into a `rig` [`ToolDyn`] so the provider sees the
-/// tool's schema (`name` + `definition`). Execution is driven by shion's own
+/// Adapts a komo [`Tool`] into a `rig` [`ToolDyn`] so the provider sees the
+/// tool's schema (`name` + `definition`). Execution is driven by komo's own
 /// loop (`AgentRuntime::run_agent_loop` → `ToolExecutor::execute_round`), not
 /// by rig: the main agent runs one completion per round and dispatches the
 /// requested tools itself. `call` below stays as the trait-required fallback
@@ -58,7 +58,7 @@ impl ToolDyn for RigTool {
         let tool = self.tool.clone();
         let core = self.core.clone();
         Box::pin(async move {
-            // Trait-required, but not on shion's hot path: `run_agent_loop` owns
+            // Trait-required, but not on komo's hot path: `run_agent_loop` owns
             // the loop and dispatches tools itself, so rig only reaches here if it
             // drives a completion that has tools attached (none today). Kept
             // functional rather than `unreachable!` so that path stays correct.

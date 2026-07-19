@@ -1,5 +1,5 @@
 //! Markdown-file memory store: one `.md` file per memory under a directory
-//! (normally `~/.shion/memory/`), with a small frontmatter block for metadata.
+//! (normally `~/.komo/memory/`), with a small frontmatter block for metadata.
 //!
 //! With the move to a canonical SQLite store (`infra/memory_db.rs`), this is no
 //! longer the primary backend — it stays as a human-readable **import/export**
@@ -218,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_then_list_roundtrips() {
-        let store = temp_store("shion_md_memory_roundtrip");
+        let store = temp_store("komo_md_memory_roundtrip");
         let memory = Memory::new(MemoryKind::Project, "项目用 Rust 写");
         store.save(&memory).await.unwrap();
 
@@ -231,7 +231,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_model_roundtrips() {
-        let store = temp_store("shion_md_memory_full");
+        let store = temp_store("komo_md_memory_full");
         let mut memory = Memory::new(MemoryKind::Preference, "prefers concise replies");
         memory.status = MemoryStatus::Active;
         memory.confidence = MemoryConfidence::UserWritten;
@@ -261,7 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_reviewer_file_migrates_to_candidate() {
-        let store = temp_store("shion_md_memory_legacy_reviewer");
+        let store = temp_store("komo_md_memory_legacy_reviewer");
         tokio::fs::create_dir_all(&store.dir).await.unwrap();
         // A pre-governance reviewer file: only old fields, source set.
         tokio::fs::write(
@@ -281,7 +281,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_handwritten_file_migrates_to_active_confirmed() {
-        let store = temp_store("shion_md_memory_legacy_hand");
+        let store = temp_store("komo_md_memory_legacy_hand");
         tokio::fs::create_dir_all(&store.dir).await.unwrap();
         tokio::fs::write(
             store.dir.join("notes.md"),
@@ -298,13 +298,13 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_files_are_skipped() {
-        let store = temp_store("shion_md_memory_malformed");
+        let store = temp_store("komo_md_memory_malformed");
         store
             .save(&Memory::new(MemoryKind::Profile, "valid"))
             .await
             .unwrap();
         std::fs::write(
-            std::env::temp_dir().join("shion_md_memory_malformed/stray.md"),
+            std::env::temp_dir().join("komo_md_memory_malformed/stray.md"),
             "just some text, no frontmatter",
         )
         .unwrap();
@@ -316,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_memories_are_hidden_from_list() {
-        let store = temp_store("shion_md_memory_expired");
+        let store = temp_store("komo_md_memory_expired");
         store
             .save(&Memory::new(MemoryKind::Profile, "still good"))
             .await

@@ -6,7 +6,7 @@ use crate::domain::tool::Tool;
 
 const MAX_RESULTS: usize = 6;
 const USER_AGENT: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 shion-agent/0.1";
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 komo-agent/0.1";
 
 #[derive(Deserialize)]
 struct SearchArgs {

@@ -1,7 +1,7 @@
-//! `shion logs` — print (and optionally follow) the gateway log.
+//! `komo logs` — print (and optionally follow) the gateway log.
 //!
 //! The gateway writes its tracing output to a daily-rotated file
-//! (`~/.shion/logs/gateway.YYYY-MM-DD.log`, a month kept — see
+//! (`~/.komo/logs/gateway.YYYY-MM-DD.log`, a month kept — see
 //! `main.rs::open_gateway_log`), teed with stderr. This command reads the
 //! newest daily file; the pre-rotation launchd capture
 //! (`gateway.err.log`) is the fallback for logs from older builds.
@@ -16,7 +16,7 @@ use std::time::Duration;
 const FOLLOW_POLL: Duration = Duration::from_millis(500);
 
 pub fn run(lines: usize, follow: bool, stdout: bool) -> anyhow::Result<()> {
-    let dir = crate::config::shion_home().join("logs");
+    let dir = crate::config::komo_home().join("logs");
     let path = if stdout {
         dir.join("gateway.log")
     } else {
@@ -25,7 +25,7 @@ pub fn run(lines: usize, follow: bool, stdout: bool) -> anyhow::Result<()> {
     };
     if !path.exists() {
         anyhow::bail!(
-            "no log file at {} — has the gateway run yet? (check `shion gateway status`)",
+            "no log file at {} — has the gateway run yet? (check `komo gateway status`)",
             path.display()
         );
     }
@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn newest_daily_file_wins() {
-        let dir = std::env::temp_dir().join("shion_logs_test_newest");
+        let dir = std::env::temp_dir().join("komo_logs_test_newest");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for name in [

@@ -1,4 +1,4 @@
-//! Operator governance over the skill store (`~/.shion/skills`) — roadmap §9.
+//! Operator governance over the skill store (`~/.komo/skills`) — roadmap §9.
 //!
 //! All of these are pure file operations on the governed store, so they work
 //! whether or not the gateway is running (no db lock involved). The runtime
@@ -120,7 +120,7 @@ pub fn inspect(name: &str) -> anyhow::Result<()> {
             history.join(", ")
         );
     }
-    println!("audit      `shion skill audit {name}` shows which turns loaded it");
+    println!("audit      `komo skill audit {name}` shows which turns loaded it");
     println!("\n{}", skill.instructions);
     Ok(())
 }
@@ -150,6 +150,6 @@ pub async fn audit(control: &OperatorControl, name: &str) -> anyhow::Result<()> 
             i.run_id
         );
     }
-    println!("\n(`shion run inspect <id>` shows the full turn.)");
+    println!("\n(`komo run inspect <id>` shows the full turn.)");
     Ok(())
 }

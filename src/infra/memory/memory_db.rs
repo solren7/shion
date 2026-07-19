@@ -1,5 +1,5 @@
 //! The memory store: durable long-term memories in their **own** SQLite file
-//! (`~/.shion/memory.db`), separate from the disposable session db (`state.db`)
+//! (`~/.komo/memory.db`), separate from the disposable session db (`state.db`)
 //! and the task db (`kanban.db`).
 //!
 //! Memories are real personal data that must survive a `state.db` reset, so —
@@ -88,7 +88,7 @@ impl MemoryDb {
         }
 
         // MVCC concurrent-writes on: writers run in parallel and conflicting
-        // commits are retried (see `with_write_retry`). shion's keys are all
+        // commits are retried (see `with_write_retry`). komo's keys are all
         // UUIDs (no AUTOINCREMENT, which MVCC rejects), so this is uniform across
         // every db.
         let driver = match &path {
@@ -333,7 +333,7 @@ mod tests {
     /// preserving its rows, leaving a `.sqlite-backup`, and never re-migrating.
     #[tokio::test]
     async fn migrates_legacy_sqlite_file_into_turso() {
-        let path = std::env::temp_dir().join("shion_memory_db_migrate.db");
+        let path = std::env::temp_dir().join("komo_memory_db_migrate.db");
         crate::infra::persistence::reset_test_db(&path);
 
         // 1. Seed a legacy SQLite file with two memories via the SQLite driver.
@@ -407,7 +407,7 @@ mod tests {
     /// destructive reset.
     #[tokio::test]
     async fn adds_missing_recall_columns_in_place() {
-        let path = std::env::temp_dir().join("shion_memory_db_addcol.db");
+        let path = std::env::temp_dir().join("komo_memory_db_addcol.db");
         crate::infra::persistence::reset_test_db(&path);
 
         // 1. Seed a turso file with the OLD 15-column schema (no recall_count)
@@ -464,7 +464,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_list_roundtrip_and_overwrite() {
-        let db = MemoryDb::connect(&turso_url("shion_memory_db_roundtrip.db"))
+        let db = MemoryDb::connect(&turso_url("komo_memory_db_roundtrip.db"))
             .await
             .unwrap();
         let mut m = Memory::new(MemoryKind::Preference, "prefers concise answers");
@@ -493,7 +493,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_hidden_from_list() {
-        let db = MemoryDb::connect(&turso_url("shion_memory_db_expired.db"))
+        let db = MemoryDb::connect(&turso_url("komo_memory_db_expired.db"))
             .await
             .unwrap();
         db.save(&Memory::new(MemoryKind::Fact, "live"))
@@ -510,7 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_filters_by_eligibility_and_scope() {
-        let db = MemoryDb::connect(&turso_url("shion_memory_db_pinned.db"))
+        let db = MemoryDb::connect(&turso_url("komo_memory_db_pinned.db"))
             .await
             .unwrap();
 
@@ -540,14 +540,14 @@ mod tests {
 
     #[tokio::test]
     async fn recall_returns_in_scope_active_and_candidate_matches() {
-        let db = MemoryDb::connect(&turso_url("shion_memory_db_recall.db"))
+        let db = MemoryDb::connect(&turso_url("komo_memory_db_recall.db"))
             .await
             .unwrap();
 
         // Relevant, active, global → recalled.
         db.save(&Memory::new(
             MemoryKind::Project,
-            "the shion project is written in Rust",
+            "the komo project is written in Rust",
         ))
         .await
         .unwrap();
@@ -596,7 +596,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_used_sets_last_used_without_touching_updated_at() {
-        let db = MemoryDb::connect(&turso_url("shion_memory_db_mark_used.db"))
+        let db = MemoryDb::connect(&turso_url("komo_memory_db_mark_used.db"))
             .await
             .unwrap();
         let mut m = Memory::new(MemoryKind::Fact, "recalled at least once");
@@ -627,7 +627,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_legacy_seeds_empty_db_only_once() {
-        let dir = std::env::temp_dir().join("shion_memory_db_import_src");
+        let dir = std::env::temp_dir().join("komo_memory_db_import_src");
         let _ = std::fs::remove_dir_all(&dir);
         let legacy = MdMemoryStore::new(dir.clone());
         legacy
@@ -635,7 +635,7 @@ mod tests {
             .await
             .unwrap();
 
-        let db = MemoryDb::connect(&turso_url("shion_memory_db_import.db"))
+        let db = MemoryDb::connect(&turso_url("komo_memory_db_import.db"))
             .await
             .unwrap();
         assert_eq!(db.import_legacy_markdown(&dir).await.unwrap(), 1);

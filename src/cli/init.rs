@@ -1,18 +1,18 @@
-//! `shion init` — bootstrap the config home with commented templates.
+//! `komo init` — bootstrap the config home with commented templates.
 //!
 //! Writes a default `config.toml` and a `.env` credential template into
-//! `~/.shion/` (or `SHION_HOME`). Existing files are never touched, so the
+//! `~/.komo/` (or `KOMO_HOME`). Existing files are never touched, so the
 //! command is safe to re-run and safe inside a running gateway (pure file
 //! ops, no db). Pairs with the degraded no-API-key startup: a fresh install
-//! boots, `shion init` scaffolds the files, the operator fills in a key.
+//! boots, `komo init` scaffolds the files, the operator fills in a key.
 
 use std::path::Path;
 
-/// The generated `~/.shion/config.toml`. Runtime settings only — credentials
+/// The generated `~/.komo/config.toml`. Runtime settings only — credentials
 /// belong in `.env` (see [`ENV_TEMPLATE`]). Everything but the provider line
 /// is commented out at its built-in default, so the file documents itself.
-const CONFIG_TEMPLATE: &str = r#"# shion runtime settings. Credentials never go here — put them in .env
-# next to this file. Priority: built-in defaults < this file < SHION_* env.
+const CONFIG_TEMPLATE: &str = r#"# komo runtime settings. Credentials never go here — put them in .env
+# next to this file. Priority: built-in defaults < this file < KOMO_* env.
 
 # LLM provider: deepseek | openai | anthropic | openrouter | codex
 # (codex needs no API key — it uses the Codex CLI's OAuth login)
@@ -45,7 +45,7 @@ provider = "deepseek"
 # require_mention = true
 # home_chat = "oc_xxx"
 
-# [channels.wechat]              # DM-only; provision with `shion channel wechat login`
+# [channels.wechat]              # DM-only; provision with `komo channel wechat login`
 # enabled = true
 
 # [channels.homeassistant]       # HA event ingress (HASS_TOKEN in .env)
@@ -60,9 +60,9 @@ provider = "deepseek"
 # port = 8765
 "#;
 
-/// The generated `~/.shion/.env`. Credentials only; empty values read as
+/// The generated `~/.komo/.env`. Credentials only; empty values read as
 /// unset, so the uncommented key line is a safe fill-in-the-blank.
-const ENV_TEMPLATE: &str = r#"# shion credentials (this file is chmod 600; never commit it anywhere).
+const ENV_TEMPLATE: &str = r#"# komo credentials (this file is chmod 600; never commit it anywhere).
 # Empty values are treated as unset. Match the `provider` in config.toml.
 
 DEEPSEEK_API_KEY=
@@ -84,14 +84,14 @@ DEEPSEEK_API_KEY=
 "#;
 
 pub fn run() -> anyhow::Result<()> {
-    let home = crate::config::ensure_shion_home();
+    let home = crate::config::ensure_komo_home();
     let (config_created, env_created) = init_at(&home)?;
     report("config.toml", &home, config_created);
     report(".env", &home, env_created);
     if config_created || env_created {
         println!(
             "\nNext: put your API key in {}/.env (DEEPSEEK_API_KEY=sk-...),\n\
-             then restart the gateway. `shion doctor` verifies the result.",
+             then restart the gateway. `komo doctor` verifies the result.",
             home.display()
         );
     }
@@ -114,7 +114,7 @@ fn init_at(home: &Path) -> anyhow::Result<(bool, bool)> {
     let config_created = write_if_absent(&home.join("config.toml"), CONFIG_TEMPLATE)?;
     let env_path = home.join(".env");
     let env_created = write_if_absent(&env_path, ENV_TEMPLATE)?;
-    // Credentials file: owner-only, same floor `ensure_shion_home` maintains.
+    // Credentials file: owner-only, same floor `ensure_komo_home` maintains.
     #[cfg(unix)]
     if env_created {
         use std::os::unix::fs::PermissionsExt;
@@ -137,7 +137,7 @@ mod tests {
     use super::*;
 
     fn tmp(suffix: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("shion_init_test_{suffix}"));
+        let dir = std::env::temp_dir().join(format!("komo_init_test_{suffix}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

@@ -317,7 +317,7 @@ impl Channel for TelegramChannel {
                     continue;
                 };
                 // Pairing gate: unknown senders get a pairing code instead of
-                // the agent until `shion pair approve` runs on the host.
+                // the agent until `komo pair approve` runs on the host.
                 let sender = self.sender.clone();
                 let chat = msg.chat_id.clone();
                 let admitted = self
@@ -409,7 +409,7 @@ mod tests {
             require_mention: true,
             ..Default::default()
         };
-        let inbound = admit(message("hello", "private", 1), &policy, "shion_bot").unwrap();
+        let inbound = admit(message("hello", "private", 1), &policy, "komo_bot").unwrap();
         assert_eq!(inbound.chat_id, "100");
         assert_eq!(inbound.sender_id, "1");
         assert_eq!(inbound.text, "hello");
@@ -421,11 +421,11 @@ mod tests {
             require_mention: true,
             ..Default::default()
         };
-        assert!(admit(message("hello", "supergroup", 1), &policy, "shion_bot").is_none());
+        assert!(admit(message("hello", "supergroup", 1), &policy, "komo_bot").is_none());
         let inbound = admit(
-            message("@shion_bot what time is it", "supergroup", 1),
+            message("@komo_bot what time is it", "supergroup", 1),
             &policy,
-            "shion_bot",
+            "komo_bot",
         )
         .unwrap();
         assert_eq!(inbound.text, "what time is it");
@@ -438,21 +438,21 @@ mod tests {
             require_mention: false,
             allowed_chats: vec!["999".to_string()],
         };
-        assert!(admit(message("hi", "supergroup", 1), &policy, "shion_bot").is_none());
+        assert!(admit(message("hi", "supergroup", 1), &policy, "komo_bot").is_none());
 
         // Same message in an allowlisted chat is admitted; DMs always pass.
         let policy = AdmitPolicy {
             require_mention: false,
             allowed_chats: vec!["100".to_string()],
         };
-        assert!(admit(message("hi", "supergroup", 1), &policy, "shion_bot").is_some());
-        assert!(admit(message("hi", "private", 1), &policy, "shion_bot").is_some());
+        assert!(admit(message("hi", "supergroup", 1), &policy, "komo_bot").is_some());
+        assert!(admit(message("hi", "private", 1), &policy, "komo_bot").is_some());
     }
 
     #[test]
     fn admit_rejects_bot_senders() {
         let mut msg = message("hello", "private", 1);
         msg.from.as_mut().unwrap().is_bot = true;
-        assert!(admit(msg, &AdmitPolicy::default(), "shion_bot").is_none());
+        assert!(admit(msg, &AdmitPolicy::default(), "komo_bot").is_none());
     }
 }

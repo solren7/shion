@@ -18,7 +18,7 @@ Status: shipped except D3 weekly (implemented 2026-07-18) — weekly deferred: T
 
 ## 核心判断
 
-1. **briefing 从"一次 completion"升级为"一个受限的 agent turn"**,复用 `AgentRuntime::run_agent_loop`,不再造第二个循环。做法:wiring 里构造第二个小号 `AgentRuntime`(aux LLM + 一个**只读工具集**的 `ToolExecutor` + 同一批 db handles),session 固定 `briefing:sweep`。副产品:briefing 的每次执行天然进 run ledger(`shion run list` 可审计),解掉上表第三行。
+1. **briefing 从"一次 completion"升级为"一个受限的 agent turn"**,复用 `AgentRuntime::run_agent_loop`,不再造第二个循环。做法:wiring 里构造第二个小号 `AgentRuntime`(aux LLM + 一个**只读工具集**的 `ToolExecutor` + 同一批 db handles),session 固定 `briefing:sweep`。副产品:briefing 的每次执行天然进 run ledger(`komo run list` 可审计),解掉上表第三行。
 2. **unattended 是 policy 规则的显式 opt-in 字段,不是新审批器**。默认没有任何规则带它 ⇒ 行为与今天完全一致(Normal 动作在 sweep 里被拒),永不静默放宽——延续 policy 层"只收紧"的原则。
 3. **数据源活在 skill 里**。日历 = 一个用 web_fetch 调 CalDAV/API 的 skill;邮件同理。core 只保证:briefing agent 能 `skill view` 加载它们、能执行它们用到的(被策略放行的)工具。
 
@@ -36,7 +36,7 @@ Status: shipped except D3 weekly (implemented 2026-07-18) — weekly deferred: T
 - `[[policy.rule]]` 加可选 `unattended = true`:该 Allow 规则在**无 session** 上下文里也生效。Deny 语义不变(本来就无条件)。
 - 生效面收窄:只对 D1 这类显式传入"unattended 允许"的 approver 链生效——交互路径(chat/channel)完全不受影响。
 - 硬底线不动:shell 拒绝清单、HA `BLOCKED_DOMAINS` 仍在工具内部短路,unattended 规则解不开。
-- 操作面:`shion policy list` 标注 unattended 规则;`shion policy check --unattended` 干跑。
+- 操作面:`komo policy list` 标注 unattended 规则;`komo policy check --unattended` 干跑。
 - 文档姿态:示例只给只读场景(如 `network suffix your-caldav-host.com allow unattended`);shell 的 unattended 放行写明"你在为无人值守进程开 shell,风险自负"。
 
 ### D3: 每周摘要(顺手收割)

@@ -1,11 +1,11 @@
-//! `shion health` — liveness probe for the running gateway.
+//! `komo health` — liveness probe for the running gateway.
 //!
 //! Reads the rendezvous file and hits the api channel's unauthenticated
 //! `/health`. The exit code carries the verdict (0 = healthy, non-zero =
 //! anything else), which is the whole point: this is the Docker
 //! `HEALTHCHECK` command, so a wedged gateway turns the container unhealthy
 //! instead of sitting there "Running". Also handy interactively — it answers
-//! in one line where `shion doctor` gives the full report.
+//! in one line where `komo doctor` gives the full report.
 
 use crate::infra::{gateway_client::GatewayClient, rendezvous};
 

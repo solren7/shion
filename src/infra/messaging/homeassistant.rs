@@ -107,7 +107,7 @@ impl HomeAssistantSender {
 #[async_trait]
 impl TextSender for HomeAssistantSender {
     async fn send_text(&self, _chat_id: &str, text: &str) -> anyhow::Result<()> {
-        self.notify("Shion", text).await
+        self.notify("Komo", text).await
     }
 }
 
@@ -120,7 +120,7 @@ struct HomeAssistantReplySink {
 #[async_trait]
 impl crate::domain::gateway::ReplySink for HomeAssistantReplySink {
     async fn send(&self, text: &str) -> anyhow::Result<()> {
-        self.sender.notify("Shion", text).await
+        self.sender.notify("Komo", text).await
     }
 }
 

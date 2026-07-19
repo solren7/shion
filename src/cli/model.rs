@@ -1,9 +1,9 @@
-//! Model inspection and switching (`shion model list`, `shion model set`).
+//! Model inspection and switching (`komo model list`, `komo model set`).
 //!
 //! `list` shows the resolved provider/model and where each value comes from —
 //! straight from the shared `ConfigSnapshot`'s provenance report, so it can
 //! never disagree with what the agent actually resolves — plus every available
-//! provider. `set` persists a new selection into `~/.shion/config.toml`.
+//! provider. `set` persists a new selection into `~/.komo/config.toml`.
 //! Neither touches the database or requires the API key to be present.
 
 use crate::{
@@ -92,12 +92,8 @@ pub async fn list(config: &ConfigSnapshot) -> anyhow::Result<()> {
     }
     let provider = config.runtime.model.provider;
     let model = &config.runtime.model.model;
-    let provider_source = origin_label(config.report.provider_origin, "SHION_PROVIDER", "default");
-    let model_source = origin_label(
-        config.report.model_origin,
-        "SHION_MODEL",
-        "provider default",
-    );
+    let provider_source = origin_label(config.report.provider_origin, "KOMO_PROVIDER", "default");
+    let model_source = origin_label(config.report.model_origin, "KOMO_MODEL", "provider default");
 
     println!("Current");
     println!("  provider  {}  ({provider_source})", provider.name());
@@ -140,8 +136,8 @@ pub async fn list(config: &ConfigSnapshot) -> anyhow::Result<()> {
     }
 
     println!();
-    println!("Switch with: shion model set <provider> [model]");
-    println!("Codex shortcut: shion model set gpt-5.5");
+    println!("Switch with: komo model set <provider> [model]");
+    println!("Codex shortcut: komo model set gpt-5.5");
     Ok(())
 }
 
@@ -176,7 +172,7 @@ pub async fn set(
     // pre-write snapshot still tells us whether any are set.
     if config.report.provider_origin == Origin::Env || config.report.model_origin == Origin::Env {
         eprintln!(
-            "note: SHION_PROVIDER/SHION_MODEL are set and override config.toml; \
+            "note: KOMO_PROVIDER/KOMO_MODEL are set and override config.toml; \
              unset them for this change to take effect"
         );
     }

@@ -728,7 +728,7 @@ pub trait MemoryRepository: Send + Sync {
 
 /// What the nightly `DreamSweep` should do with a candidate memory, decided
 /// purely from its accumulated usage. Borrowed from OpenClaw's dreaming system,
-/// adapted to shion's governance ladder: instead of promoting daily-journal
+/// adapted to komo's governance ladder: instead of promoting daily-journal
 /// fragments into `MEMORY.md`, we promote reviewer-extracted **candidates** into
 /// the active, recallable set — and archive the ones that never earn their keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -760,7 +760,7 @@ pub const DREAM_PROMOTE_MIN_SCORE: f64 = 1.0;
 
 /// Dreaming score for a candidate: dominated by recall frequency, nudged by
 /// recency and importance. Explainable and embedding-free, matching the rest of
-/// shion's ranking. Higher = stronger case for promotion. (Query-diversity is
+/// komo's ranking. Higher = stronger case for promotion. (Query-diversity is
 /// a separate hard gate in [`dream_verdict`], not a score component — a
 /// diversity-failing candidate must not promote no matter how high it scores.)
 pub fn dream_score(memory: &Memory, now: i64) -> f64 {
@@ -776,7 +776,7 @@ pub fn dream_score(memory: &Memory, now: i64) -> f64 {
 
 /// Decide a candidate's fate for this dream cycle. Only `Candidate` memories are
 /// ever acted on — active memories (user-saved or already promoted) are left to
-/// the operator (`shion memory report` flags long-unused ones), so dreaming can
+/// the operator (`komo memory report` flags long-unused ones), so dreaming can
 /// never silently retire something the user deliberately kept.
 pub fn dream_verdict(memory: &Memory, now: i64) -> DreamVerdict {
     if memory.status != MemoryStatus::Candidate {
@@ -811,7 +811,7 @@ mod tests {
     fn scope_roundtrips_through_parts() {
         let scopes = [
             MemoryScope::Global,
-            MemoryScope::Project("shion".into()),
+            MemoryScope::Project("komo".into()),
             MemoryScope::Channel {
                 platform: "telegram".into(),
                 chat_id: "42".into(),
@@ -1036,7 +1036,7 @@ mod tests {
         let b = recall_query_hash("Language — PROJECT... rust?!");
         assert_eq!(a.len(), 16);
         assert_eq!(a, b, "same terms, any order/punctuation → same fingerprint");
-        let c = recall_query_hash("does shion support telegram");
+        let c = recall_query_hash("does komo support telegram");
         assert_ne!(a, c, "different substantive terms → different fingerprint");
         assert!(
             recall_query_hash("— …!").is_empty(),

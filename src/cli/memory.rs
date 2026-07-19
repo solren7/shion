@@ -1,4 +1,4 @@
-//! `shion memory` — operator-facing governance over the memory library.
+//! `komo memory` — operator-facing governance over the memory library.
 //!
 //! Unlike the in-chat `memory` tool (scoped to the current chat), the CLI is a
 //! host-side operator view: it lists and searches across *all* scopes, so you
@@ -216,7 +216,7 @@ pub async fn pin(control: &OperatorControl, id: &str) -> anyhow::Result<()> {
 /// triage, the pinned L1 set, low-confidence actives, long-unused actives, and
 /// expired memories. Read-only; suggests `promote`/`reject`/`archive`/`pin`.
 ///
-/// Recall counts (the dreaming usage signal) are shown per line; `shion dream`
+/// Recall counts (the dreaming usage signal) are shown per line; `komo dream`
 /// previews which candidates that signal would promote or archive.
 pub async fn report(control: &OperatorControl) -> anyhow::Result<()> {
     let memories = load_all(control).await?;

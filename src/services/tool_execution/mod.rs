@@ -304,7 +304,7 @@ impl ToolExecutionCore {
         result.map(|out| cap_tool_result(out, self.config.max_result_bytes))
     }
 
-    /// The trait-required fallback for a rig-driven completion (not on shion's
+    /// The trait-required fallback for a rig-driven completion (not on komo's
     /// hot path — the runtime owns the loop). Bridges from rig's fixed call
     /// signature: session from the ambient context if any, no run ledger.
     pub async fn execute_fallback(

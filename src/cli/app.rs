@@ -6,7 +6,7 @@ use super::{
 };
 
 #[derive(Parser)]
-#[command(name = "shion", version, about = "Personal agent framework")]
+#[command(name = "komo", version, about = "Personal agent framework")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -14,21 +14,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Bootstrap ~/.shion: write a commented default config.toml and a .env
+    /// Bootstrap ~/.komo: write a commented default config.toml and a .env
     /// credential template. Existing files are never overwritten.
     Init,
     /// Start an interactive chat session (full-screen TUI; needs a terminal)
     Chat,
     /// Run the always-on gateway: maintenance scheduler (and, later,
     /// config-declared ingress channels). Maintenance cron comes from
-    /// `schedule` in ~/.shion/config.toml (or SHION_SCHEDULE); default hourly.
+    /// `schedule` in ~/.komo/config.toml (or KOMO_SCHEDULE); default hourly.
     /// With no action, runs in the foreground (this is what launchd invokes).
     Gateway {
         #[command(subcommand)]
         action: Option<GatewayAction>,
     },
     /// Pull the latest source, rebuild + reinstall the binary, and restart the
-    /// gateway so the new build goes live (shion's analog of `hermes update`)
+    /// gateway so the new build goes live (komo's analog of `hermes update`)
     Upgrade {
         /// Rebuild and reinstall, but don't restart the gateway
         #[arg(long)]
@@ -71,7 +71,7 @@ enum Commands {
         #[command(subcommand)]
         action: SkillAction,
     },
-    /// Timeline of what shion has learned: memories (born/promoted/archived)
+    /// Timeline of what komo has learned: memories (born/promoted/archived)
     /// and skills (proposed/activated), newest first
     Journey {
         /// Maximum number of events to show
@@ -125,7 +125,7 @@ enum Commands {
         #[arg(long)]
         stdout: bool,
     },
-    /// Print the shion version
+    /// Print the komo version
     Version,
 }
 
@@ -366,17 +366,17 @@ fn require_terminal() -> anyhow::Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "`shion chat` is a full-screen TUI and needs a terminal.\n\
+        "`komo chat` is a full-screen TUI and needs a terminal.\n\
          For scripted access, POST to the gateway's api channel instead \
-         (`/v1/chat/completions`; address and key in ~/.shion/gateway.json)."
+         (`/v1/chat/completions`; address and key in ~/.komo/gateway.json)."
     )
 }
 
 pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // One resolved snapshot for the whole invocation: every source (config.toml,
-    // SHION_* env, .env secrets) is read exactly once. All paths live under the
-    // config home; use SHION_HOME to point at a different one (e.g. for tests
+    // KOMO_* env, .env secrets) is read exactly once. All paths live under the
+    // config home; use KOMO_HOME to point at a different one (e.g. for tests
     // or a second instance).
     let config = crate::config::ConfigSnapshot::load();
     match cli.command {
@@ -486,7 +486,7 @@ pub async fn run() -> anyhow::Result<()> {
             stdout,
         } => logs::run(lines, follow, stdout),
         Commands::Version => {
-            println!("shion {}", env!("CARGO_PKG_VERSION"));
+            println!("komo {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }

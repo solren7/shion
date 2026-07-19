@@ -193,7 +193,7 @@ impl Rule {
 }
 
 /// A verdict plus which rule produced it (`None` = fell through to a default).
-/// The rule index is into the policy's rule list as configured — `shion policy
+/// The rule index is into the policy's rule list as configured — `komo policy
 /// list` shows the same numbering, so a `check` result points at a real line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Decision {
@@ -226,7 +226,7 @@ impl Policy {
         }
     }
 
-    /// The configured rules, in evaluation-list order (for `shion policy list`).
+    /// The configured rules, in evaluation-list order (for `komo policy list`).
     pub fn rules(&self) -> &[Rule] {
         &self.rules
     }
@@ -238,7 +238,7 @@ impl Policy {
 
     /// Evaluate `request` for a turn on `channel` (`None` when no session is in
     /// scope, e.g. a maintenance sweep), reporting which rule matched — also the
-    /// dry-run surface behind `shion policy check`.
+    /// dry-run surface behind `komo policy check`.
     ///
     /// Deny rules take precedence over allow rules regardless of order; with no
     /// rule matching, `Risk::Normal` falls to `default_normal` and

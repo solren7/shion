@@ -41,7 +41,7 @@ pub struct SessionContext {
     /// the approval timeout against a sink no one is reading.
     pub interactive: bool,
     /// Whether approval-needing tool calls should be auto-approved without a
-    /// prompt. Set only for a **trusted** turn — a `shion chat` routed over the
+    /// prompt. Set only for a **trusted** turn — a `komo chat` routed over the
     /// gateway's loopback api channel, where the CLI user *is* the host
     /// operator (see `SessionContext::trusted`). The api channel gates this to
     /// loopback callers, so a publicly-bound api can never reach it. Leave
@@ -64,7 +64,7 @@ impl SessionContext {
     }
 
     /// A trusted context: like `detached` (no mid-turn prompting), but
-    /// approval-needing tool calls are auto-approved. Used for a `shion chat`
+    /// approval-needing tool calls are auto-approved. Used for a `komo chat`
     /// turn routed over the gateway's **loopback** api channel — the CLI user
     /// is the host operator, so there is no separate human to prompt. The api
     /// channel only builds this for loopback callers carrying the trusted

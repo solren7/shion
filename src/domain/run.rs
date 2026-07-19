@@ -10,7 +10,7 @@
 //!
 //! `recoverable` marks the resumable set (§6): set by `reconcile_interrupted`
 //! when a crash leaves a run mid-flight, cleared by `mark_resumed` once a
-//! resume turn has been dispatched — so `shion run resume` is at-most-once.
+//! resume turn has been dispatched — so `komo run resume` is at-most-once.
 
 use async_trait::async_trait;
 
@@ -171,7 +171,7 @@ pub fn resume_prompt(run: &Run, steps: &[RunStep]) -> String {
             if out.len() > RESUME_DIGEST_CAP {
                 out.push_str(&format!(
                     "…and {} more step(s), elided for length (full record: \
-                     `shion run inspect {}`).\n",
+                     `komo run inspect {}`).\n",
                     steps.len() - idx,
                     run.id
                 ));

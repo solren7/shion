@@ -14,7 +14,7 @@
 //! resolves a fresh token on demand and [`CodexHttpClient`] — a `rig`
 //! [`HttpClientExt`] backend — re-stamps the `Authorization` header on **every**
 //! outgoing request, so a turn an hour into the process still authenticates.
-//! Refreshed tokens are written back to `auth.json` so the Codex CLI and shion
+//! Refreshed tokens are written back to `auth.json` so the Codex CLI and komo
 //! stay in sync.
 
 use std::path::{Path, PathBuf};
@@ -43,7 +43,7 @@ const REFRESH_SKEW_SECS: u64 = 120;
 /// originators from non-residential IPs are served a 403 challenge.
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 /// `User-Agent` shaped like the upstream `codex-rs` CLI (beats SDK fingerprinting).
-const CODEX_USER_AGENT: &str = "codex_cli_rs/0.0.0 (shion)";
+const CODEX_USER_AGENT: &str = "codex_cli_rs/0.0.0 (komo)";
 
 pub const DEFAULT_CODEX_MODELS: &[&str] = &[
     "gpt-5.5",
@@ -459,7 +459,7 @@ impl CodexAuth {
             return Ok(guard.access_token.clone());
         }
 
-        // The Codex CLI (or another shion run) may have already refreshed the
+        // The Codex CLI (or another komo run) may have already refreshed the
         // shared file. Adopt it before spending our own (single-use) refresh
         // token: if it's fresh we're done, otherwise use its newer refresh token.
         if let Ok(fresh) = read_tokens(&self.path) {
@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn read_tokens_parses_chatgpt_shape() {
-        let dir = std::env::temp_dir().join(format!("shion_codex_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("komo_codex_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("auth.json");
         std::fs::write(
@@ -875,7 +875,7 @@ mod tests {
 
     #[test]
     fn write_back_preserves_other_fields() {
-        let dir = std::env::temp_dir().join(format!("shion_codex_wb_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("komo_codex_wb_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("auth.json");
         std::fs::write(
@@ -903,7 +903,7 @@ mod tests {
 
     #[test]
     fn cache_models_keep_visible_codex_backend_slugs() {
-        let dir = std::env::temp_dir().join(format!("shion_codex_cache_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("komo_codex_cache_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(
             dir.join("models_cache.json"),

@@ -329,7 +329,7 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
 
         let mut app = App::new("sess-1".into());
-        app.push(Role::Info, "Shion v0.1 — session sess-1");
+        app.push(Role::Info, "Komo v0.1 — session sess-1");
         app.push(Role::You, "hello 你好");
         app.push(Role::Agent, "hi there");
         app.input = "draft".into();

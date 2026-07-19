@@ -245,7 +245,7 @@ impl Channel for FeishuChannel {
                 }
 
                 // Pairing gate: unknown senders get a pairing code instead of
-                // the agent until `shion pair approve` runs on the host.
+                // the agent until `komo pair approve` runs on the host.
                 let sender = self.sender.clone();
                 let chat = msg.chat_id.clone();
                 let admitted = self
@@ -512,7 +512,7 @@ mod tests {
                 "mentions": [{
                     "key": "@_user_1",
                     "id": { "union_id": "un_b", "user_id": "u_b", "open_id": "ou_bot" },
-                    "name": "shion",
+                    "name": "komo",
                     "tenant_key": "t"
                 }]
             } }

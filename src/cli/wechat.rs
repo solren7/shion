@@ -1,9 +1,9 @@
-//! `shion wechat login` — interactive QR provisioning for the WeChat channel.
+//! `komo wechat login` — interactive QR provisioning for the WeChat channel.
 //!
 //! The gateway can't render a QR code (it runs headless under launchd), so the
 //! one interactive step — scanning a login QR with the WeChat app — is an
 //! operator command run on the host. It writes the iLink credentials to
-//! `~/.shion/wechat/credentials.json`; the gateway channel then reuses them
+//! `~/.komo/wechat/credentials.json`; the gateway channel then reuses them
 //! non-interactively. Re-provision by deleting that file and running this again.
 
 use qrcode::{QrCode, render::unicode};
@@ -43,6 +43,6 @@ pub async fn login() -> anyhow::Result<()> {
         creds.user_id, creds.account_id
     );
     println!("凭证已保存到 {}", cred_path.display());
-    println!("现在可以在 ~/.shion/config.toml 启用 [channels.wechat] 并重启 gateway。");
+    println!("现在可以在 ~/.komo/config.toml 启用 [channels.wechat] 并重启 gateway。");
     Ok(())
 }

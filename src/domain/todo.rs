@@ -5,7 +5,7 @@
 //!
 //! Modeled on the精简 intersection of hermes-agent's `TodoStore` and Claude
 //! Code's `TodoWrite`: `{content, status, active_form}`, full-list replace on
-//! write. Unlike those (which keep it purely in process memory), shion reloads
+//! write. Unlike those (which keep it purely in process memory), komo reloads
 //! a session per turn, so the list is persisted keyed by session id — but it is
 //! still disposable working state, cleared when the session rotates (`/new`).
 

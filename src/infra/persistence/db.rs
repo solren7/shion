@@ -105,7 +105,7 @@ struct PairingRecord {
     created_at: i64,
 }
 
-/// Failure-lockout counter for the `shion pair approve` path. A singleton row
+/// Failure-lockout counter for the `komo pair approve` path. A singleton row
 /// (`id = "approve"`); mirrors hermes' per-platform approve lockout.
 #[derive(Debug, toasty::Model)]
 struct LockoutRecord {
@@ -249,9 +249,9 @@ impl Db {
 // ── legacy skills (read-only) ─────────────────────────────────────────────────
 
 impl Db {
-    /// The skills a pre-filesystem shion accumulated in `shion.db` (the
+    /// The skills a pre-filesystem komo accumulated in `komo.db` (the
     /// reviewer used to write here; the runtime never read it). Read-only:
-    /// skills now live as files under `~/.shion/skills` (`infra/skills.rs`),
+    /// skills now live as files under `~/.komo/skills` (`infra/skills.rs`),
     /// and this backs the one-time candidate import at wiring time. The
     /// `SkillRecord` table stays in the schema only so old dbs remain readable.
     pub async fn export_legacy_skills(&self) -> anyhow::Result<Vec<Skill>> {
@@ -1157,7 +1157,7 @@ mod tests {
     #[tokio::test]
     async fn run_ledger_roundtrips_with_ordered_steps() {
         use crate::domain::run::{Run, RunStatus, RunStep};
-        let db = Db::connect(&sqlite_url("shion_run_repo_test.db"))
+        let db = Db::connect(&sqlite_url("komo_run_repo_test.db"))
             .await
             .unwrap();
 
@@ -1212,7 +1212,7 @@ mod tests {
     #[tokio::test]
     async fn run_prune_drops_old_runs_and_their_steps() {
         use crate::domain::run::{Run, RunStatus, RunStep};
-        let db = Db::connect(&sqlite_url("shion_run_prune_test.db"))
+        let db = Db::connect(&sqlite_url("komo_run_prune_test.db"))
             .await
             .unwrap();
 
@@ -1268,7 +1268,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_interrupted_fails_only_running_runs() {
         use crate::domain::run::{INTERRUPTED_ERROR, Run, RunStatus};
-        let db = Db::connect(&sqlite_url("shion_run_reconcile_test.db"))
+        let db = Db::connect(&sqlite_url("komo_run_reconcile_test.db"))
             .await
             .unwrap();
 
@@ -1316,7 +1316,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_repository_lists_sessions() {
-        let db = Db::connect(&sqlite_url("shion_session_repo_test.db"))
+        let db = Db::connect(&sqlite_url("komo_session_repo_test.db"))
             .await
             .unwrap();
         let first = Session::new("first");
@@ -1337,7 +1337,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_empty_sessions_prunes_only_sessions_without_messages() {
-        let db = Db::connect(&sqlite_url("shion_delete_empty_test.db"))
+        let db = Db::connect(&sqlite_url("komo_delete_empty_test.db"))
             .await
             .unwrap();
 
@@ -1366,7 +1366,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_empty_sessions_returns_zero_when_none_empty() {
-        let db = Db::connect(&sqlite_url("shion_delete_none_test.db"))
+        let db = Db::connect(&sqlite_url("komo_delete_none_test.db"))
             .await
             .unwrap();
 
@@ -1383,7 +1383,7 @@ mod tests {
 
     #[tokio::test]
     async fn db_reminder_schedule_roundtrip() {
-        let db = Db::connect(&sqlite_url("shion_reminder_schedule_test.db"))
+        let db = Db::connect(&sqlite_url("komo_reminder_schedule_test.db"))
             .await
             .unwrap();
         let now_unix = chrono::Utc::now().timestamp();
@@ -1412,7 +1412,7 @@ mod tests {
 
     #[tokio::test]
     async fn db_reminder_roundtrip() {
-        let db = Db::connect(&sqlite_url("shion_reminder_repo_test.db"))
+        let db = Db::connect(&sqlite_url("komo_reminder_repo_test.db"))
             .await
             .unwrap();
         let reminder = Reminder::new("drink water".to_string(), 9999999999);
@@ -1433,7 +1433,7 @@ mod tests {
     #[tokio::test]
     async fn db_session_todo_set_get_clear() {
         use crate::domain::todo::{TodoItem, TodoStatus};
-        let db = Db::connect(&sqlite_url("shion_session_todo_test.db"))
+        let db = Db::connect(&sqlite_url("komo_session_todo_test.db"))
             .await
             .unwrap();
 
@@ -1496,7 +1496,7 @@ mod tests {
     async fn db_pairing_upsert_approve_revoke_roundtrip() {
         use crate::domain::pairing::ApproveOutcome;
 
-        let db = Db::connect(&sqlite_url("shion_pairing_repo_test.db"))
+        let db = Db::connect(&sqlite_url("komo_pairing_repo_test.db"))
             .await
             .unwrap();
         let (request, code) = PairingRequest::mint("telegram", "777", "777");
@@ -1567,7 +1567,7 @@ mod tests {
     async fn db_pairing_locks_out_after_repeated_bad_codes() {
         use crate::domain::pairing::{APPROVE_MAX_FAILURES, ApproveOutcome};
 
-        let db = Db::connect(&sqlite_url("shion_pairing_lockout_test.db"))
+        let db = Db::connect(&sqlite_url("komo_pairing_lockout_test.db"))
             .await
             .unwrap();
 
@@ -1591,7 +1591,7 @@ mod tests {
 
     #[tokio::test]
     async fn rotate_archives_transcript_and_empties_live_session() {
-        let db = Db::connect(&sqlite_url("shion_rotate_test.db"))
+        let db = Db::connect(&sqlite_url("komo_rotate_test.db"))
             .await
             .unwrap();
         let sid = "telegram:rot";
@@ -1630,7 +1630,7 @@ mod tests {
 
     #[tokio::test]
     async fn home_repository_roundtrips_and_overwrites() {
-        let db = Db::connect(&sqlite_url("shion_home_repo_test.db"))
+        let db = Db::connect(&sqlite_url("komo_home_repo_test.db"))
             .await
             .unwrap();
 
@@ -1655,7 +1655,7 @@ mod tests {
         // Skills now live as files (`infra/skills.rs`); the db only backs the
         // one-time candidate import. Seed a legacy row directly and check the
         // export maps it with reviewer provenance.
-        let db = Db::connect(&sqlite_url("shion_skill_repo_test.db"))
+        let db = Db::connect(&sqlite_url("komo_skill_repo_test.db"))
             .await
             .unwrap();
         let mut conn = db.inner.connection().await.unwrap();
@@ -1679,7 +1679,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_windowed_returns_recent_messages_in_order() {
-        let db = Db::connect(&sqlite_url("shion_find_windowed_test.db"))
+        let db = Db::connect(&sqlite_url("komo_find_windowed_test.db"))
             .await
             .unwrap();
         let sid = "telegram:win";
@@ -1733,7 +1733,7 @@ mod tests {
 
     #[tokio::test]
     async fn count_user_turns_counts_only_user_messages() {
-        let db = Db::connect(&sqlite_url("shion_count_user_turns_test.db"))
+        let db = Db::connect(&sqlite_url("komo_count_user_turns_test.db"))
             .await
             .unwrap();
         let sid = "cli:count";
@@ -1768,7 +1768,7 @@ mod tests {
     /// query until the operator remembers the delete-to-reset convention.
     #[tokio::test]
     async fn adds_missing_session_columns_in_place() {
-        let path = std::env::temp_dir().join("shion_db_addcol.db");
+        let path = std::env::temp_dir().join("komo_db_addcol.db");
         crate::infra::persistence::reset_test_db(&path);
 
         // 1. Seed a turso file with the OLD session_records shape (no
@@ -1840,7 +1840,7 @@ mod tests {
     /// recoverable") until the operator remembers the delete-to-reset.
     #[tokio::test]
     async fn adds_missing_run_columns_in_place() {
-        let path = std::env::temp_dir().join("shion_db_addcol_runs.db");
+        let path = std::env::temp_dir().join("komo_db_addcol_runs.db");
         crate::infra::persistence::reset_test_db(&path);
 
         // 1. Seed a turso file with the OLD run_records shape (no recoverable):
@@ -1899,7 +1899,7 @@ mod tests {
     /// an already-higher watermark.
     #[tokio::test]
     async fn mark_reviewed_clamps_stale_and_never_regresses() {
-        let db = Db::connect(&sqlite_url("shion_mark_reviewed_race.db"))
+        let db = Db::connect(&sqlite_url("komo_mark_reviewed_race.db"))
             .await
             .unwrap();
         let sid = "telegram:42";

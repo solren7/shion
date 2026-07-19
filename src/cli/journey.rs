@@ -1,10 +1,10 @@
-//! `shion journey` — a read-only timeline of what shion has *learned* over
+//! `komo journey` — a read-only timeline of what komo has *learned* over
 //! time: long-term memories (born, promoted, archived) and governed skills
 //! (proposed as candidates, activated).
 //!
-//! This is the observability surface over shion's two learning subsystems
+//! This is the observability surface over komo's two learning subsystems
 //! (memory §5, skills §9). It is deliberately **not** an execution log — that
-//! is `shion run list`. It composes existing reads (the memory loader, which
+//! is `komo run list`. It composes existing reads (the memory loader, which
 //! routes to a running gateway over HTTP, and the file-backed skill store,
 //! which never needs the db lock), so it adds no new api endpoint or schema.
 //!
@@ -25,7 +25,7 @@ use crate::{
     services::operator_control::OperatorControl,
 };
 
-/// One dated thing shion learned (or forgot). Kept small and owned so the
+/// One dated thing komo learned (or forgot). Kept small and owned so the
 /// assembly logic is a pure, testable function over in-memory values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Event {
@@ -78,7 +78,7 @@ pub async fn journey(
     }
     println!(
         "\n({} event(s); timings inferred from created/updated + file mtimes. \
-         `shion memory list` / `shion skill list` show current state.)",
+         `komo memory list` / `komo skill list` show current state.)",
         shown.len()
     );
     Ok(())
@@ -137,7 +137,7 @@ pub(crate) fn memory_events(memories: &[Memory]) -> Vec<Event> {
 
 /// Flatten the skill store into candidate / active events, timed by the
 /// `SKILL.md` file mtime. Reads files only — no db lock, so it works while the
-/// gateway runs (same as `shion skill`).
+/// gateway runs (same as `komo skill`).
 fn skill_events(store: &FsSkillStore) -> Vec<Event> {
     let mut events = Vec::new();
     for s in store.list_candidates() {

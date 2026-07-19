@@ -1,4 +1,4 @@
-//! `shion dream` — operator view over the usage-driven memory "dreaming"
+//! `komo dream` — operator view over the usage-driven memory "dreaming"
 //! consolidation (the OpenClaw-borrowed back-loop).
 //!
 //! By default this is a **dry run**: it shows which candidate memories would be

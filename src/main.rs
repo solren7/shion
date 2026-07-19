@@ -15,10 +15,10 @@ mod tui;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // cwd .env first (developer override), then ~/.shion/.env.
+    // cwd .env first (developer override), then ~/.komo/.env.
     // dotenvy never overwrites an already-set variable, so the first loader wins.
     let _ = dotenvy::dotenv();
-    let _ = dotenvy::from_path(config::ensure_shion_home().join(".env"));
+    let _ = dotenvy::from_path(config::ensure_komo_home().join(".env"));
     init_tracing();
     cli::run().await
 }
@@ -26,16 +26,16 @@ async fn main() -> anyhow::Result<()> {
 /// Install the tracing subscriber. Without this every `info!`/`warn!`/`debug!`
 /// in the codebase is a no-op (events emitted, no consumer). Logs go to stderr
 /// (launchd captures the gateway's via the plist's `StandardErrorPath`); the
-/// level is controlled by `SHION_LOG` (e.g. `SHION_LOG=debug`), defaulting to
+/// level is controlled by `KOMO_LOG` (e.g. `KOMO_LOG=debug`), defaulting to
 /// `info`. `try_init` so a second call (e.g. in tests) is a harmless no-op.
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
-    // Default: shion's own logs at info, but mute two sources of noise —
+    // Default: komo's own logs at info, but mute two sources of noise —
     // toasty's per-connect schema chatter, and rig's `prompt_request` INFO
     // events, which log every tool call's *full result* verbatim (a wall of
-    // text for any list-returning tool). shion's own `tool ok` span line
+    // text for any list-returning tool). komo's own `tool ok` span line
     // (name/seq/elapsed, no result) still records each call concisely.
-    // `SHION_LOG` overrides the whole filter (e.g. `debug` to see everything).
+    // `KOMO_LOG` overrides the whole filter (e.g. `debug` to see everything).
     //
     // For every subcommand except the gateway, toasty's connection-pool ERROR
     // lines are muted too: a CLI that can't open the db (it's locked by the
@@ -47,17 +47,17 @@ fn init_tracing() {
     } else {
         ",toasty::db::pool=off"
     };
-    let filter = EnvFilter::try_from_env("SHION_LOG")
+    let filter = EnvFilter::try_from_env("KOMO_LOG")
         .unwrap_or_else(|_| EnvFilter::new(format!("info,toasty=warn,rig_core=warn{pool_noise}")));
 
     // The chat TUI owns the terminal (alternate screen): a stderr log line
     // would tear the display, so route tracing to a file for that mode.
     // Falls back to stderr if the log file can't be opened.
     //
-    // The gateway tees stderr with a daily-rotated file in ~/.shion/logs
+    // The gateway tees stderr with a daily-rotated file in ~/.komo/logs
     // (`gateway.YYYY-MM-DD.log`, 30 files kept, older ones auto-deleted):
     // stderr keeps `docker logs` / launchd capture working, the dated files
-    // are the durable month of history `shion logs` reads.
+    // are the durable month of history `komo logs` reads.
     let writer = if will_run_tui() {
         open_tui_log()
             .map(|f| fmt::writer::BoxMakeWriter::new(std::sync::Mutex::new(f)))
@@ -76,12 +76,12 @@ fn init_tracing() {
     let _ = fmt().with_env_filter(filter).with_writer(writer).try_init();
 }
 
-/// Daily-rotating gateway log under `~/.shion/logs`, one file per day
+/// Daily-rotating gateway log under `~/.komo/logs`, one file per day
 /// (`gateway.YYYY-MM-DD.log`), a month of history kept — the appender deletes
 /// older files itself. `None` (e.g. unwritable dir) degrades to stderr-only.
 fn open_gateway_log() -> Option<tracing_appender::rolling::RollingFileAppender> {
     const KEEP_DAYS: usize = 30;
-    let dir = config::ensure_shion_home().join("logs");
+    let dir = config::ensure_komo_home().join("logs");
     std::fs::create_dir_all(&dir).ok()?;
     tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
@@ -92,8 +92,8 @@ fn open_gateway_log() -> Option<tracing_appender::rolling::RollingFileAppender> 
         .ok()
 }
 
-/// Whether this invocation will run the full-screen chat TUI (`shion chat` /
-/// `shion session resume` on a TTY — off a TTY they error out early instead;
+/// Whether this invocation will run the full-screen chat TUI (`komo chat` /
+/// `komo session resume` on a TTY — off a TTY they error out early instead;
 /// see `cli/app.rs::require_terminal`) — checked here because the tracing
 /// writer must be chosen before the CLI parses.
 fn will_run_tui() -> bool {
@@ -105,9 +105,9 @@ fn will_run_tui() -> bool {
     is_chat && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
-/// Append-mode log file for TUI sessions (`~/.shion/logs/chat-tui.log`).
+/// Append-mode log file for TUI sessions (`~/.komo/logs/chat-tui.log`).
 fn open_tui_log() -> Option<std::fs::File> {
-    let dir = config::ensure_shion_home().join("logs");
+    let dir = config::ensure_komo_home().join("logs");
     std::fs::create_dir_all(&dir).ok()?;
     std::fs::OpenOptions::new()
         .create(true)

@@ -1,4 +1,4 @@
-//! Full-screen chat TUI — `shion chat`'s interface (a terminal is required;
+//! Full-screen chat TUI — `komo chat`'s interface (a terminal is required;
 //! scripted access goes through the gateway's api channel instead). A ratatui
 //! front end over two backends: a running gateway via [`GatewayClient::chat`]
 //! (trusted loopback, approvals auto-granted server-side), or the in-process
@@ -8,9 +8,9 @@
 //! bordered input box. In local mode, a side-effecting tool's approval request
 //! arrives over a channel ([`TuiApprover`]) and renders as a modal — `y`/`s`/`n`
 //! — with the same semantics as `cli/approver.rs`'s stdin prompt (still used
-//! by `shion run resume`).
+//! by `komo run resume`).
 //!
-//! Logs: `main.rs::init_tracing` routes tracing to `~/.shion/logs/chat-tui.log`
+//! Logs: `main.rs::init_tracing` routes tracing to `~/.komo/logs/chat-tui.log`
 //! when it detects the TUI will run — stderr writes would tear the alternate
 //! screen. `ratatui::init` installs a panic hook that restores the terminal.
 
@@ -100,7 +100,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     drive(connected, new_session_id(), false).await
 }
 
-/// Continue an existing session (`shion session resume <id>` on a TTY). Errors
+/// Continue an existing session (`komo session resume <id>` on a TTY). Errors
 /// if the session doesn't exist — resume never creates one.
 pub async fn resume(config: &ConfigSnapshot, session_id: &str) -> anyhow::Result<()> {
     let connected = connect(config).await?;
@@ -108,12 +108,12 @@ pub async fn resume(config: &ConfigSnapshot, session_id: &str) -> anyhow::Result
         Backend::Remote(gw) => {
             let known = gw.sessions().await?.iter().any(|s| s.id == session_id);
             if !known {
-                anyhow::bail!("no session with id `{session_id}` (see `shion session list`)");
+                anyhow::bail!("no session with id `{session_id}` (see `komo session list`)");
             }
         }
         Backend::Local { db, .. } => {
             if SessionRepository::find(&**db, session_id).await?.is_none() {
-                anyhow::bail!("no session with id `{session_id}` (see `shion session list`)");
+                anyhow::bail!("no session with id `{session_id}` (see `komo session list`)");
             }
         }
     }
@@ -193,7 +193,7 @@ async fn event_loop(
     app.push(
         Role::Info,
         format!(
-            "Shion v0.1 — {mode}, {} `{}`",
+            "Komo v0.1 — {mode}, {} `{}`",
             if resuming {
                 "resumed session"
             } else {

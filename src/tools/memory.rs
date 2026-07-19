@@ -305,7 +305,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_list_search_roundtrip() {
-        let tool = temp_tool("shion_mem_tool_test");
+        let tool = temp_tool("komo_mem_tool_test");
 
         tool.execute(json!({ "action": "save", "text": "用户喜欢蓝色" }).to_string())
             .await
@@ -334,7 +334,7 @@ mod tests {
 
     #[tokio::test]
     async fn promote_then_pin_via_update() {
-        let tool = temp_tool("shion_mem_tool_promote");
+        let tool = temp_tool("komo_mem_tool_promote");
         // A candidate (simulating a reviewer extraction).
         let mut cand = Memory::new(MemoryKind::Preference, "prefers concise answers");
         cand.status = MemoryStatus::Candidate;
@@ -357,7 +357,7 @@ mod tests {
 
     #[tokio::test]
     async fn reject_and_archive_set_status() {
-        let tool = temp_tool("shion_mem_tool_reject");
+        let tool = temp_tool("komo_mem_tool_reject");
         let m = Memory::new(MemoryKind::Fact, "ephemeral");
         tool.memories.save(&m).await.unwrap();
 
@@ -372,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_unknown_id_errors() {
-        let tool = temp_tool("shion_mem_tool_unknown");
+        let tool = temp_tool("komo_mem_tool_unknown");
         let err = tool
             .execute(json!({ "action": "promote", "id": "nope" }).to_string())
             .await

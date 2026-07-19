@@ -1,9 +1,9 @@
 //! Channel pairing: an unknown sender on a message platform must be approved
-//! from the shion host before the agent talks to them.
+//! from the komo host before the agent talks to them.
 //!
 //! The flow is a device-pairing handshake: the first message from an unpaired
 //! sender gets a short code as the only reply; someone with shell access to
-//! the host runs `shion pair approve <code>`, which proves they control the
+//! the host runs `komo pair approve <code>`, which proves they control the
 //! machine; from the next message on, the sender is admitted. Senders in a
 //! channel's `allow_from` list are pre-trusted and skip pairing.
 //!
@@ -14,7 +14,7 @@
 //!   - a sender can only be issued a fresh code once per [`PAIRING_RATE_LIMIT_SECS`];
 //!   - at most [`MAX_PENDING_PER_PLATFORM`] distinct senders may await approval
 //!     on a platform at a time;
-//!   - after [`APPROVE_MAX_FAILURES`] wrong `shion pair approve` codes the
+//!   - after [`APPROVE_MAX_FAILURES`] wrong `komo pair approve` codes the
 //!     approve command locks for [`APPROVE_LOCKOUT_SECS`].
 
 use async_trait::async_trait;
@@ -30,7 +30,7 @@ pub const PAIRING_RATE_LIMIT_SECS: i64 = 600;
 /// Cap on distinct senders awaiting approval on one platform at once.
 pub const MAX_PENDING_PER_PLATFORM: usize = 3;
 
-/// Wrong `shion pair approve` codes tolerated before the approve path locks.
+/// Wrong `komo pair approve` codes tolerated before the approve path locks.
 pub const APPROVE_MAX_FAILURES: i64 = 5;
 
 /// How long the approve path stays locked after too many failures.
@@ -156,7 +156,7 @@ pub fn ct_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// Outcome of approving a code from the host (`shion pair approve`).
+/// Outcome of approving a code from the host (`komo pair approve`).
 pub enum ApproveOutcome {
     Approved(PairingRequest),
     /// No pending, unexpired request matched the code.

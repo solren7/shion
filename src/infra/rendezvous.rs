@@ -1,4 +1,4 @@
-//! Gateway rendezvous file (`~/.shion/gateway.json`).
+//! Gateway rendezvous file (`~/.komo/gateway.json`).
 //!
 //! Turso takes an exclusive cross-process lock on each db file, so while the
 //! gateway runs it is the *sole* owner of `state.db` / `kanban.db` /
@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::config::shion_home;
+use crate::config::komo_home;
 
 /// Where the gateway advertises how to reach its loopback api channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,9 +43,9 @@ impl GatewayInfo {
     }
 }
 
-/// `~/.shion/gateway.json`.
+/// `~/.komo/gateway.json`.
 pub fn path() -> PathBuf {
-    shion_home().join("gateway.json")
+    komo_home().join("gateway.json")
 }
 
 /// Record how to reach the running gateway. Best-effort: a failure is logged

@@ -57,7 +57,7 @@ impl LlmClient for UnconfiguredLlm {
 pub struct RigLlm<M: CompletionModel> {
     agent: Agent<M>,
     /// Maximum tool-calling round-trips per user turn before the agent must
-    /// answer (config `max_turns`, env `SHION_MAX_TURNS`).
+    /// answer (config `max_turns`, env `KOMO_MAX_TURNS`).
     max_turns: usize,
     /// Rebuilds the system prompt each turn (see [`PreambleFn`]).
     preamble: PreambleFn,
@@ -188,7 +188,7 @@ where
 
 /// A [`TurnDriver`] backed by a per-turn rig [`Agent`] clone. Holds the growing
 /// conversation history (excluding the not-yet-sent prompt) so each round is a
-/// single `agent.completion(...).send()` — rig does one completion, shion owns
+/// single `agent.completion(...).send()` — rig does one completion, komo owns
 /// the loop.
 struct RigTurnDriver<M: CompletionModel> {
     agent: Agent<M>,
@@ -299,7 +299,7 @@ fn choice_text(choice: &OneOrMany<AssistantContent>) -> String {
     text
 }
 
-/// Split a model's assistant turn into shion's [`Step`]: any tool call makes it
+/// Split a model's assistant turn into komo's [`Step`]: any tool call makes it
 /// a [`Step::ToolCalls`]; otherwise the concatenated text is the final answer.
 /// Reasoning/image blocks are ignored for control flow (the driver still echoes
 /// them back into history verbatim).
@@ -340,14 +340,14 @@ pub fn build_llm(
     enricher: Option<Arc<MemoryEnricher>>,
 ) -> anyhow::Result<Arc<dyn LlmClient>> {
     // A missing API key degrades instead of failing construction: a fresh
-    // install (first Docker boot, pre-`shion init`) must still bring the
+    // install (first Docker boot, pre-`komo init`) must still bring the
     // gateway up — channels serve, pairing works — while every LLM call
     // reports the fix. Config resolution records the matching warning.
     if config.provider.uses_api_key() && config.api_key.is_empty() {
         return Ok(Arc::new(UnconfiguredLlm {
             message: format!(
-                "{} is not set (required for {:?}). Add it to ~/.shion/.env \
-                 (run `shion init` to scaffold one) or the container \
+                "{} is not set (required for {:?}). Add it to ~/.komo/.env \
+                 (run `komo init` to scaffold one) or the container \
                  environment, then restart the gateway.",
                 config.provider.api_key_var(),
                 config.provider
@@ -460,7 +460,7 @@ where
     }
 }
 
-/// Map a shion message into a rig chat-history message. The system prompt is
+/// Map a komo message into a rig chat-history message. The system prompt is
 /// supplied via the preamble, and tool outputs are folded into the following
 /// assistant reply, so both `System` and `Tool` roles are skipped here.
 fn to_rig_message(msg: &Message) -> Option<RigMessage> {

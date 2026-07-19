@@ -1,8 +1,8 @@
 //! Redacted configuration diagnostics: load issues and value provenance.
 //!
 //! The report never holds secret values — only whether a credential is
-//! present and where each resolved value came from. `shion doctor` and
-//! `shion model list` render it; `ConfigSnapshot::validate_gateway` fails
+//! present and where each resolved value came from. `komo doctor` and
+//! `komo model list` render it; `ConfigSnapshot::validate_gateway` fails
 //! startup on its fatal issues.
 
 use super::Provider;
@@ -12,9 +12,9 @@ use super::Provider;
 pub enum Origin {
     /// Built-in default (including per-provider model defaults).
     Default,
-    /// `~/.shion/config.toml`.
+    /// `~/.komo/config.toml`.
     File,
-    /// A `SHION_*` environment variable.
+    /// A `KOMO_*` environment variable.
     Env,
 }
 
@@ -22,7 +22,7 @@ pub enum Origin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueSeverity {
     /// The gateway (or an agent turn) cannot start with this problem:
-    /// malformed `SHION_*` values, an unusable model selection, an enabled
+    /// malformed `KOMO_*` values, an unusable model selection, an enabled
     /// channel missing its credential.
     Fatal,
     /// Worth surfacing in `doctor` but safe to run with.

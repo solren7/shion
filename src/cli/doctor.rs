@@ -1,6 +1,6 @@
-//! `shion doctor` — config & gateway health aggregation (roadmap §9).
+//! `komo doctor` — config & gateway health aggregation (roadmap §9).
 //!
-//! A single read-only snapshot of "what is shion configured to do, and what is
+//! A single read-only snapshot of "what is komo configured to do, and what is
 //! missing": the active model/provider and whether its API key is present, the
 //! sweep schedules, each ingress channel's enabled+credentials state, the
 //! resolved home channel, and the run ledger's recent failures.
@@ -146,7 +146,7 @@ fn policy_health(config: &ConfigSnapshot) {
         Verdict::Ask => "ask",
     };
     println!(
-        "  {OK} {} rule(s), default_normal = {d}  (see `shion policy list`)",
+        "  {OK} {} rule(s), default_normal = {d}  (see `komo policy list`)",
         report.policy.rules().len()
     );
     if !report.invalid.is_empty() {
@@ -192,7 +192,7 @@ fn channel_health(config: &ConfigSnapshot) {
                 println!("  {OK} {:<14} enabled", "wechat");
             } else {
                 println!(
-                    "  {BAD} {:<14} enabled but not logged in (run `shion channel wechat login`)",
+                    "  {BAD} {:<14} enabled but not logged in (run `komo channel wechat login`)",
                     "wechat"
                 );
             }

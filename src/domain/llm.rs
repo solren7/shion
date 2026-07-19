@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use super::session::Session;
 
-/// One model round-trip's outcome inside shion's own tool loop. The loop lives
+/// One model round-trip's outcome inside komo's own tool loop. The loop lives
 /// in `AgentRuntime` (not rig — roadmap §7), so it can insert control points
 /// between rounds: either the model produced a final answer, or it requested
 /// tools the runtime must execute and feed back.

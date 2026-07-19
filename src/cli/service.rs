@@ -1,10 +1,10 @@
 //! OS-level supervisor for the gateway.
 //!
-//! macOS uses `launchd`: `shion gateway start` writes a LaunchAgent plist and
+//! macOS uses `launchd`: `komo gateway start` writes a LaunchAgent plist and
 //! bootstraps it; launchd then owns the process (`KeepAlive` relaunches it
 //! after a crash, `RunAtLoad` starts it at login).
 //!
-//! Other platforms, including Linux containers, should run `shion gateway` in
+//! Other platforms, including Linux containers, should run `komo gateway` in
 //! the foreground and let the outer supervisor (Docker, Compose, systemd, etc.)
 //! own start/stop/restart.
 
@@ -56,7 +56,7 @@ pub fn status() -> anyhow::Result<()> {
     }
 }
 
-/// Whether a supervised gateway is currently live. `shion upgrade` uses this to
+/// Whether a supervised gateway is currently live. `komo upgrade` uses this to
 /// decide whether to restart — so an upgrade never *installs* the supervisor for
 /// someone who only runs the gateway in the foreground.
 pub fn gateway_loaded() -> anyhow::Result<bool> {
@@ -74,7 +74,7 @@ pub fn gateway_loaded() -> anyhow::Result<bool> {
 #[cfg(not(target_os = "macos"))]
 fn unsupported(action: &str) -> anyhow::Result<()> {
     anyhow::bail!(
-        "gateway {action} is macOS-only. In Docker/Linux, run `shion gateway` in \
+        "gateway {action} is macOS-only. In Docker/Linux, run `komo gateway` in \
          the foreground and use your supervisor, e.g. `docker restart <container>`."
     )
 }
@@ -88,10 +88,10 @@ mod launchd {
     use std::path::PathBuf;
     use std::process::Command;
 
-    const LABEL: &str = "com.shion.gateway";
+    const LABEL: &str = "com.komo.gateway";
 
     /// Render the LaunchAgent plist. Pure so the XML is unit-testable.
-    /// `exe` is the absolute shion binary path; `log_dir` holds stdout/stderr logs;
+    /// `exe` is the absolute komo binary path; `log_dir` holds stdout/stderr logs;
     /// `work_dir` is the process working directory (launchd defaults to `/`, which
     /// would make the workspace-confined tools useless).
     fn render_plist(exe: &str, log_dir: &str, work_dir: &str) -> String {
@@ -185,14 +185,14 @@ mod launchd {
         let domain = gui_domain()?;
         if is_loaded(&domain) {
             println!(
-                "shion gateway is already running under launchd. Use `shion gateway restart` to restart it."
+                "komo gateway is already running under launchd. Use `komo gateway restart` to restart it."
             );
             return Ok(());
         }
 
         let exe = std::env::current_exe()?;
-        let shion_home = crate::config::ensure_shion_home();
-        let log_dir = shion_home.join("logs");
+        let komo_home = crate::config::ensure_komo_home();
+        let log_dir = komo_home.join("logs");
         std::fs::create_dir_all(&log_dir)?;
 
         let path = plist_path()?;
@@ -204,7 +204,7 @@ mod launchd {
             render_plist(
                 &exe.display().to_string(),
                 &log_dir.display().to_string(),
-                &shion_home.display().to_string(),
+                &komo_home.display().to_string(),
             ),
         )?;
 
@@ -216,7 +216,7 @@ mod launchd {
             );
         }
         println!(
-            "shion gateway started under launchd ({LABEL}).\n\
+            "komo gateway started under launchd ({LABEL}).\n\
              It will restart automatically on crash and start at login.\n\
              Logs: {}/gateway.log",
             log_dir.display()
@@ -228,7 +228,7 @@ mod launchd {
     pub fn stop() -> anyhow::Result<()> {
         let domain = gui_domain()?;
         if !is_loaded(&domain) {
-            println!("shion gateway is not running under launchd.");
+            println!("komo gateway is not running under launchd.");
             return Ok(());
         }
         let out = launchctl(&["bootout", &format!("{domain}/{LABEL}")])?;
@@ -241,7 +241,7 @@ mod launchd {
         // Wait for the job to actually unload so the "stopped" report is truthful
         // and an immediate `start` afterwards isn't blocked by the stale job.
         wait_until_unloaded(&domain);
-        println!("shion gateway stopped.");
+        println!("komo gateway stopped.");
         Ok(())
     }
 
@@ -261,7 +261,7 @@ mod launchd {
             // `is_loaded` guard would otherwise see the stale job and no-op.
             if !wait_until_unloaded(&domain) {
                 anyhow::bail!(
-                    "gateway did not unload after bootout; wait a moment and run `shion gateway start`"
+                    "gateway did not unload after bootout; wait a moment and run `komo gateway start`"
                 );
             }
         }
@@ -273,7 +273,7 @@ mod launchd {
         let domain = gui_domain()?;
         let out = launchctl(&["print", &format!("{domain}/{LABEL}")])?;
         if !out.status.success() {
-            println!("shion gateway: not loaded (run `shion gateway start`).");
+            println!("komo gateway: not loaded (run `komo gateway start`).");
             return Ok(());
         }
         let text = String::from_utf8_lossy(&out.stdout);
@@ -298,23 +298,23 @@ mod launchd {
         #[test]
         fn plist_contains_label_exe_keepalive_and_workdir() {
             let plist = render_plist(
-                "/usr/local/bin/shion",
-                "/Users/me/.shion/logs",
-                "/Users/me/.shion",
+                "/usr/local/bin/komo",
+                "/Users/me/.komo/logs",
+                "/Users/me/.komo",
             );
-            assert!(plist.contains("<string>com.shion.gateway</string>"));
-            assert!(plist.contains("<string>/usr/local/bin/shion</string>"));
+            assert!(plist.contains("<string>com.komo.gateway</string>"));
+            assert!(plist.contains("<string>/usr/local/bin/komo</string>"));
             assert!(plist.contains("<string>gateway</string>"));
             assert!(plist.contains("<key>KeepAlive</key>"));
-            assert!(plist.contains("/Users/me/.shion/logs/gateway.log"));
+            assert!(plist.contains("/Users/me/.komo/logs/gateway.log"));
             assert!(plist.contains("<key>WorkingDirectory</key>"));
-            assert!(plist.contains("<string>/Users/me/.shion</string>"));
+            assert!(plist.contains("<string>/Users/me/.komo</string>"));
         }
 
         #[test]
         fn plist_escapes_xml_special_chars_in_paths() {
-            let plist = render_plist("/odd<&>path/shion", "/logs", "/work");
-            assert!(plist.contains("/odd&lt;&amp;&gt;path/shion"));
+            let plist = render_plist("/odd<&>path/komo", "/logs", "/work");
+            assert!(plist.contains("/odd&lt;&amp;&gt;path/komo"));
             assert!(!plist.contains("/odd<&>path"));
         }
     }

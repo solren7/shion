@@ -1,7 +1,7 @@
 //! Pure resolution: raw [`ConfigSources`] → one [`RuntimeConfig`] snapshot.
 //!
 //! Precedence is applied here exactly once — built-in defaults < `config.toml`
-//! < `SHION_*` env — and every problem found becomes a [`ConfigIssue`] instead
+//! < `KOMO_*` env — and every problem found becomes a [`ConfigIssue`] instead
 //! of an early error, so diagnostic consumers (`doctor`) always see the whole
 //! picture while startup paths fail fast via `ConfigSnapshot::validate_*`.
 
@@ -10,30 +10,30 @@ use std::path::PathBuf;
 
 use super::Provider;
 use super::report::{ConfigIssue, ConfigReport, IssueSeverity, Origin};
-use super::sources::{ConfigSources, PolicyFileConfig, PolicyRuleFileConfig, ShionEnv};
+use super::sources::{ConfigSources, KomoEnv, PolicyFileConfig, PolicyRuleFileConfig};
 
-/// Built-in default for `max_turns` when neither `SHION_MAX_TURNS` nor
+/// Built-in default for `max_turns` when neither `KOMO_MAX_TURNS` nor
 /// config.toml sets one. Multi-file edits easily take 10+ round-trips.
 pub const DEFAULT_MAX_TURNS: usize = 30;
 
 /// Built-in default byte cap on a tool result handed back to the LLM, when
-/// neither `SHION_MAX_TOOL_RESULT_BYTES` nor config.toml sets one. Sized above
+/// neither `KOMO_MAX_TOOL_RESULT_BYTES` nor config.toml sets one. Sized above
 /// the per-tool self-caps (web_fetch / homeassistant trim to 8 KB) so it only
 /// catches tools that don't self-trim.
 pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 16 * 1024;
 
 /// Built-in default for `max_history_messages` when neither
-/// `SHION_MAX_HISTORY_MESSAGES` nor config.toml sets one. Counts prior messages
+/// `KOMO_MAX_HISTORY_MESSAGES` nor config.toml sets one. Counts prior messages
 /// (user + assistant alternating, so ~25 turns), enough context for a chat
 /// assistant while keeping a long-lived session's per-turn cost bounded. `0`
 /// disables the window (replay the whole transcript, the pre-windowing behavior).
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
 /// Built-in reviewer cadence: run the reflective reviewer every N user turns
-/// when `SHION_REVIEW_INTERVAL` doesn't set one.
+/// when `KOMO_REVIEW_INTERVAL` doesn't set one.
 pub const DEFAULT_REVIEW_INTERVAL: usize = 10;
 
-/// Default maintenance cron when neither `SHION_SCHEDULE` nor config.toml
+/// Default maintenance cron when neither `KOMO_SCHEDULE` nor config.toml
 /// `schedule` sets one: hourly.
 pub const DEFAULT_MAINTENANCE_SCHEDULE: &str = "0 * * * *";
 
@@ -57,7 +57,7 @@ const DEFAULT_API_PORT: u16 = 8765;
 ///
 /// No `Debug` impl on purpose: several fields carry credentials.
 pub struct RuntimeConfig {
-    /// The `~/.shion` home directory the snapshot was resolved against.
+    /// The `~/.komo` home directory the snapshot was resolved against.
     pub home: PathBuf,
     /// `turso:` URL of the disposable session/state db (`state.db`).
     pub db_url: String,
@@ -79,7 +79,7 @@ pub struct RuntimeConfig {
     pub dream_schedule: Option<String>,
     /// The permission policy plus its load diagnostics.
     pub policy: PolicyReport,
-    /// Extra skill directories from `SHION_SKILLS_PATH` (colon-separated),
+    /// Extra skill directories from `KOMO_SKILLS_PATH` (colon-separated),
     /// highest priority first.
     pub skills_path: Vec<PathBuf>,
     /// The `homeassistant` *tool* credentials (`HASS_TOKEN`/`HASS_URL`);
@@ -174,7 +174,7 @@ impl ModelConfig {
     }
 }
 
-/// The resolved policy plus load diagnostics (for `shion policy list` / doctor).
+/// The resolved policy plus load diagnostics (for `komo policy list` / doctor).
 pub struct PolicyReport {
     pub policy: crate::domain::policy::Policy,
     /// Config indices (0-based `[[policy.rule]]` order) of ignored invalid rules.
@@ -274,7 +274,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
     // `api_key` stays empty and is resolved in `infra/codex.rs`.
     //
     // A missing key is a *warning*, not a fatal issue: a fresh install (first
-    // gateway boot in Docker, `shion init` before any credential exists) must
+    // gateway boot in Docker, `komo init` before any credential exists) must
     // come up rather than crash-loop. `build_llm` degrades to a client whose
     // every call reports this same fix, so turns fail with guidance instead.
     let api_key = if provider.uses_api_key() {
@@ -286,7 +286,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
                     severity: IssueSeverity::Warning,
                     message: format!(
                         "{} is not set (required for {provider:?}) — agent turns will \
-                         fail until it is added to ~/.shion/.env (see `shion init`)",
+                         fail until it is added to ~/.komo/.env (see `komo init`)",
                         provider.api_key_var()
                     ),
                 });
@@ -388,7 +388,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         },
     };
     // WeChat has no credential to check here — login is QR-based and the token
-    // lives in `~/.shion/wechat/credentials.json`, verified at serve time.
+    // lives in `~/.komo/wechat/credentials.json`, verified at serve time.
     let wechat = match channels.wechat.filter(|c| c.enabled) {
         None => ChannelState::Disabled,
         Some(cfg) => ChannelState::Ready(WeChatConfig {
@@ -412,7 +412,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
                 &mut issues,
                 "channels.homeassistant",
                 "[channels.homeassistant] is enabled but HASS_TOKEN is not set \
-                 (put it in ~/.shion/.env)"
+                 (put it in ~/.komo/.env)"
                     .to_string(),
             ),
         },
@@ -514,7 +514,7 @@ fn misconfigured<T>(
     ChannelState::Misconfigured(message)
 }
 
-/// Resolve a required channel credential read from `~/.shion/.env`. Channels
+/// Resolve a required channel credential read from `~/.komo/.env`. Channels
 /// keep secrets in the environment, never in `config.toml`; an enabled channel
 /// missing its secret gets one uniform message.
 fn require_secret(value: &Option<String>, channel: &str, var: &str) -> Result<String, String> {
@@ -523,9 +523,7 @@ fn require_secret(value: &Option<String>, channel: &str, var: &str) -> Result<St
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .ok_or_else(|| {
-            format!(
-                "[channels.{channel}] is enabled but {var} is not set (put it in ~/.shion/.env)"
-            )
+            format!("[channels.{channel}] is enabled but {var} is not set (put it in ~/.komo/.env)")
         })
 }
 
@@ -548,8 +546,8 @@ fn resolve_dream_schedule(configured: Option<String>) -> Option<String> {
     }
 }
 
-/// `SHION_SKILLS_PATH` (colon-separated) → extra skill dirs, order preserved.
-fn skills_dirs(env: &ShionEnv) -> Vec<PathBuf> {
+/// `KOMO_SKILLS_PATH` (colon-separated) → extra skill dirs, order preserved.
+fn skills_dirs(env: &KomoEnv) -> Vec<PathBuf> {
     env.skills_path
         .as_deref()
         .map(|extra| {
@@ -625,9 +623,9 @@ mod tests {
 
     fn sources() -> ConfigSources {
         ConfigSources {
-            home: PathBuf::from("/tmp/shion-test-home"),
+            home: PathBuf::from("/tmp/komo-test-home"),
             file: FileConfig::default(),
-            env: ShionEnv::default(),
+            env: KomoEnv::default(),
             secrets: Secrets::default(),
             env_error: None,
         }
@@ -736,7 +734,7 @@ mod tests {
     #[test]
     fn env_error_is_fatal_for_startup_not_diagnostics() {
         let mut s = with_deepseek_key(sources());
-        s.env_error = Some("invalid SHION_* environment variable: bad".into());
+        s.env_error = Some("invalid KOMO_* environment variable: bad".into());
         let snap = ConfigSnapshot::from_sources(s);
         let fatal = snap.report.fatal().expect("env error is fatal");
         assert_eq!(fatal.path, "env");
@@ -885,14 +883,14 @@ mod tests {
     #[test]
     fn db_urls_derive_from_home() {
         let snap = ConfigSnapshot::from_sources(with_deepseek_key(sources()));
-        assert_eq!(snap.runtime.db_url, "turso:/tmp/shion-test-home/state.db");
+        assert_eq!(snap.runtime.db_url, "turso:/tmp/komo-test-home/state.db");
         assert_eq!(
             snap.runtime.kanban_db_url,
-            "turso:/tmp/shion-test-home/kanban.db"
+            "turso:/tmp/komo-test-home/kanban.db"
         );
         assert_eq!(
             snap.runtime.memory_db_url,
-            "turso:/tmp/shion-test-home/memory.db"
+            "turso:/tmp/komo-test-home/memory.db"
         );
     }
 

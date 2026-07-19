@@ -1,4 +1,4 @@
-//! Raw configuration sources: `~/.shion/config.toml`, `SHION_*` environment
+//! Raw configuration sources: `~/.komo/config.toml`, `KOMO_*` environment
 //! overrides, and `.env` credentials.
 //!
 //! These types carry values verbatim — precedence, defaults, and validation
@@ -17,26 +17,26 @@ use super::Provider;
 /// resolves it purely — tests construct this directly instead of mutating the
 /// real process environment.
 pub struct ConfigSources {
-    /// The `~/.shion` home directory the sources were read relative to.
+    /// The `~/.komo` home directory the sources were read relative to.
     pub home: PathBuf,
     pub file: FileConfig,
-    pub env: ShionEnv,
+    pub env: KomoEnv,
     pub secrets: Secrets,
-    /// Set when the `SHION_*` environment failed strict parsing; its overrides
+    /// Set when the `KOMO_*` environment failed strict parsing; its overrides
     /// are then dropped (mirroring the old lenient path) and resolution records
     /// a fatal issue.
     pub env_error: Option<String>,
 }
 
 impl ConfigSources {
-    /// Read all three sources once. Never fails: a malformed `SHION_*` value is
+    /// Read all three sources once. Never fails: a malformed `KOMO_*` value is
     /// captured in `env_error` (and later reported) instead of aborting, so
     /// diagnostic consumers like `doctor` always get a full snapshot.
     pub fn load(home: PathBuf) -> Self {
         let file = FileConfig::load(&home);
-        let (env, env_error) = match ShionEnv::load() {
+        let (env, env_error) = match KomoEnv::load() {
             Ok(env) => (env, None),
-            Err(e) => (ShionEnv::default(), Some(e.to_string())),
+            Err(e) => (KomoEnv::default(), Some(e.to_string())),
         };
         let secrets = Secrets::load();
         Self {
@@ -49,11 +49,11 @@ impl ConfigSources {
     }
 }
 
-/// `SHION_*` environment overrides, deserialized in one place via envy.
+/// `KOMO_*` environment overrides, deserialized in one place via envy.
 /// dotenvy (`main.rs`) populates the process env from `.env` files first,
 /// so these see both real env vars and `.env` entries.
 #[derive(Debug, Deserialize, Default)]
-pub struct ShionEnv {
+pub struct KomoEnv {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
@@ -69,17 +69,17 @@ pub struct ShionEnv {
     pub skills_path: Option<String>,
 }
 
-impl ShionEnv {
-    /// Strict load: a malformed value (e.g. non-numeric `SHION_MAX_TURNS`)
+impl KomoEnv {
+    /// Strict load: a malformed value (e.g. non-numeric `KOMO_MAX_TURNS`)
     /// is an error. Use on paths that should fail fast at startup.
     pub fn load() -> anyhow::Result<Self> {
-        let env: ShionEnv = envy::prefixed("SHION_")
+        let env: KomoEnv = envy::prefixed("KOMO_")
             .from_env()
-            .map_err(|e| anyhow::anyhow!("invalid SHION_* environment variable: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("invalid KOMO_* environment variable: {e}"))?;
         Ok(env.normalized())
     }
 
-    /// Treat empty strings as unset, so `SHION_MODEL=` behaves like an
+    /// Treat empty strings as unset, so `KOMO_MODEL=` behaves like an
     /// absent variable.
     fn normalized(mut self) -> Self {
         for slot in [
@@ -100,10 +100,10 @@ impl ShionEnv {
     }
 }
 
-/// Every credential shion reads, loaded once from the environment (and thus from
-/// `~/.shion/.env`, which dotenvy folds into the process env at startup) via
+/// Every credential komo reads, loaded once from the environment (and thus from
+/// `~/.komo/.env`, which dotenvy folds into the process env at startup) via
 /// envy. Secrets live ONLY here, never in `config.toml` — keeping behavior (the
-/// `*FileConfig` types) and secrets (this one) in separate types is shion's
+/// `*FileConfig` types) and secrets (this one) in separate types is komo's
 /// security boundary, which a single merged config would erode. envy maps each
 /// field to its SCREAMING_SNAKE_CASE name, so `feishu_app_id` reads `FEISHU_APP_ID`
 /// — the per-channel prefixes are encoded in the field names, no `envy::prefixed`
@@ -164,9 +164,9 @@ impl Secrets {
     }
 }
 
-/// Settings read from `~/.shion/config.toml`. All fields are optional;
-/// absent keys fall back to `SHION_*` env vars then built-in defaults.
-/// API keys must never appear here — keep them in `~/.shion/.env`.
+/// Settings read from `~/.komo/config.toml`. All fields are optional;
+/// absent keys fall back to `KOMO_*` env vars then built-in defaults.
+/// API keys must never appear here — keep them in `~/.komo/.env`.
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct FileConfig {
@@ -217,7 +217,7 @@ impl FileConfig {
                 return FileConfig::default();
             }
             Err(e) => {
-                eprintln!("shion: could not read {}: {e}", path.display());
+                eprintln!("komo: could not read {}: {e}", path.display());
                 return FileConfig::default();
             }
         };
@@ -225,7 +225,7 @@ impl FileConfig {
             Ok(cfg) => cfg,
             Err(e) => {
                 eprintln!(
-                    "shion: {} is invalid (falling back to defaults): {e}",
+                    "komo: {} is invalid (falling back to defaults): {e}",
                     path.display()
                 );
                 FileConfig::default()
@@ -305,7 +305,7 @@ pub struct HomeAssistantChannelFileConfig {
 }
 
 /// `[channels.feishu]` table. App credentials never live here — they are
-/// read from `FEISHU_APP_ID` / `FEISHU_APP_SECRET` (in `~/.shion/.env`).
+/// read from `FEISHU_APP_ID` / `FEISHU_APP_SECRET` (in `~/.komo/.env`).
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct FeishuFileConfig {
@@ -321,7 +321,7 @@ pub struct FeishuFileConfig {
 }
 
 /// `[channels.telegram]` table. The bot token never lives here — it is read
-/// from `TELEGRAM_BOT_TOKEN` (in `~/.shion/.env`).
+/// from `TELEGRAM_BOT_TOKEN` (in `~/.komo/.env`).
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct TelegramFileConfig {
@@ -341,8 +341,8 @@ pub struct TelegramFileConfig {
 
 /// `[channels.wechat]` table: WeChat (微信) over the iLink personal-bot
 /// protocol. There are no credentials here or in `.env` — login is QR-based and
-/// the resulting token is stored in `~/.shion/wechat/credentials.json`
-/// (provisioned once with `shion wechat login`). DM-only, so no group/mention
+/// the resulting token is stored in `~/.komo/wechat/credentials.json`
+/// (provisioned once with `komo wechat login`). DM-only, so no group/mention
 /// keys.
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
@@ -359,9 +359,9 @@ pub struct WeChatFileConfig {
 
 /// `[channels.api]` table: the OpenAI-compatible + dashboard HTTP API. The
 /// bearer key never lives here — it is read from `API_SERVER_KEY` (in
-/// `~/.shion/.env`), like the other channels' credentials.
+/// `~/.komo/.env`), like the other channels' credentials.
 ///
-/// The api channel is **always on**: the `shion` CLI (and `shion chat`) reach a
+/// The api channel is **always on**: the `komo` CLI (and `komo chat`) reach a
 /// running gateway through it, because Turso's exclusive db lock means the CLI
 /// can't open the db itself while the gateway holds it. `enabled = true` widens
 /// it from the default loopback-only, ephemeral-port, CLI-only listener to an
@@ -388,7 +388,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn tmp(suffix: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("shion_config_test_{suffix}"));
+        let dir = std::env::temp_dir().join(format!("komo_config_test_{suffix}"));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -513,8 +513,8 @@ mod tests {
     }
 
     #[test]
-    fn shion_env_normalizes_empty_strings_to_unset() {
-        let env = ShionEnv {
+    fn komo_env_normalizes_empty_strings_to_unset() {
+        let env = KomoEnv {
             provider: Some("openai".into()),
             model: Some(String::new()),
             ..Default::default()

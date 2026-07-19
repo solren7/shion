@@ -1,4 +1,4 @@
-# Shion 架构深化方案
+# Komo 架构深化方案
 
 - 状态：Implemented（2026-07-11，commits bb5348f…b781243；§11 全部结构检查通过）
 - 范围：operator control、resolved configuration、tool execution、memory enrichment、review orchestration
@@ -6,7 +6,7 @@
 
 ## 1. 背景与目标
 
-Shion 当前的核心能力已经完整：gateway 常驻、CLI 经 loopback HTTP 路由、工具循环、memory recall、reviewer、run ledger 都已落地。当前问题不是缺少能力，而是部分实现随着能力增长变得 shallow：caller 需要知道过多选择规则、执行顺序和失败语义。
+Komo 当前的核心能力已经完整：gateway 常驻、CLI 经 loopback HTTP 路由、工具循环、memory recall、reviewer、run ledger 都已落地。当前问题不是缺少能力，而是部分实现随着能力增长变得 shallow：caller 需要知道过多选择规则、执行顺序和失败语义。
 
 本方案深化五个 module：
 
@@ -28,7 +28,7 @@ Shion 当前的核心能力已经完整：gateway 常驻、CLI 经 loopback HTTP
 
 - 不改变现有 `/api/*` HTTP 路由或 OpenAI-compatible chat 路由。
 - 不重做 Turso owner model；gateway 常驻仍是正常运行模式。
-- 不改变 config 的优先级：built-in defaults < `config.toml` < `SHION_*`。
+- 不改变 config 的优先级：built-in defaults < `config.toml` < `KOMO_*`。
 - 不改变 tool retry、审批、ledger、预算和结果截断的语义。
 - 不调整 memory 排名算法、dreaming 判据或 reviewer prompt。
 - 不合并 `SessionRepository` 与 `MessageRepository`；这可以作为后续独立议题。
@@ -271,7 +271,7 @@ contract suite 至少覆盖：
 `src/config.rs` 同时公开 raw structs、source loaders 和大量独立 resolver。`gateway`、`wiring`、`doctor`、`model` 分别调用：
 
 - `FileConfig::load`
-- `ShionEnv::load` / `load_lenient`
+- `KomoEnv::load` / `load_lenient`
 - `Secrets::load`
 - `maintenance_schedule`
 - `briefing_schedule`
@@ -386,7 +386,7 @@ gateway 在启动时创建一个 snapshot 并传给 `wiring::build` 与 `gateway
 ### 5.9 Acceptance criteria
 
 - gateway 启动只读取一次 file/env/secrets。
-- `wiring.rs`、`gateway.rs` 不直接调用 `FileConfig::load`、`ShionEnv::load`、`Secrets::load`。
+- `wiring.rs`、`gateway.rs` 不直接调用 `FileConfig::load`、`KomoEnv::load`、`Secrets::load`。
 - `doctor.rs` 不再复制 model/config precedence。
 - raw config structs 不进入 application caller。
 - 所有 secret-bearing types 的 debug 输出均已脱敏。
@@ -871,7 +871,7 @@ git diff --check
 rg 'GatewayClient::try_connect' src/cli src/tui
 
 # #2: wiring/gateway 不再读取 raw sources
-rg 'FileConfig::load|ShionEnv::load|Secrets::load' src/cli/wiring.rs src/cli/gateway.rs
+rg 'FileConfig::load|KomoEnv::load|Secrets::load' src/cli/wiring.rs src/cli/gateway.rs
 
 # #3: 不再存在 public free execution path
 rg 'execute_isolated|set_tool_result_cap' src

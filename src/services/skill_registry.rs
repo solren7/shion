@@ -11,7 +11,7 @@ use crate::domain::skill::Skill;
 /// only the directory list and **re-scans on every query**, so a skill
 /// installed, promoted, enabled, or disabled on disk is reflected the next time
 /// the `skill` tool runs — no gateway restart needed (the filesystem is the
-/// source of truth, matching `FsSkillStore` and the `shion skill` CLI). Reads
+/// source of truth, matching `FsSkillStore` and the `komo skill` CLI). Reads
 /// touch only a handful of small files, so live scanning is cheap. A registry
 /// built via [`new`](Self::new) instead holds a fixed list and never re-scans
 /// (used by tests).
@@ -35,7 +35,7 @@ impl SkillRegistry {
         }
     }
 
-    /// A live registry over multiple directories (e.g. shion's own `skills/`,
+    /// A live registry over multiple directories (e.g. komo's own `skills/`,
     /// the project's `.claude/skills/`, and the user's `~/.claude/skills/`).
     /// Each query re-scans these, so on-disk changes appear without a restart.
     /// The first directory to define a given skill name wins, so workspace-local
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn loads_skills_from_directory() {
-        let dir = std::env::temp_dir().join("shion_skill_reg_test");
+        let dir = std::env::temp_dir().join("komo_skill_reg_test");
         let skill_dir = dir.join("greet");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
@@ -159,10 +159,10 @@ mod tests {
     /// A skill written to disk *after* the registry is built must appear on the
     /// next query without reconstructing the registry — this is the no-restart
     /// hot-reload behavior (the bug that made `skill list` miss a freshly
-    /// installed skill while `shion skill list` saw it).
+    /// installed skill while `komo skill list` saw it).
     #[test]
     fn rescans_disk_so_new_skills_appear_without_restart() {
-        let dir = std::env::temp_dir().join("shion_skill_hot_reload_test");
+        let dir = std::env::temp_dir().join("komo_skill_hot_reload_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -207,13 +207,13 @@ mod tests {
 
     #[test]
     fn missing_directory_is_empty() {
-        let reg = SkillRegistry::load_from_dirs(&[PathBuf::from("/nonexistent/shion/skills")]);
+        let reg = SkillRegistry::load_from_dirs(&[PathBuf::from("/nonexistent/komo/skills")]);
         assert!(reg.is_empty());
     }
 
     #[test]
     fn disabled_skills_are_hidden_from_the_catalog_but_still_resolvable() {
-        let dir = std::env::temp_dir().join("shion_skill_disabled_test");
+        let dir = std::env::temp_dir().join("komo_skill_disabled_test");
         for (name, disabled) in [("alive", false), ("paused", true)] {
             let d = dir.join(name);
             std::fs::create_dir_all(&d).unwrap();
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn first_directory_wins_on_name_collision() {
-        let base = std::env::temp_dir().join("shion_skill_dirs_test");
+        let base = std::env::temp_dir().join("komo_skill_dirs_test");
         let local = base.join("local");
         let global = base.join("global");
         for (dir, body) in [(&local, "LOCAL version"), (&global, "GLOBAL version")] {

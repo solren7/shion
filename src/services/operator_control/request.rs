@@ -154,7 +154,7 @@ pub struct PairingView {
     pub created_at: i64,
 }
 
-/// One `skill view` step from the run ledger (backs `shion skill audit`).
+/// One `skill view` step from the run ledger (backs `komo skill audit`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillInvocation {
     pub run_id: String,
@@ -163,7 +163,7 @@ pub struct SkillInvocation {
     pub ok: bool,
 }
 
-/// The result of resuming an interrupted run, consumed by `shion run resume`.
+/// The result of resuming an interrupted run, consumed by `komo run resume`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeOutcome {
     pub run_id: String,

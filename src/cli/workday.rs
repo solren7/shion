@@ -1,4 +1,4 @@
-//! `shion workday [date]` — operator view of the Chinese working-day calendar.
+//! `komo workday [date]` — operator view of the Chinese working-day calendar.
 //!
 //! Reports whether a date is a workday (and triggers the once-a-year fetch +
 //! cache for its year if not already cached), so the gate can be verified

@@ -1,7 +1,7 @@
 //! Background maintenance daemon.
 //!
 //! Borrowed from gbrain's `autopilot` supervisor (a long-running loop that runs
-//! one work "cycle" on a schedule), trimmed to shion's needs:
+//! one work "cycle" on a schedule), trimmed to komo's needs:
 //!
 //!   - **cron-expression scheduling** — 5-field Unix syntax (`*/5 * * * *`) via
 //!     `croner`, rather than gbrain's fixed interval seconds.
@@ -13,7 +13,7 @@
 //!
 //! The OS-level supervisor install (launchd / systemd / crontab) that gbrain
 //! also ships is intentionally left out of v0.1: this is the in-process loop
-//! only, which a later `shion daemon --install` can wrap.
+//! only, which a later `komo daemon --install` can wrap.
 
 use std::{sync::Arc, time::Duration};
 
@@ -108,14 +108,14 @@ impl Maintenance for ReviewSweep {
     }
 }
 
-/// The "dreaming" consolidation sweep (OpenClaw's dreaming, adapted to shion's
+/// The "dreaming" consolidation sweep (OpenClaw's dreaming, adapted to komo's
 /// governance ladder). Runs on a low-frequency schedule (e.g. nightly `0 3 * * *`)
 /// and decides each candidate memory's fate purely from its accumulated usage:
 /// a candidate recalled often enough is promoted to active (and so becomes
 /// eligible for L3 recall going forward), while one that is old and never
 /// recalled is archived. **Importance is proven by use, not guessed at write
 /// time.** Only candidates are ever touched — user-saved/active memories are left
-/// to the operator (`shion memory report`) — and nothing is ever auto-*pinned*:
+/// to the operator (`komo memory report`) — and nothing is ever auto-*pinned*:
 /// dreaming can promote into recall (L3) but never into the always-injected
 /// profile (L1), which stays a manual, confirmed-only path.
 ///
@@ -127,7 +127,7 @@ pub struct DreamSweep {
 
 impl DreamSweep {
     /// Apply one dream cycle over all memories, returning what changed. Shared by
-    /// the scheduled sweep and the `shion dream --apply` CLI. A promotion lifts a
+    /// the scheduled sweep and the `komo dream --apply` CLI. A promotion lifts a
     /// candidate to `Active` with `Inferred` confidence — usage-proven, but not
     /// user-confirmed, so it surfaces in recall yet stays ineligible for L1
     /// pinning (which requires confirmed/user-written). Per-memory failures are
@@ -231,9 +231,9 @@ impl Maintenance for ReminderSweep {
             if r.is_recurring() {
                 // Notify first, then reschedule — prefer duplicate over silent loss.
                 let title = if late > REMINDER_GRACE_SECS {
-                    "Shion (missed reminder)"
+                    "Komo (missed reminder)"
                 } else {
-                    "Shion reminder"
+                    "Komo reminder"
                 };
                 self.notifier.notify(title, &r.message).await.ok();
                 // Compute next occurrence from now (not run_at) so a resting daemon
@@ -263,7 +263,7 @@ impl Maintenance for ReminderSweep {
                 // One-shot path — original v1 logic unchanged.
                 if late > REMINDER_GRACE_SECS {
                     self.notifier
-                        .notify("Shion (missed reminder)", &r.message)
+                        .notify("Komo (missed reminder)", &r.message)
                         .await
                         .ok();
                     if let Err(e) = self
@@ -274,10 +274,7 @@ impl Maintenance for ReminderSweep {
                         warn!(error = %e, id = %r.id, "failed to mark reminder missed");
                     }
                 } else {
-                    self.notifier
-                        .notify("Shion reminder", &r.message)
-                        .await
-                        .ok();
+                    self.notifier.notify("Komo reminder", &r.message).await.ok();
                     if let Err(e) = self
                         .reminders
                         .set_status(&r.id, ReminderStatus::Fired)
@@ -316,9 +313,9 @@ impl Maintenance for TaskSweep {
                 continue;
             }
             let title = if now - due_at > REMINDER_GRACE_SECS {
-                "Shion (overdue task)"
+                "Komo (overdue task)"
             } else {
-                "Shion task due"
+                "Komo task due"
             };
             let body = if task.waiting_on.is_empty() {
                 task.title.clone()
@@ -413,10 +410,7 @@ impl Maintenance for BriefingSweep {
         if text.is_empty() {
             return Ok(summary);
         }
-        self.notifier
-            .notify("Shion daily briefing", text)
-            .await
-            .ok();
+        self.notifier.notify("Komo daily briefing", text).await.ok();
         summary.briefings_sent = 1;
         Ok(summary)
     }
@@ -835,7 +829,7 @@ mod tests {
         sweep.run().await.unwrap();
 
         assert_eq!(notifier.calls.lock().unwrap().len(), 1);
-        assert_eq!(notifier.calls.lock().unwrap()[0].0, "Shion reminder");
+        assert_eq!(notifier.calls.lock().unwrap()[0].0, "Komo reminder");
 
         let rems = repo.reminders.lock().unwrap();
         let updated = rems.iter().find(|r| r.id == id).unwrap();
@@ -991,7 +985,7 @@ mod tests {
         let summary = sweep.run().await.unwrap();
         assert_eq!(summary.tasks_notified, 1);
         assert_eq!(notifier.calls.lock().unwrap().len(), 1);
-        assert_eq!(notifier.calls.lock().unwrap()[0].0, "Shion task due");
+        assert_eq!(notifier.calls.lock().unwrap()[0].0, "Komo task due");
         // Task stays open; only the guard flips. (Scoped so the guard is
         // provably released before the next await — clippy's
         // await_holding_lock doesn't credit an explicit drop().)
@@ -1024,7 +1018,7 @@ mod tests {
 
         sweep.run().await.unwrap();
         let calls = notifier.calls.lock().unwrap();
-        assert_eq!(calls[0].0, "Shion (overdue task)");
+        assert_eq!(calls[0].0, "Komo (overdue task)");
     }
 
     #[tokio::test]
@@ -1178,7 +1172,7 @@ mod tests {
         assert_eq!(summary.briefings_sent, 1);
         let calls = notifier.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "Shion daily briefing");
+        assert_eq!(calls[0].0, "Komo daily briefing");
         assert!(calls[0].1.contains("Good morning"));
     }
 

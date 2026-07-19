@@ -40,16 +40,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/shion" "dist/shion"
-          tar -czf "dist/shion-${{ matrix.asset_suffix }}.tar.gz" -C dist shion
-          rm -f dist/shion
+          cp "target/${{ matrix.target }}/release/komo" "dist/komo"
+          tar -czf "dist/komo-${{ matrix.asset_suffix }}.tar.gz" -C dist komo
+          rm -f dist/komo
           ls -lh dist
 
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
-          name: shion-${{ matrix.asset_suffix }}
-          path: dist/shion-${{ matrix.asset_suffix }}.tar.gz
+          name: komo-${{ matrix.asset_suffix }}
+          path: dist/komo-${{ matrix.asset_suffix }}.tar.gz
           if-no-files-found: error
           retention-days: 1
 
@@ -72,14 +72,14 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum shion-*.tar.gz > SHA256SUMS
+          sha256sum komo-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
       - name: Generate build provenance
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
-            dist/shion-*.tar.gz
+            dist/komo-*.tar.gz
             dist/SHA256SUMS
 
       - name: Create GitHub release

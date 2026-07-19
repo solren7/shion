@@ -10,7 +10,7 @@
 //! Caching is deliberately coarse — "fetch a year the first time any date in it
 //! is asked, then never again" — because the user only needs a yearly refresh:
 //! the State Council publishes the next year's arrangement once, late in the
-//! prior year. Each year is cached to `<shion_home>/workdays/{year}.json`; a new
+//! prior year. Each year is cached to `<komo_home>/workdays/{year}.json`; a new
 //! year rolls in automatically the first time it is queried. Delete a year's
 //! file (or the whole `workdays/` dir) to force a re-fetch.
 //!
@@ -198,7 +198,7 @@ mod tests {
     async fn listed_holiday_is_not_a_workday_and_makeup_day_is() {
         // Seed the disk cache so no network is touched: New Year's Day off, and
         // a Saturday (2026-02-14) flipped to a makeup workday by 调休.
-        let dir = std::env::temp_dir().join(format!("shion-workday-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("komo-workday-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let raw = HashMap::from([
             ("2026-01-01".to_string(), true),

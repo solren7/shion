@@ -1,9 +1,9 @@
-//! HTTP client the `shion` CLI uses to reach a **running gateway**.
+//! HTTP client the `komo` CLI uses to reach a **running gateway**.
 //!
 //! Turso takes an exclusive cross-process lock on each db file, so while the
 //! gateway runs the CLI can't open the db itself. Instead it talks to the
 //! gateway's always-on loopback api channel (`infra/messaging/api.rs`), which
-//! the gateway advertises in `~/.shion/gateway.json` (see `infra/rendezvous`).
+//! the gateway advertises in `~/.komo/gateway.json` (see `infra/rendezvous`).
 //!
 //! [`GatewayClient::try_connect`] is the single "is a gateway reachable?" check
 //! every CLI command makes: `Some` → route over HTTP, `None` → open the db
@@ -71,7 +71,7 @@ impl GatewayClient {
     }
 
     /// One quick unauthenticated `/health` probe. Shared by [`from_info`] and
-    /// `shion health` (the Docker HEALTHCHECK command).
+    /// `komo health` (the Docker HEALTHCHECK command).
     pub async fn health_ok(http: &reqwest::Client, base: &str) -> bool {
         http.get(format!("{base}/health"))
             .timeout(PROBE_TIMEOUT)
@@ -145,7 +145,7 @@ impl GatewayClient {
             .http
             .post(self.url(&format!("/api/runs/{id}/resume")))
             .bearer_auth(&self.key)
-            .header("X-Shion-Trusted", "1")
+            .header("X-Komo-Trusted", "1")
             .send()
             .await?;
         match resp.status() {
@@ -244,7 +244,7 @@ impl GatewayClient {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             anyhow::bail!(
                 "the running gateway doesn't serve `{path}` — it predates this command.\n\
-                 Restart it onto the current binary (`shion gateway restart`) and retry."
+                 Restart it onto the current binary (`komo gateway restart`) and retry."
             );
         }
         Ok(resp.error_for_status()?.json().await?)
@@ -326,7 +326,7 @@ impl GatewayClient {
     /// auto-approves side-effecting tools — it is gated to loopback callers).
     pub async fn chat(&self, session_id: &str, message: &str) -> anyhow::Result<String> {
         let body = json!({
-            "model": "shion",
+            "model": "komo",
             "stream": false,
             "messages": [{ "role": "user", "content": message }],
         });
@@ -334,8 +334,8 @@ impl GatewayClient {
             .http
             .post(self.url("/v1/chat/completions"))
             .bearer_auth(&self.key)
-            .header("X-Shion-Session-Id", session_id)
-            .header("X-Shion-Trusted", "1")
+            .header("X-Komo-Session-Id", session_id)
+            .header("X-Komo-Trusted", "1")
             .json(&body)
             .send()
             .await?

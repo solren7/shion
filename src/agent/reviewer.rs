@@ -96,7 +96,7 @@ impl Reviewer for ReflectiveReviewer {
                 .unwrap_or(MemoryKind::Fact);
             // Content-derived dedup key: skip if this session already produced
             // the same fact (an earlier sweep or earlier in this review), or if
-            // shion already holds it as an active, in-scope memory.
+            // komo already holds it as an active, in-scope memory.
             let key = memory_key(&suggestion.content);
             if seen_keys.contains(&key) || known_keys.contains(&key) {
                 continue;
@@ -109,7 +109,7 @@ impl Reviewer for ReflectiveReviewer {
             memory.status = MemoryStatus::Candidate;
             memory.confidence = MemoryConfidence::Extracted;
             memory.scope = ctx.write_scope();
-            // Tag the origin so a later answer can trace why shion believes this.
+            // Tag the origin so a later answer can trace why komo believes this.
             memory.source = session.id.clone();
             memory.source_message_id = key.clone();
             self.memories.save(&memory).await?;
@@ -534,7 +534,7 @@ mod tests {
 
     #[tokio::test]
     async fn dedups_extracted_memory_across_repeated_reviews() {
-        let reply = r#"{"memories":[{"kind":"fact","content":"shion uses Rust"}],"skills":[],"commitments":[]}"#;
+        let reply = r#"{"memories":[{"kind":"fact","content":"komo uses Rust"}],"skills":[],"commitments":[]}"#;
         let memories = Arc::new(FakeMemories::default());
         let reviewer = ReflectiveReviewer::new(
             Arc::new(FixedLlm(reply.to_string())),
@@ -553,13 +553,13 @@ mod tests {
 
     #[tokio::test]
     async fn does_not_re_extract_a_known_active_memory() {
-        // shion already holds this fact as an active, in-scope memory — distilled
+        // komo already holds this fact as an active, in-scope memory — distilled
         // from a *different* session, so the per-session source dedup can't catch
         // it. The reviewer must still refuse to re-ingest it (the assistant likely
         // echoed a recalled fact), instead of minting a duplicate candidate.
-        let reply = r#"{"memories":[{"kind":"fact","content":"shion uses Rust"}],"skills":[],"commitments":[]}"#;
+        let reply = r#"{"memories":[{"kind":"fact","content":"komo uses Rust"}],"skills":[],"commitments":[]}"#;
         let memories = Arc::new(FakeMemories::default());
-        let mut existing = Memory::new(MemoryKind::Fact, "shion uses Rust");
+        let mut existing = Memory::new(MemoryKind::Fact, "komo uses Rust");
         existing.status = MemoryStatus::Active;
         existing.scope = crate::domain::memory::MemoryScope::Channel {
             platform: "telegram".into(),
@@ -586,9 +586,9 @@ mod tests {
         // The same fact held active but scoped to a *different* channel was never
         // eligible to be recalled into this session, so it is not self-echo — a
         // channel-scoped candidate is still captured here.
-        let reply = r#"{"memories":[{"kind":"fact","content":"shion uses Rust"}],"skills":[],"commitments":[]}"#;
+        let reply = r#"{"memories":[{"kind":"fact","content":"komo uses Rust"}],"skills":[],"commitments":[]}"#;
         let memories = Arc::new(FakeMemories::default());
-        let mut existing = Memory::new(MemoryKind::Fact, "shion uses Rust");
+        let mut existing = Memory::new(MemoryKind::Fact, "komo uses Rust");
         existing.status = MemoryStatus::Active;
         existing.scope = crate::domain::memory::MemoryScope::Channel {
             platform: "feishu".into(),

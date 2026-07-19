@@ -1,4 +1,4 @@
-//! `shion policy` — inspect and dry-run the permission policy (roadmap §3).
+//! `komo policy` — inspect and dry-run the permission policy (roadmap §3).
 //!
 //! `list` shows the resolved rules exactly as the `PolicyApprover` will apply
 //! them (invalid config entries are already filtered out, and reported); the

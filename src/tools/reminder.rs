@@ -108,7 +108,7 @@ impl Tool for ReminderTool {
                         self.reminders.save(&reminder).await?;
                         Ok(format!(
                             "Reminder {id} set for {fire_time}. \
-                             Delivered by the gateway process — make sure `shion gateway` is running."
+                             Delivered by the gateway process — make sure `komo gateway` is running."
                         ))
                     }
                     (_, Some(at), _) => {
@@ -121,7 +121,7 @@ impl Tool for ReminderTool {
                         self.reminders.save(&reminder).await?;
                         Ok(format!(
                             "Reminder {id} set for {fire_time}. \
-                             Delivered by the gateway process — make sure `shion gateway` is running."
+                             Delivered by the gateway process — make sure `komo gateway` is running."
                         ))
                     }
                     (_, _, Some(cron)) => {
@@ -135,7 +135,7 @@ impl Tool for ReminderTool {
                         self.reminders.save(&reminder).await?;
                         Ok(format!(
                             "Recurring reminder {id} set: {cron} (next at {next_time}). \
-                             Delivered by the gateway process — make sure `shion gateway` is running."
+                             Delivered by the gateway process — make sure `komo gateway` is running."
                         ))
                     }
                     (None, None, None) => Err(anyhow::anyhow!(

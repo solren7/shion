@@ -1,5 +1,5 @@
 //! Operator control: one module owns how host-operator actions (list/inspect
-//! reads, governance and maintenance writes) reach shion's state.
+//! reads, governance and maintenance writes) reach komo's state.
 //!
 //! Turso's exclusive cross-process lock means a running gateway is the sole
 //! owner of the dbs — so every operator action has two transports: routed to
@@ -182,7 +182,7 @@ mod tests {
     use crate::domain::run::Run;
 
     fn temp_urls(tag: &str) -> StoreUrls {
-        let dir = std::env::temp_dir().join(format!("shion_opctl_{tag}"));
+        let dir = std::env::temp_dir().join(format!("komo_opctl_{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         StoreUrls {

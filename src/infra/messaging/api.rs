@@ -8,7 +8,7 @@
 //!     and `models`, so third-party chat frontends connect by pointing at
 //!     `http://127.0.0.1:8765/v1` with the bearer key.
 //!   - **dashboard** (`/api/*`): read views over the same repositories the
-//!     `shion` CLI uses — sessions, tasks, memories, runs, plus a `status`
+//!     `komo` CLI uses — sessions, tasks, memories, runs, plus a `status`
 //!     aggregate. These back the desktop control panel (roadmap §9).
 //!
 //! Unlike the chat channels, an HTTP request is synchronous request/response,
@@ -122,7 +122,7 @@ impl Channel for ApiChannel {
         // port is only known after bind — read it back and advertise it.
         let local = listener.local_addr()?;
         info!(addr = %local, "api channel listening");
-        // Publish how to reach this gateway so the local `shion` CLI can route
+        // Publish how to reach this gateway so the local `komo` CLI can route
         // to it instead of opening the db (which Turso's exclusive lock forbids
         // while the gateway holds it). Removed again on graceful shutdown.
         crate::infra::rendezvous::write(&crate::infra::rendezvous::GatewayInfo {
@@ -295,10 +295,10 @@ async fn list_models() -> impl IntoResponse {
     Json(json!({
         "object": "list",
         "data": [{
-            "id": "shion",
+            "id": "komo",
             "object": "model",
             "created": 0,
-            "owned_by": "shion",
+            "owned_by": "komo",
         }],
     }))
 }
@@ -312,16 +312,16 @@ async fn chat_completions(
     let (session_id, stateful) = resolve_session(&headers);
     let input = build_input(&req.messages, stateful);
     let model = if req.model.is_empty() {
-        "shion".to_string()
+        "komo".to_string()
     } else {
         req.model.clone()
     };
 
-    // A **trusted** turn — `shion chat` routed over the gateway's loopback api
+    // A **trusted** turn — `komo chat` routed over the gateway's loopback api
     // channel — auto-approves side-effecting tools (the CLI user is the host
     // operator). Gated to loopback callers so a publicly-bound api can never
     // reach it; everyone else gets the detached (auto-deny) context.
-    let trusted = peer.ip().is_loopback() && headers.contains_key("x-shion-trusted");
+    let trusted = peer.ip().is_loopback() && headers.contains_key("x-komo-trusted");
     let ctx = if trusted {
         SessionContext::trusted(&session_id)
     } else {
@@ -389,11 +389,11 @@ fn stream_completion(
 }
 
 /// Continue an existing conversation only when the client opts in with
-/// `X-Shion-Session-Id`. Without it, mint an ephemeral session so no server-side
+/// `X-Komo-Session-Id`. Without it, mint an ephemeral session so no server-side
 /// history accrues — the client manages its own context.
 fn resolve_session(headers: &axum::http::HeaderMap) -> (String, bool) {
     if let Some(id) = headers
-        .get("x-shion-session-id")
+        .get("x-komo-session-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
@@ -491,7 +491,7 @@ async fn list_memories(
     Ok(Json(json!({ "memories": memories })))
 }
 
-// Memory governance writes (`shion memory promote/reject/pin` while the gateway
+// Memory governance writes (`komo memory promote/reject/pin` while the gateway
 // holds the db lock). Host-operator actions — loopback-gated by the
 // `require_loopback` layer on the operator-writes router.
 
@@ -563,10 +563,10 @@ async fn get_run(
     }
 }
 
-/// Resume an interrupted run (backs `shion run resume` while the gateway holds
+/// Resume an interrupted run (backs `komo run resume` while the gateway holds
 /// the db lock): compose the priming input from the ledger and drive one normal
 /// turn in the run's original session, then clear the `recoverable` flag.
-/// Trust follows the chat rule — loopback + `X-Shion-Trusted` auto-approves
+/// Trust follows the chat rule — loopback + `X-Komo-Trusted` auto-approves
 /// (the CLI user is the host operator); anyone else runs detached (auto-deny).
 async fn resume_run(
     State(state): State<AppState>,
@@ -596,7 +596,7 @@ async fn resume_run(
         }
     };
 
-    let trusted = peer.ip().is_loopback() && headers.contains_key("x-shion-trusted");
+    let trusted = peer.ip().is_loopback() && headers.contains_key("x-komo-trusted");
     let ctx = if trusted {
         SessionContext::trusted(&run.session_id)
     } else {
@@ -639,7 +639,7 @@ async fn prune_runs(
     Ok(Json(json!({ "removed": removed })).into_response())
 }
 
-/// Delete every session with no messages (backs `shion session clean`).
+/// Delete every session with no messages (backs `komo session clean`).
 async fn clean_sessions(State(state): State<AppState>) -> Result<Response, ApiError> {
     let removed = state.actions.clean_sessions().await?;
     Ok(Json(json!({ "removed": removed })).into_response())
@@ -650,7 +650,7 @@ struct ApproveParams {
     code: String,
 }
 
-/// Approve the pending pairing bearing `code` (backs `shion pair approve`). The
+/// Approve the pending pairing bearing `code` (backs `komo pair approve`). The
 /// outcome variant is echoed so the CLI prints the same message it would locally.
 async fn pair_approve(
     State(state): State<AppState>,
@@ -666,7 +666,7 @@ async fn pair_approve(
     Ok(Json(json).into_response())
 }
 
-/// Remove a pairing by id (backs `shion pair revoke`).
+/// Remove a pairing by id (backs `komo pair revoke`).
 async fn pair_revoke(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -675,7 +675,7 @@ async fn pair_revoke(
     Ok(Json(json!({ "revoked": revoked })).into_response())
 }
 
-/// Run one dreaming consolidation cycle (backs `shion dream --apply`) — the same
+/// Run one dreaming consolidation cycle (backs `komo dream --apply`) — the same
 /// `DreamSweep` the gateway schedules.
 async fn dream_apply(State(state): State<AppState>) -> Result<Response, ApiError> {
     let summary = DreamSweep {
@@ -692,19 +692,19 @@ async fn dream_apply(State(state): State<AppState>) -> Result<Response, ApiError
 
 // ---- control-plane read endpoints (CLI ↔ gateway) --------------------------
 
-/// Pending reminders (backs `shion cron list`), soonest first.
+/// Pending reminders (backs `komo cron list`), soonest first.
 async fn list_reminders(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let pending = state.actions.pending_reminders().await?;
     Ok(Json(json!({ "reminders": pending })))
 }
 
-/// Registered skills (backs `shion skill list`), by name.
+/// Registered skills (backs `komo skill list`), by name.
 async fn list_skills(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let skills = state.actions.list_skills().await?;
     Ok(Json(json!({ "skills": skills })))
 }
 
-/// Which turns loaded a skill (backs `shion skill audit` while the gateway
+/// Which turns loaded a skill (backs `komo skill audit` while the gateway
 /// holds the db lock). Derived from the run ledger via the shared operator
 /// projection.
 async fn skill_audit(
@@ -715,14 +715,14 @@ async fn skill_audit(
     Ok(Json(json!({ "invocations": invocations })))
 }
 
-/// Pairings (backs `shion pair list`). A hash-free view — the salted code hash
+/// Pairings (backs `komo pair list`). A hash-free view — the salted code hash
 /// and per-row salt are never serialized off the host.
 async fn list_pairings(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let pairings = state.actions.pairing_views().await?;
     Ok(Json(json!({ "pairings": pairings })))
 }
 
-/// The dreaming dry-run classification (backs `shion dream`, no `--apply`):
+/// The dreaming dry-run classification (backs `komo dream`, no `--apply`):
 /// which candidates would promote / archive, with their scores. Read-only.
 async fn dream_preview(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let report = state.actions.dream_preview().await?;
@@ -788,7 +788,7 @@ mod tests {
     #[test]
     fn resolve_session_uses_header_when_present() {
         let mut headers = axum::http::HeaderMap::new();
-        headers.insert("x-shion-session-id", "panel-1".parse().unwrap());
+        headers.insert("x-komo-session-id", "panel-1".parse().unwrap());
         let (id, stateful) = resolve_session(&headers);
         assert_eq!(id, "api:panel-1");
         assert!(stateful);

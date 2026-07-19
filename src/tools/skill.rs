@@ -166,7 +166,7 @@ impl Tool for SkillTool {
                 self.store.save(&skill).await?;
                 Ok(format!(
                     "Learned `{name}` as a candidate skill. Review it with \
-                     `shion skill inspect {name}`, then `shion skill promote {name}` \
+                     `komo skill inspect {name}`, then `komo skill promote {name}` \
                      to activate (usable on the agent's next `skill` list once promoted)."
                 ))
             }
@@ -221,7 +221,7 @@ mod tests {
 
     /// A throwaway on-disk store rooted in a unique temp dir.
     fn store(tag: &str) -> Arc<FsSkillStore> {
-        let root = std::env::temp_dir().join(format!("shion_skilltool_{tag}"));
+        let root = std::env::temp_dir().join(format!("komo_skilltool_{tag}"));
         let _ = std::fs::remove_dir_all(&root);
         Arc::new(FsSkillStore::new(root))
     }

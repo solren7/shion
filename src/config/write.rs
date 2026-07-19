@@ -8,7 +8,7 @@ use super::Provider;
 /// every other key already present (schedule, base_url, aux_model, …).
 ///
 /// `model: None` removes the `model` key so the provider's default applies.
-/// Returns the path written. Note: any `SHION_PROVIDER` / `SHION_MODEL` env
+/// Returns the path written. Note: any `KOMO_PROVIDER` / `KOMO_MODEL` env
 /// vars still take priority over the file at resolve time.
 pub fn write_model_selection(
     home: &Path,

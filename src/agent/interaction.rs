@@ -5,7 +5,7 @@
 //! Borrowed from hermes-agent's gateway approval. Hermes runs the agent on a
 //! worker thread that blocks on a `threading.Event` keyed by session while the
 //! async message loop stays responsive and intercepts `/approve` to signal it.
-//! shion's tokio-native equivalent:
+//! komo's tokio-native equivalent:
 //!
 //!   - each turn is a **spawned task**, so the channel's receive loop keeps
 //!     polling while the turn is in flight (no deadlock);
@@ -189,7 +189,7 @@ impl Approver for ChatApprover {
             return false;
         };
 
-        // Trusted turn (a `shion chat` routed over the gateway's loopback api
+        // Trusted turn (a `komo chat` routed over the gateway's loopback api
         // channel): the CLI user is the host operator, so run without prompting.
         // The api channel only builds a trusted context for loopback callers.
         if ctx.auto_approve {
@@ -273,7 +273,7 @@ pub enum Command {
     /// Provision the WeChat channel by QR (delivered to this chat).
     WechatLogin,
     /// Approve/list/revoke pairings from chat — the gateway holds the db lock,
-    /// so the `shion pair` CLI can't open it while the gateway runs.
+    /// so the `komo pair` CLI can't open it while the gateway runs.
     Pair(PairAction),
     /// Ordinary message — run a turn.
     Plain(String),
@@ -340,7 +340,7 @@ pub struct GatewayDispatcher {
     todos: Arc<dyn SessionTodoRepository>,
     /// Set when the WeChat channel is enabled — drives `/wechat login`.
     wechat_login: Option<Arc<dyn WeChatLogin>>,
-    /// Backs the `/pair` chat commands (same store the `shion pair` CLI uses).
+    /// Backs the `/pair` chat commands (same store the `komo pair` CLI uses).
     pairings: Arc<dyn PairingRepository>,
     /// Per-session turn state. A session key is present iff a turn is in flight;
     /// its queue holds up to [`QUEUE_CAP`] messages that arrived mid-turn, drained
@@ -465,7 +465,7 @@ impl GatewayDispatcher {
 
     /// Run a `/pair` command against the shared pairing store. Lives in the
     /// gateway (which holds the db lock) so admitting a new sender no longer
-    /// needs the `shion pair` CLI — that CLI can't open the db while the
+    /// needs the `komo pair` CLI — that CLI can't open the db while the
     /// gateway is running. Any already-admitted sender may run it (same trust
     /// level as `/sethome` and `/wechat login`).
     async fn handle_pair(&self, action: PairAction) -> String {
@@ -540,7 +540,7 @@ impl GatewayDispatcher {
         let Some(login) = self.wechat_login.clone() else {
             tokio::spawn(async move {
                 let _ = sink
-                    .send("微信通道未启用：先在 ~/.shion/config.toml 配置 [channels.wechat]。")
+                    .send("微信通道未启用：先在 ~/.komo/config.toml 配置 [channels.wechat]。")
                     .await;
             });
             return;

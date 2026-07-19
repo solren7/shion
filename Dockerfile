@@ -4,7 +4,7 @@
 # frontend (Docker 23+) already supports the `RUN --mount=type=cache` used
 # below, so nothing here needs the external frontend.
 #
-# Multi-stage build for the shion gateway.
+# Multi-stage build for the komo gateway.
 #   builder : rust toolchain + protoc (feishu's protobuf is compiled at build
 #             time), produces the release binary
 #   runtime : debian-slim + CA certs (TLS to Telegram / Home Assistant / the
@@ -14,9 +14,9 @@
 #             tzdata (reminders and the briefing run on local time — set TZ)
 #
 # Build for the NAS's architecture, NOT your laptop's. On Apple Silicon:
-#   docker buildx build --platform linux/amd64 -t ghcr.io/solren7/shion:latest --push .
+#   docker buildx build --platform linux/amd64 -t ghcr.io/solren7/komo:latest --push .
 # Deployment lives in compose.yaml (registry pull by default; a Dockhand git
-# stack sets SHION_PULL_POLICY=build to build natively on the NAS).
+# stack sets KOMO_PULL_POLICY=build to build natively on the NAS).
 
 # ---- builder ----------------------------------------------------------------
 FROM rust:trixie AS builder
@@ -38,7 +38,7 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo build --release --locked \
-    && cp target/release/shion /usr/local/bin/shion
+    && cp target/release/komo /usr/local/bin/komo
 
 # ---- runtime ----------------------------------------------------------------
 FROM debian:trixie-slim AS runtime
@@ -47,22 +47,22 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tzdata libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/local/bin/shion /usr/local/bin/shion
+COPY --from=builder /usr/local/bin/komo /usr/local/bin/komo
 
 # All durable state (config.toml, .env, state.db / kanban.db / memory.db, logs)
 # lives here — mount a TrueNAS dataset to it so nothing is lost on redeploy.
-ENV SHION_HOME=/data
+ENV KOMO_HOME=/data
 VOLUME ["/data"]
 
 # The gateway is outbound-only (Telegram long-poll, Feishu WS, LLM API, LAN HA)
-# — no inbound port to EXPOSE. `shion gateway` runs in the foreground; Docker's
+# — no inbound port to EXPOSE. `komo gateway` runs in the foreground; Docker's
 # restart policy replaces launchd. One-off CLI ops bypass the entrypoint, e.g.
-#   docker exec shion shion pair approve <code>
+#   docker exec komo komo pair approve <code>
 
 # "Running" ≠ alive: probe the gateway's loopback /health (via the rendezvous
-# file in $SHION_HOME) so a wedged gateway flips the container unhealthy.
+# file in $KOMO_HOME) so a wedged gateway flips the container unhealthy.
 HEALTHCHECK --interval=60s --timeout=5s --start-period=30s --retries=3 \
-    CMD ["shion", "health"]
+    CMD ["komo", "health"]
 
-ENTRYPOINT ["shion"]
+ENTRYPOINT ["komo"]
 CMD ["gateway"]

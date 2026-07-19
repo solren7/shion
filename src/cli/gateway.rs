@@ -248,7 +248,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     }
 
     // Senders outside `allow_from` go through the pairing handshake; the
-    // pairing store is shared with the `shion pair` CLI via the same db.
+    // pairing store is shared with the `komo pair` CLI via the same db.
     let pairings: Arc<dyn PairingRepository> = db.clone();
     let mut channels = Vec::new();
     if let (Some(cfg), Some(sender)) = (feishu, &feishu_sender) {
@@ -295,7 +295,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // it needs the repositories rather than just the dispatcher. Added last so
     // `/api/status` can report every other channel that came up.
     // The api channel is **always on** (see `config::api_config`): it is how the
-    // local `shion` CLI reaches this gateway while we hold the exclusive Turso db
+    // local `komo` CLI reaches this gateway while we hold the exclusive Turso db
     // lock. By default it is loopback-only on an ephemeral port (published in the
     // rendezvous file); `[channels.api] enabled = true` widens it to an external
     // bind/port for Open WebUI / the dashboard.
@@ -342,7 +342,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             .unwrap_or_else(|| "off".to_string())
     };
     println!(
-        "Shion gateway — maintenance `{}`, reminders every minute, briefing {}, dreaming {}, channels: {}. Ctrl-C to stop.\n",
+        "Komo gateway — maintenance `{}`, reminders every minute, briefing {}, dreaming {}, channels: {}. Ctrl-C to stop.\n",
         schedule_expr,
         fmt_opt(briefing_expr),
         fmt_opt(dream_expr),
@@ -358,7 +358,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
 
 /// Resolve when the process is asked to stop. Catches both Ctrl-C (SIGINT, the
 /// foreground case) and SIGTERM — the signal `launchctl bootout` sends when
-/// `shion gateway stop`/`restart` tears the job down. Without the SIGTERM arm
+/// `komo gateway stop`/`restart` tears the job down. Without the SIGTERM arm
 /// launchd would kill the process before the shutdown notice could be sent.
 async fn shutdown_signal() {
     #[cfg(unix)]

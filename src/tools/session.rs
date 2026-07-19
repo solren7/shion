@@ -12,7 +12,7 @@ struct SessionArgs {
     action: String,
 }
 
-/// Introspection over Shion's own stored conversation sessions. Lets the
+/// Introspection over Komo's own stored conversation sessions. Lets the
 /// model answer "how many sessions do you have" from the database instead of
 /// reaching for shell commands like `tmux ls` or `who`.
 pub struct SessionTool {
@@ -32,7 +32,7 @@ impl Tool for SessionTool {
     }
 
     fn description(&self) -> &'static str {
-        "Inspect Shion's own stored conversation sessions (this agent's chat \
+        "Inspect Komo's own stored conversation sessions (this agent's chat \
          history database, NOT system/tmux/login sessions). action=\"count\" \
          returns how many sessions exist; action=\"list\" returns each \
          session's id, creation time, and message count."

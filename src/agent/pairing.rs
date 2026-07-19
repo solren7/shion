@@ -4,7 +4,7 @@
 //! approved pairing row → a recently-issued pending code (rate-limited, no new
 //! code) → otherwise mint a fresh code (subject to the per-platform pending
 //! cap) and tell the sender how to pair. Approval happens out-of-band via
-//! `shion pair approve`, which writes the shared SQLite db — the gateway picks
+//! `komo pair approve`, which writes the shared SQLite db — the gateway picks
 //! it up on the sender's next message, no restart needed.
 //!
 //! Hardening (after hermes-agent's `pairing.py`): codes are stored only as
@@ -128,8 +128,8 @@ impl PairingGuard {
 
 fn prompt(code: &str) -> String {
     format!(
-        "此账号尚未与 shion 配对。配对码: {code}\n\
-         请在 shion 所在主机上运行: shion pair approve {code}\n\
+        "此账号尚未与 komo 配对。配对码: {code}\n\
+         请在 komo 所在主机上运行: komo pair approve {code}\n\
          配对完成后再发消息即可对话。"
     )
 }
@@ -222,7 +222,7 @@ mod tests {
     /// Pull the 8-char pairing code out of a prompt reply.
     fn code_in(reply: &str) -> String {
         reply
-            .split("shion pair approve ")
+            .split("komo pair approve ")
             .nth(1)
             .and_then(|s| s.split_whitespace().next())
             .expect("reply carries a code")
@@ -274,7 +274,7 @@ mod tests {
         assert!(!admitted, "an unpaired sender is not admitted");
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1, "exactly one pairing prompt sent");
-        assert!(sent[0].contains("shion pair approve"), "{}", sent[0]);
+        assert!(sent[0].contains("komo pair approve"), "{}", sent[0]);
     }
 
     #[tokio::test]
@@ -283,7 +283,7 @@ mod tests {
         let Gate::Denied { reply } = guard.check("7", "7").await.unwrap() else {
             panic!("unknown sender must be denied");
         };
-        assert!(reply.contains("shion pair approve"), "{reply}");
+        assert!(reply.contains("komo pair approve"), "{reply}");
         // The minted code verifies against the stored (hashed) row.
         let code = code_in(&reply);
         let row = &repo.rows.lock().unwrap()[0];
@@ -299,7 +299,7 @@ mod tests {
             panic!("still unpaired");
         };
         // No fresh code minted; the pending row is untouched.
-        assert!(!reply.contains("shion pair approve"), "{reply}");
+        assert!(!reply.contains("komo pair approve"), "{reply}");
         assert_eq!(repo.rows.lock().unwrap().len(), 1);
         assert_eq!(repo.rows.lock().unwrap()[0].code_hash, first_hash);
     }
@@ -344,12 +344,12 @@ mod tests {
             let Gate::Denied { reply } = guard.check(&i.to_string(), "c").await.unwrap() else {
                 panic!("unpaired sender denied");
             };
-            assert!(reply.contains("shion pair approve"), "{reply}");
+            assert!(reply.contains("komo pair approve"), "{reply}");
         }
         // One past the cap: no code, told to try later.
         let Gate::Denied { reply } = guard.check("99", "c").await.unwrap() else {
             panic!("denied");
         };
-        assert!(!reply.contains("shion pair approve"), "{reply}");
+        assert!(!reply.contains("komo pair approve"), "{reply}");
     }
 }

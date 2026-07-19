@@ -183,7 +183,7 @@ mod tests {
     #[tokio::test]
     async fn write_then_read_roundtrips() {
         let dir = std::env::temp_dir();
-        let path = dir.join("shion_file_tool_test.txt");
+        let path = dir.join("komo_file_tool_test.txt");
         let path_str = path.to_string_lossy().to_string();
         let tool = tool_rooted_at(dir);
 
@@ -202,7 +202,7 @@ mod tests {
     async fn write_without_content_errors() {
         let dir = std::env::temp_dir();
         let path = dir
-            .join("shion_no_content.txt")
+            .join("komo_no_content.txt")
             .to_string_lossy()
             .to_string();
         let tool = tool_rooted_at(dir);
@@ -230,7 +230,7 @@ mod tests {
             }
         }
         let dir = std::env::temp_dir();
-        let path = dir.join("shion_denied_read.txt");
+        let path = dir.join("komo_denied_read.txt");
         std::fs::write(&path, "secret").unwrap();
         let tool = FileTool::new(Arc::new(Workspace::new(vec![dir])), Arc::new(DenyAll));
         let args = json!({ "action": "read", "path": path.to_string_lossy() });

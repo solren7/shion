@@ -41,12 +41,12 @@ effect = "deny"
 ```
 
 - `web_search` 不动:它只打固定的 provider API host,没有可变目标。
-- allow 规则对 network 无意义(本来就放行),`shion policy check` 对此给出提示(见 G3)。
+- allow 规则对 network 无意义(本来就放行),`komo policy check` 对此给出提示(见 G3)。
 
 不选的方案及原因:`web_fetch` 升 `Risk::Normal` + `default_network = "allow"`(类别级默认)——会让无 session 的 aux 子代理/sweep 的 fetch 落到 inner approver 被拒,破坏现有 web 检索;且多一个配置概念,换来的能力与 deny-only 等价。
 
 **附带收益(同一机制,顺手做)**:`file` 读路径同样发 `Risk::Safe + ActionRef::File { write: false }`,
-使 `category = "file", access = "read", effect = "deny"` 能封敏感路径(如 `~/.ssh`、`~/.shion/.env`)。
+使 `category = "file", access = "read", effect = "deny"` 能封敏感路径(如 `~/.ssh`、`~/.komo/.env`)。
 目前 file 读完全不经 approver,`access = "read"` 的 deny 规则同样是死配置。
 
 ### G2: 无人值守场景没有任何放行通道
@@ -75,12 +75,12 @@ unattended = true
 
 ### G3: 零操作面——写了规则无法验证,doctor 不显示
 
-**设计:`shion policy` 子命令 + doctor 段。**
+**设计:`komo policy` 子命令 + doctor 段。**
 
-- `shion policy list`:解析后的规则表(序号、channel scope、category、matcher、value、effect、标志)+ `default_normal` + 非法规则计数。纯本地 config 解析,不碰 db,不需要 gateway 路由。
-- `shion policy check <category> <target> [--channel <c>] [--dangerous] [--write]`:dry-run 一条动作,输出 verdict + 命中的规则序号(未命中则显示落到的默认)。例:
-  - `shion policy check shell "git push origin main"`
-  - `shion policy check network "https://api.github.com/repos" --channel telegram`
+- `komo policy list`:解析后的规则表(序号、channel scope、category、matcher、value、effect、标志)+ `default_normal` + 非法规则计数。纯本地 config 解析,不碰 db,不需要 gateway 路由。
+- `komo policy check <category> <target> [--channel <c>] [--dangerous] [--write]`:dry-run 一条动作,输出 verdict + 命中的规则序号(未命中则显示落到的默认)。例:
+  - `komo policy check shell "git push origin main"`
+  - `komo policy check network "https://api.github.com/repos" --channel telegram`
   - 对 network 的 allow 规则命中时提示"network 默认放行,此 allow 仅对 unattended 有意义"。
 - doctor 新增 `policy:` 段:规则数、非法规则数(>0 标 ✗)、`default_normal`。放在 sweeps 和 channels 之间。
 
@@ -93,14 +93,14 @@ unattended = true
 ## 审计(设计确认,不改代码)
 
 - 策略判定已有结构化日志(`policy: denied` / `policy: auto-allowed`,带 summary + channel);G2 落地时在日志里附命中规则的序号/值。
-- run ledger 不加字段:policy deny 的结果已经以工具错误形式进入 `RunStep`(模型和 `shion run inspect` 都可见),"no dead fields" 原则继续成立。
+- run ledger 不加字段:policy deny 的结果已经以工具错误形式进入 `RunStep`(模型和 `komo run inspect` 都可见),"no dead fields" 原则继续成立。
 
 ## 实施顺序
 
 | # | issue | 内容 | 规模 |
 |---|-------|------|------|
 | 01 | deny-only-for-safe | `Policy`/`PolicyApprover` 支持 Safe+action 的 deny-only 评估;`web_fetch` 埋点;`file` 读路径埋点 | 中 |
-| 02 | policy-cli | `shion policy list` / `shion policy check`;doctor `policy:` 段 | 中 |
+| 02 | policy-cli | `komo policy list` / `komo policy check`;doctor `policy:` 段 | 中 |
 | 03 | docs | README 示例、AGENTS.md 架构条目、roadmap §3 重写 | 小 |
 | 04 | unattended-flag | `unattended` 规则标志 + `PolicyApprover` 窄通道(后置,等 briefing-via-skill 立项时一起) | 小 |
 
@@ -110,4 +110,4 @@ unattended = true
 
 - 每 channel 的 `default_normal`(规则已可按 channel 写 deny/allow,再加维度是配置复杂度换不来表达力)。
 - skill 维度的 category(skill 最终落到具体工具调用,每个调用已被现有类别覆盖)。
-- 规则热加载(config 改动重启 gateway 即可,`shion gateway restart` 秒级)。
+- 规则热加载(config 改动重启 gateway 即可,`komo gateway restart` 秒级)。

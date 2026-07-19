@@ -3,13 +3,13 @@
 //!
 //! hermes runs its cron ticker as a thread *inside* the gateway because the
 //! gateway is already the always-on process; ingress (Telegram/Slack adapters)
-//! lives there too. shion follows that shape:
+//! lives there too. komo follows that shape:
 //!
 //!   - **background services** — the maintenance scheduler from `daemon.rs`,
 //!     run as a tokio task inside the gateway (its only host).
 //!   - **ingress channels** — pluggable `Channel`s that route inbound messages
 //!     through a `MessageHandler` (the wired `AgentRuntime`). None are wired
-//!     today; they will be declared in ~/.shion/config.toml and constructed
+//!     today; they will be declared in ~/.komo/config.toml and constructed
 //!     from there.
 //!
 //! All tasks share one `watch` shutdown signal; on Ctrl-C the gateway flips it
@@ -150,7 +150,7 @@ impl Gateway {
         // from blocking shutdown.
         if let Some(notice) = &shutdown_notice {
             let send = notice.notify(
-                "⚠️ Shion 已下线",
+                "⚠️ Komo 已下线",
                 "网关正在停止，暂时无法响应消息，稍后回来。",
             );
             match tokio::time::timeout(SHUTDOWN_NOTICE_TIMEOUT, send).await {

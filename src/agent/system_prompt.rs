@@ -13,7 +13,7 @@
 //!     drifts, kept last so the stable+context prefix stays byte-identical and
 //!     upstream prompt caches stay warm.
 //!
-//! Hermes builds this once per session and caches it; shion builds it once at
+//! Hermes builds this once per session and caches it; komo builds it once at
 //! agent construction (the chat REPL is one sitting = one session; the gateway
 //! shares one agent identity across sessions). The date line is **day**
 //! precision on purpose — byte-stable for the whole day, so a rebuild never
@@ -26,10 +26,10 @@ use std::time::SystemTime;
 
 use chrono::Local;
 
-use crate::config::{ModelConfig, shion_home};
+use crate::config::{ModelConfig, komo_home};
 
-/// Base persona, used when no `~/.shion/SOUL.md` override is present.
-const IDENTITY: &str = "You are Shion, a concise and helpful personal agent. \
+/// Base persona, used when no `~/.komo/SOUL.md` override is present.
+const IDENTITY: &str = "You are Komo, a concise and helpful personal agent. \
     When a request needs live information or an action, call one of your tools \
     instead of guessing.";
 
@@ -39,14 +39,14 @@ const TIME_GUIDANCE: &str = "Use the `time` tool when you need the exact current
 
 /// Gated on any of the state-backed tools (`session` / `memory` / `skill`).
 const STATE_GUIDANCE: &str = "Questions about your own state — your sessions, \
-    conversation history, memories, or skills — refer to Shion's database, not the \
+    conversation history, memories, or skills — refer to Komo's database, not the \
     operating system: answer them with the `session`, `memory`, or `skill` tools, \
     never with shell commands like `tmux ls` or `who`.";
 
 /// Gated on the `reminder` tool.
 const REMINDER_GUIDANCE: &str = "You CAN schedule reminders: call the `reminder` tool \
     (action=create) with a message and a delay. Reminders are delivered as desktop \
-    notifications by the `shion gateway` background process — you do NOT count down \
+    notifications by the `komo gateway` background process — you do NOT count down \
     yourself, and you must never pretend to track time in the conversation. If the \
     user asks for a reminder, create it with the tool and relay the tool's \
     confirmation. For recurring reminders (\"every day at 9am\"), pass a 5-field cron \
@@ -66,7 +66,7 @@ const CONTEXT_FILES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", ".cursorrules"];
 /// Cap on an included context file, mirroring hermes' 20k-char head truncation.
 const CONTEXT_FILE_CAP: usize = 20_000;
 
-/// Assembles shion's system prompt from cache-ordered tiers.
+/// Assembles komo's system prompt from cache-ordered tiers.
 ///
 /// Built via chained setters, then `build()`:
 ///
@@ -107,7 +107,7 @@ impl SystemPromptBuilder {
             workspace_root: None,
             model: config.model.clone(),
             provider: config.provider.name(),
-            home: shion_home(),
+            home: komo_home(),
             cache: Mutex::new(None),
         }
     }
@@ -146,7 +146,7 @@ impl SystemPromptBuilder {
     fn stable(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
 
-        // Persona: an operator-supplied ~/.shion/SOUL.md wins (hermes' SOUL.md
+        // Persona: an operator-supplied ~/.komo/SOUL.md wins (hermes' SOUL.md
         // analog); otherwise the built-in identity.
         let persona = std::fs::read_to_string(self.home.join("SOUL.md"))
             .ok()
@@ -290,7 +290,7 @@ mod tests {
     }
 
     fn tmp(suffix: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("shion_sysprompt_test_{suffix}"));
+        let dir = std::env::temp_dir().join(format!("komo_sysprompt_test_{suffix}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -301,7 +301,7 @@ mod tests {
         let p = SystemPromptBuilder::new(&config())
             .home(tmp("minimal"))
             .build();
-        assert!(p.contains("You are Shion"));
+        assert!(p.contains("You are Komo"));
         assert!(p.contains("Model: deepseek-chat"));
         assert!(p.contains("Provider: deepseek"));
         // No tools → no tool-aware guidance.
@@ -325,7 +325,7 @@ mod tests {
         let p = SystemPromptBuilder::new(&config())
             .home(tmp("order"))
             .build();
-        let identity_at = p.find("You are Shion").unwrap();
+        let identity_at = p.find("You are Komo").unwrap();
         let date_at = p.find("Today's date is").unwrap();
         assert!(
             identity_at < date_at,
@@ -366,7 +366,7 @@ mod tests {
         std::fs::write(home.join("SOUL.md"), "You are Nyx, a terse oracle.").unwrap();
         let p = SystemPromptBuilder::new(&config()).home(home).build();
         assert!(p.contains("You are Nyx, a terse oracle."));
-        assert!(!p.contains("You are Shion"));
+        assert!(!p.contains("You are Komo"));
     }
 
     #[test]

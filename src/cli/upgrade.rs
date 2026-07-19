@@ -1,18 +1,18 @@
-//! `shion upgrade` — pull the latest source, rebuild + reinstall the binary, and
+//! `komo upgrade` — pull the latest source, rebuild + reinstall the binary, and
 //! restart the macOS launchd gateway so the new build goes live.
 //!
-//! shion's analog of hermes' `hermes update` (git pull → reinstall → restart),
-//! minus hermes' fork-sync / Windows-ZIP / hangup machinery — shion is a
+//! komo's analog of hermes' `hermes update` (git pull → reinstall → restart),
+//! minus hermes' fork-sync / Windows-ZIP / hangup machinery — komo is a
 //! single-user macOS/Rust tool, so the flow stays small:
 //!
 //!   1. `git pull --ff-only` in the repo this binary was built from
 //!      (`CARGO_MANIFEST_DIR`, baked in at compile time).
 //!   2. `cargo install --path <repo> --force`, reinstalled to the **currently
 //!      running** binary's location.
-//!   3. `shion gateway restart` on macOS — but only if the gateway is actually
+//!   3. `komo gateway restart` on macOS — but only if the gateway is actually
 //!      loaded under launchd, so an upgrade never installs the service uninvited.
 //!      Docker/Linux deployments should restart the container/process outside
-//!      shion after upgrading.
+//!      komo after upgrading.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -39,14 +39,14 @@ pub fn run(no_restart: bool) -> anyhow::Result<()> {
     };
     if !repo.exists() {
         anyhow::bail!(
-            "source repo {} no longer exists — `shion upgrade` rebuilds from the \
+            "source repo {} no longer exists — `komo upgrade` rebuilds from the \
              checkout this binary was built in. Re-clone it (or rebuild from the new \
              location) and `cargo install --path .` to relink.",
             repo.display()
         );
     }
     println!(
-        "shion upgrade — current version {}\nrepo: {}",
+        "komo upgrade — current version {}\nrepo: {}",
         env!("CARGO_PKG_VERSION"),
         repo.display()
     );
@@ -97,10 +97,10 @@ pub fn run(no_restart: bool) -> anyhow::Result<()> {
     }
 
     // 3. Restart the gateway so the new binary goes live — only if it is being
-    //    supervised by shion itself. Docker/Linux deployments run the gateway in
+    //    supervised by komo itself. Docker/Linux deployments run the gateway in
     //    the foreground and should be restarted by the outer supervisor.
     if no_restart {
-        println!("\n--no-restart: skipped. Run `shion gateway restart` to go live.");
+        println!("\n--no-restart: skipped. Run `komo gateway restart` to go live.");
     } else if service::gateway_loaded().unwrap_or(false) {
         println!("\n→ restarting gateway");
         service::restart()?;
@@ -113,8 +113,8 @@ pub fn run(no_restart: bool) -> anyhow::Result<()> {
 }
 
 /// The `cargo install --root` that lands the new binary back on the currently
-/// running binary's path: if the live binary is `<root>/bin/shion`, return
-/// `<root>` (so `cargo install --root <root>` writes `<root>/bin/shion`).
+/// running binary's path: if the live binary is `<root>/bin/komo`, return
+/// `<root>` (so `cargo install --root <root>` writes `<root>/bin/komo`).
 /// Returns `None` — meaning the default cargo bin dir — when the layout isn't
 /// the standard `.../bin/<exe>` (e.g. a `cargo run` dev build under `target/`).
 fn cargo_root_for_current_exe() -> Option<PathBuf> {
@@ -158,7 +158,7 @@ mod tests {
     /// to the main checkout, and the main checkout resolves to itself.
     #[test]
     fn main_worktree_resolves_linked_worktrees_to_the_main_checkout() {
-        let dir = std::env::temp_dir().join("shion_upgrade_worktree_test");
+        let dir = std::env::temp_dir().join("komo_upgrade_worktree_test");
         let _ = std::fs::remove_dir_all(&dir);
         let main = dir.join("repo");
         std::fs::create_dir_all(&main).unwrap();
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn main_worktree_is_none_outside_a_repo() {
-        let dir = std::env::temp_dir().join("shion_upgrade_nonrepo_test");
+        let dir = std::env::temp_dir().join("komo_upgrade_nonrepo_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(main_worktree_of(&dir).is_none());

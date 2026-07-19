@@ -48,7 +48,7 @@ pub struct Wiring {
     pub aux_llm: Arc<dyn LlmClient>,
     /// The markdown memory store, also read by the briefing sweep.
     pub memories: Arc<dyn MemoryRepository>,
-    /// The governed skill store (`~/.shion/skills`, files — roadmap §9), shared
+    /// The governed skill store (`~/.komo/skills`, files — roadmap §9), shared
     /// with the gateway's api channel.
     pub skills: Arc<FsSkillStore>,
     /// Mid-turn clarify state: the `ask_user` tool waits on it; the gateway
@@ -70,7 +70,7 @@ pub async fn build(
     kanban: Arc<KanbanDb>,
     approver: Arc<dyn Approver>,
 ) -> anyhow::Result<Wiring> {
-    // An unusable model selection (bad SHION_* value, unknown provider,
+    // An unusable model selection (bad KOMO_* value, unknown provider,
     // missing API key) can't produce a working agent — fail here like the old
     // strict resolver did.
     config.validate_agent()?;
@@ -122,10 +122,10 @@ pub async fn build(
         )));
     }
 
-    // Memories live in their own SQLite file (~/.shion/memory.db), shared by the
+    // Memories live in their own SQLite file (~/.komo/memory.db), shared by the
     // `memory` tool, the reflective reviewer, the L1 pinned injection, and the
     // briefing sweep. On first run it seeds itself from any legacy markdown
-    // memories under ~/.shion/memory/ (a one-time, no-op-once-populated import).
+    // memories under ~/.komo/memory/ (a one-time, no-op-once-populated import).
     let memory_db = MemoryDb::connect(&config.runtime.memory_db_url).await?;
     let imported = memory_db
         .import_legacy_markdown(&config.runtime.home.join("memory"))
@@ -148,15 +148,15 @@ pub async fn build(
     let aux_llm = build_llm(&aux_config, None, aux_preamble, None)?;
     tools.register(Arc::new(DelegateTool::new(aux_llm.clone())));
 
-    // The governed skill store: `~/.shion/skills` is the shion-owned home for
+    // The governed skill store: `~/.komo/skills` is the komo-owned home for
     // durable skills (files, not db — roadmap §9). Reviewer proposals land in
     // its `.candidates/` for triage; a one-time import moves any skills a
-    // pre-filesystem shion accumulated in shion.db into that triage pile.
+    // pre-filesystem komo accumulated in komo.db into that triage pile.
     let skill_store = Arc::new(FsSkillStore::new(FsSkillStore::default_root()));
     match db.export_legacy_skills().await {
         Ok(rows) if !rows.is_empty() => match skill_store.import_legacy_db(rows) {
             Ok(0) => {}
-            Ok(n) => tracing::info!(n, "imported legacy shion.db skills as candidates"),
+            Ok(n) => tracing::info!(n, "imported legacy komo.db skills as candidates"),
             Err(error) => tracing::warn!(%error, "legacy skill import failed"),
         },
         Ok(_) => {}
@@ -164,8 +164,8 @@ pub async fn build(
     }
 
     // Skills load from, in priority order (first to define a name wins):
-    //   SHION_SKILLS_PATH (colon-separated), <workspace>/skills,
-    //   <workspace>/.claude/skills, the governed ~/.shion/skills store, and the
+    //   KOMO_SKILLS_PATH (colon-separated), <workspace>/skills,
+    //   <workspace>/.claude/skills, the governed ~/.komo/skills store, and the
     //   user-global ~/.claude/skills shared by general agents (Claude Agent
     //   Skills `SKILL.md` format).
     let root = workspace.roots().first().cloned().unwrap_or_default();
@@ -260,7 +260,7 @@ pub async fn build(
     // a `Risk::Normal` action passes only through an explicit `unattended`
     // policy rule. Safe reads (web_fetch, skill view) work out of the box.
     // Sharing the run ledger (`runs: db`) makes every briefing execution
-    // auditable via `shion run list`.
+    // auditable via `komo run list`.
     let briefing_approver = crate::agent::policy_approver::PolicyApprover::wrap(
         config.runtime.policy.policy.clone(),
         Arc::new(UnattendedDeny),

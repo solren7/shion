@@ -1,14 +1,14 @@
 //! Configuration as one resolved snapshot.
 //!
-//! Raw sources (`~/.shion/config.toml`, `SHION_*` env vars, `.env` secrets) are
+//! Raw sources (`~/.komo/config.toml`, `KOMO_*` env vars, `.env` secrets) are
 //! read once by [`sources::ConfigSources`] and resolved purely into a
 //! [`ConfigSnapshot`]: the [`RuntimeConfig`] every caller consumes plus a
 //! redacted [`ConfigReport`] of issues and provenance. Precedence (built-in
-//! defaults < `config.toml` < `SHION_*`), credential-missing semantics, and
+//! defaults < `config.toml` < `KOMO_*`), credential-missing semantics, and
 //! per-value defaults live in `resolved.rs` — callers never re-derive them.
 //!
 //! Resolution never aborts: problems are recorded as [`ConfigIssue`]s so
-//! diagnostics (`shion doctor`) always see the whole picture, while startup
+//! diagnostics (`komo doctor`) always see the whole picture, while startup
 //! paths fail fast via [`ConfigSnapshot::validate_agent`] /
 //! [`ConfigSnapshot::validate_gateway`].
 
@@ -106,7 +106,7 @@ impl Provider {
     }
 }
 
-/// One resolved view of everything shion is configured to do, plus the
+/// One resolved view of everything komo is configured to do, plus the
 /// redacted diagnostics that explain it. Load once per process (or construct
 /// from explicit [`ConfigSources`] in tests) and pass it down — callers never
 /// re-read `config.toml`, the env, or `.env`.
@@ -116,11 +116,11 @@ pub struct ConfigSnapshot {
 }
 
 impl ConfigSnapshot {
-    /// Read all sources once (ensuring `~/.shion` exists) and resolve.
+    /// Read all sources once (ensuring `~/.komo` exists) and resolve.
     /// Never fails — problems land in the report; validate before starting
     /// long-running work.
     pub fn load() -> Self {
-        Self::from_sources(ConfigSources::load(ensure_shion_home()))
+        Self::from_sources(ConfigSources::load(ensure_komo_home()))
     }
 
     /// Pure resolution seam: tests provide sources directly instead of
@@ -131,7 +131,7 @@ impl ConfigSnapshot {
     }
 
     /// Fail on the issues that make an agent turn impossible: a malformed
-    /// `SHION_*` env or an unusable model selection. Channel problems don't
+    /// `KOMO_*` env or an unusable model selection. Channel problems don't
     /// block a chat turn — the gateway checks those via [`Self::validate_gateway`].
     pub fn validate_agent(&self) -> anyhow::Result<()> {
         Self::ok_or(
@@ -155,24 +155,24 @@ impl ConfigSnapshot {
     }
 }
 
-/// Returns the `~/.shion` config directory. Overridable via `SHION_HOME`.
+/// Returns the `~/.komo` config directory. Overridable via `KOMO_HOME`.
 ///
-/// Read directly (not via `ShionEnv`): this is the bootstrap variable that
-/// decides where `~/.shion/.env` lives, so it must work before dotenvy has
+/// Read directly (not via `KomoEnv`): this is the bootstrap variable that
+/// decides where `~/.komo/.env` lives, so it must work before dotenvy has
 /// loaded that file.
-pub fn shion_home() -> PathBuf {
-    std::env::var("SHION_HOME")
+pub fn komo_home() -> PathBuf {
+    std::env::var("KOMO_HOME")
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             dirs::home_dir()
                 .expect("cannot determine home directory")
-                .join(".shion")
+                .join(".komo")
         })
 }
 
-/// Ensure `~/.shion/` exists (0700) and return its path.
+/// Ensure `~/.komo/` exists (0700) and return its path.
 /// Tightens `.env` inside to 0600 if present.
 /// Permission failures are silently ignored (containers, Windows).
 ///
@@ -181,11 +181,11 @@ pub fn shion_home() -> PathBuf {
 /// differs from 0600. Re-chmod'ing an existing path on every startup rewrites
 /// the ACL on filesystems that keep one (ZFS/NFSv4 — a mounted TrueNAS
 /// dataset), which would clobber operator-set ACLs on each gateway restart.
-pub fn ensure_shion_home() -> PathBuf {
-    let home = shion_home();
+pub fn ensure_komo_home() -> PathBuf {
+    let home = komo_home();
     let newly_created = !home.exists();
     if let Err(e) = std::fs::create_dir_all(&home) {
-        eprintln!("shion: could not create {}: {e}", home.display());
+        eprintln!("komo: could not create {}: {e}", home.display());
     }
     #[cfg(unix)]
     {
@@ -204,16 +204,16 @@ pub fn ensure_shion_home() -> PathBuf {
 }
 
 /// Directory holding the cached Chinese workday calendar, one `{year}.json` per
-/// year: `<shion_home>/workdays/`. Disposable — delete a file to force a
+/// year: `<komo_home>/workdays/`. Disposable — delete a file to force a
 /// re-fetch from the holiday API.
 pub fn workday_cache_dir() -> PathBuf {
-    shion_home().join("workdays")
+    komo_home().join("workdays")
 }
 
 /// Where the WeChat QR-login credentials are stored. Shared by the gateway
-/// channel and the `shion channel wechat login` provisioning command.
+/// channel and the `komo channel wechat login` provisioning command.
 pub fn wechat_cred_path() -> PathBuf {
-    shion_home().join("wechat").join("credentials.json")
+    komo_home().join("wechat").join("credentials.json")
 }
 
 #[cfg(test)]
@@ -221,13 +221,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shion_home_respects_env_override() {
-        let dir = std::env::temp_dir().join("shion_config_test_home_override");
+    fn komo_home_respects_env_override() {
+        let dir = std::env::temp_dir().join("komo_config_test_home_override");
         let _ = std::fs::create_dir_all(&dir);
         // SAFETY: single-threaded test context; we restore immediately.
-        unsafe { std::env::set_var("SHION_HOME", dir.to_str().unwrap()) };
-        let home = shion_home();
-        unsafe { std::env::remove_var("SHION_HOME") };
+        unsafe { std::env::set_var("KOMO_HOME", dir.to_str().unwrap()) };
+        let home = komo_home();
+        unsafe { std::env::remove_var("KOMO_HOME") };
         assert_eq!(home, dir);
     }
 }

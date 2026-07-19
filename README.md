@@ -1,16 +1,16 @@
-# shion
+# komo
 
 A personal agent framework in Rust. One binary gives you interactive LLM chat,
 local tools, durable tasks and memories, scheduled reminders, and an always-on
 gateway for chat channels and proactive background work. State lives locally
-under `~/.shion`.
+under `~/.komo`.
 
 ## Install
 
 From GitHub release binaries (macOS):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/solren7/shion/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/solren7/komo/main/install.sh | bash
 ```
 
 Or build from source:
@@ -22,30 +22,30 @@ cargo build --release
 ## Quick start
 
 ```bash
-shion init                       # scaffold ~/.shion/config.toml + .env (never overwrites)
-# then fill the DEEPSEEK_API_KEY= line in ~/.shion/.env
+komo init                       # scaffold ~/.komo/config.toml + .env (never overwrites)
+# then fill the DEEPSEEK_API_KEY= line in ~/.komo/.env
 
-shion chat                       # interactive chat (full-screen TUI; needs a terminal)
-shion model list                 # show current provider/model
-shion model set anthropic        # switch provider (persists to config.toml)
+komo chat                       # interactive chat (full-screen TUI; needs a terminal)
+komo model list                 # show current provider/model
+komo model set anthropic        # switch provider (persists to config.toml)
 ```
 
 Everything boots without a key — the gateway starts and channels serve — but
 agent turns reply with a "key not set" pointer until one is configured.
 
 Inside chat, `/new` (or `/clear` / `/reset`) starts a fresh session. History and
-the run ledger are stored in `~/.shion/state.db`.
+the run ledger are stored in `~/.komo/state.db`.
 
 ```bash
-shion session list               # stored sessions with message counts
-shion session clean              # delete empty sessions
-shion cron list                  # pending reminders and next fire times
-shion task list                  # open durable tasks
-shion memory list                # memory candidates/active items
-shion run list                   # recent agent turns (⟲ marks interrupted, resumable ones)
-shion run resume                 # re-dispatch the last interrupted turn from the run ledger
-shion skill list                 # governed skills + reviewer candidates awaiting triage
-shion skill promote <name>       # accept a reviewer-proposed skill into the active store
+komo session list               # stored sessions with message counts
+komo session clean              # delete empty sessions
+komo cron list                  # pending reminders and next fire times
+komo task list                  # open durable tasks
+komo memory list                # memory candidates/active items
+komo run list                   # recent agent turns (⟲ marks interrupted, resumable ones)
+komo run resume                 # re-dispatch the last interrupted turn from the run ledger
+komo skill list                 # governed skills + reviewer candidates awaiting triage
+komo skill promote <name>       # accept a reviewer-proposed skill into the active store
 ```
 
 ## Gateway (always-on background process)
@@ -59,13 +59,13 @@ The gateway hosts chat/event ingress and scheduled maintenance:
 - Feishu, Telegram, WeChat, and Home Assistant channels when configured
 
 ```bash
-shion gateway start              # macOS only: install + start under launchd
-shion gateway status             # macOS only: launchd state
-shion gateway restart            # macOS only: pick up a reinstalled binary
-shion gateway stop               # macOS only: stop and remove from launchd
+komo gateway start              # macOS only: install + start under launchd
+komo gateway status             # macOS only: launchd state
+komo gateway restart            # macOS only: pick up a reinstalled binary
+komo gateway stop               # macOS only: stop and remove from launchd
 ```
 
-Bare `shion gateway` runs in the foreground (this is what launchd
+Bare `komo gateway` runs in the foreground (this is what launchd
 invokes, and what Docker should run as the container process). In chat channels,
 side-effecting tools can ask for approval in the conversation; reply `/approve`,
 `/approve session`, or `/deny`.
@@ -82,16 +82,16 @@ The agent can call these during a chat turn:
 | `reminder` | Schedule one-shot and recurring reminders |
 | `task` | Capture/list/update/complete durable cross-session tasks |
 | `todo` | Maintain the current session's working focus list |
-| `memory` | Govern long-term memories in `~/.shion/memory.db` |
+| `memory` | Govern long-term memories in `~/.komo/memory.db` |
 | `homeassistant` | Read and control Home Assistant entities when configured |
 | `session` | Look up past conversations |
 | `delegate` | Hand a sub-task to a cheaper auxiliary model |
-| `skill` | Load skills: workspace `skills/`·`.claude/skills/` dirs + the governed `~/.shion/skills` store |
+| `skill` | Load skills: workspace `skills/`·`.claude/skills/` dirs + the governed `~/.komo/skills` store |
 | `time` | Current time (RFC 3339 UTC) |
 
 ## Data Layout
 
-Everything lives in `~/.shion/` by default, or under `SHION_HOME` when set.
+Everything lives in `~/.komo/` by default, or under `KOMO_HOME` when set.
 
 | File | Purpose |
 |---|---|
@@ -107,10 +107,10 @@ Delete `state.db` freely to reset development state. Do not delete `kanban.db`,
 
 ## Configuration
 
-Priority: built-in defaults < `config.toml` < `SHION_*` env vars. API keys go
-only in `~/.shion/.env`, never in `config.toml`.
+Priority: built-in defaults < `config.toml` < `KOMO_*` env vars. API keys go
+only in `~/.komo/.env`, never in `config.toml`.
 
-`~/.shion/config.toml`:
+`~/.komo/config.toml`:
 
 ```toml
 provider = "deepseek"        # deepseek | openai | anthropic | openrouter
@@ -168,8 +168,8 @@ access = "read"              # file rules can scope to read | write
 effect = "deny"
 ```
 
-Verify with `shion policy list` (resolved rules) and
-`shion policy check <category> <target>` (dry-run one action, shows the
+Verify with `komo policy list` (resolved rules) and
+`komo policy check <category> <target>` (dry-run one action, shows the
 matching rule). Rules can also scope to channels
 (`channels = ["telegram"]`), and an allow rule only covers
 `Risk::Dangerous` actions when it sets `include_dangerous = true`.
@@ -191,7 +191,7 @@ HASS_TOKEN=xxx
 HASS_URL=http://homeassistant.local:8123
 ```
 
-WeChat is QR-based: run `shion wechat login` on the host, or send `/wechat login`
+WeChat is QR-based: run `komo wechat login` on the host, or send `/wechat login`
 from an already-working chat channel.
 
 ## Architecture
@@ -204,7 +204,7 @@ CLI/channel → AgentRuntime ─ run_agent_loop ─┬→ LlmClient::begin_turn 
                           ↘ MessageRepository · RunRepository (ledger) → Response
 ```
 
-shion owns the tool loop: `AgentRuntime::run_agent_loop` drives the model one
+komo owns the tool loop: `AgentRuntime::run_agent_loop` drives the model one
 round at a time and hands each round of requested tool calls to the
 `ToolExecutor`, where every call is isolated, retried on transient failures,
 traced, and recorded in the run ledger.
@@ -256,9 +256,9 @@ dependency compiles protobuf frames at build time.
 
 To reset after schema changes, delete the affected database file:
 
-- `TaskRecord` changes: `~/.shion/kanban.db`
-- `MemoryRecord` changes: `~/.shion/memory.db`
-- other toasty models: `~/.shion/state.db`
+- `TaskRecord` changes: `~/.komo/kanban.db`
+- `MemoryRecord` changes: `~/.komo/memory.db`
+- other toasty models: `~/.komo/state.db`
 
 ## Roadmap
 

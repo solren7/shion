@@ -1,6 +1,6 @@
 //! Install a skill from a remote source into the active skill store.
 //!
-//! Shared by the operator CLI (`shion skill install`) and the approved `skill`
+//! Shared by the operator CLI (`komo skill install`) and the approved `skill`
 //! tool `install` action. Two source shapes are supported:
 //!
 //! - a **git repository** (`owner/repo`, `owner/repo/subpath`, a GitHub
@@ -281,7 +281,7 @@ fn safe_join(root: &Path, sub: &str) -> anyhow::Result<PathBuf> {
 async fn fetch_text(url: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
-        .user_agent("shion-skill-installer")
+        .user_agent("komo-skill-installer")
         .build()?;
     let resp = client
         .get(url)
@@ -303,7 +303,7 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> anyhow::Result<Self> {
         let path =
-            std::env::temp_dir().join(format!("shion-skill-install-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("komo-skill-install-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&path)?;
         Ok(Self(path))
     }
@@ -325,9 +325,9 @@ mod tests {
     #[test]
     fn resolves_owner_repo_shorthand() {
         assert_eq!(
-            resolve_source("solren7/shion").unwrap(),
+            resolve_source("solren7/komo").unwrap(),
             Source::Git {
-                repo: "https://github.com/solren7/shion.git".into(),
+                repo: "https://github.com/solren7/komo.git".into(),
                 branch: None,
                 subpath: None,
             }
@@ -337,9 +337,9 @@ mod tests {
     #[test]
     fn resolves_owner_repo_subpath_shorthand() {
         assert_eq!(
-            resolve_source("solren7/shion/skills/summarize-file").unwrap(),
+            resolve_source("solren7/komo/skills/summarize-file").unwrap(),
             Source::Git {
-                repo: "https://github.com/solren7/shion.git".into(),
+                repo: "https://github.com/solren7/komo.git".into(),
                 branch: None,
                 subpath: Some("skills/summarize-file".into()),
             }
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn locate_finds_single_skill_and_flags_multiple() {
-        let base = std::env::temp_dir().join(format!("shion-locate-{}", uuid::Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("komo-locate-{}", uuid::Uuid::now_v7()));
         let one = base.join("one");
         std::fs::create_dir_all(one.join("skills/a")).unwrap();
         std::fs::write(one.join("skills/a/SKILL.md"), "---\nname: a\n---\nx").unwrap();

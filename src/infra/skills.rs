@@ -2,7 +2,7 @@
 //! skills (roadmap §9).
 //!
 //! Skills are durable personal data (peers of memory/kanban), so they live as
-//! `SKILL.md` files under `~/.shion/skills/<name>/`, not in the disposable
+//! `SKILL.md` files under `~/.komo/skills/<name>/`, not in the disposable
 //! `state.db`. Files are editable, shareable, and lock-free: every governance
 //! action works while the gateway holds the Turso db lock.
 //!
@@ -10,7 +10,7 @@
 //! - `<name>/SKILL.md` — an **active** skill, loaded into the runtime
 //!   `SkillRegistry` (the root is one of its scan directories).
 //! - `.candidates/<name>/SKILL.md` — a reviewer **proposal**, invisible to the
-//!   runtime until the operator promotes it (`shion skill promote`). The dot
+//!   runtime until the operator promotes it (`komo skill promote`). The dot
 //!   prefix keeps the registry's directory scan from ever loading it.
 //! - `.candidates/<name>/.history/<ts>.md` — prior candidate versions, rolled
 //!   on overwrite so a re-extraction never silently destroys the last proposal.
@@ -35,7 +35,7 @@ use crate::domain::{
 const CANDIDATES_DIR: &str = ".candidates";
 /// Directory (under a candidate) holding rolled prior versions.
 const HISTORY_DIR: &str = ".history";
-/// Marker file: the one-time import of legacy `shion.db` skills already ran.
+/// Marker file: the one-time import of legacy `komo.db` skills already ran.
 const DB_IMPORT_MARKER: &str = ".imported-from-db";
 
 pub struct FsSkillStore {
@@ -47,9 +47,9 @@ impl FsSkillStore {
         Self { root }
     }
 
-    /// The shion-owned skills home: `~/.shion/skills`.
+    /// The komo-owned skills home: `~/.komo/skills`.
     pub fn default_root() -> PathBuf {
-        crate::config::shion_home().join("skills")
+        crate::config::komo_home().join("skills")
     }
 
     pub fn root(&self) -> &Path {
@@ -154,8 +154,8 @@ impl FsSkillStore {
         Ok(())
     }
 
-    /// One-time import of skills a pre-filesystem shion accumulated in
-    /// `shion.db` (the reviewer used to write there; the runtime never read
+    /// One-time import of skills a pre-filesystem komo accumulated in
+    /// `komo.db` (the reviewer used to write there; the runtime never read
     /// it). They land as **candidates** — previously-invisible extractions get
     /// a triage pass instead of silently activating. A marker file makes this
     /// a no-op forever after, even if the db rows outlive it.
@@ -178,14 +178,14 @@ impl FsSkillStore {
         fs::create_dir_all(&self.root)?;
         fs::write(
             &marker,
-            "legacy shion.db skills were imported as candidates\n",
+            "legacy komo.db skills were imported as candidates\n",
         )?;
         Ok(imported)
     }
 
     /// Install a skill **directory** (its `SKILL.md` plus any supporting files —
     /// scripts, `references/`, etc.) as an **active** skill, copying the whole
-    /// tree. This is the install path (operator `shion skill install` + the
+    /// tree. This is the install path (operator `komo skill install` + the
     /// approved `skill` tool `install` action), distinct from `save`, which only
     /// renders a single-file candidate. Overwrites an existing active skill of
     /// the same name — unless it's protected, matching the `save` floor.
@@ -369,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_writes_a_candidate_not_an_active_skill() {
-        let store = store("shion_skillstore_candidate");
+        let store = store("komo_skillstore_candidate");
         store.save(&skill("sync-cal")).await.unwrap();
 
         assert!(store.find_active("sync-cal").is_none());
@@ -381,7 +381,7 @@ mod tests {
 
     #[tokio::test]
     async fn promote_moves_candidate_to_active() {
-        let store = store("shion_skillstore_promote");
+        let store = store("komo_skillstore_promote");
         store.save(&skill("sync-cal")).await.unwrap();
 
         store.promote("sync-cal").unwrap();
@@ -394,7 +394,7 @@ mod tests {
 
     #[tokio::test]
     async fn reject_deletes_the_candidate() {
-        let store = store("shion_skillstore_reject");
+        let store = store("komo_skillstore_reject");
         store.save(&skill("sync-cal")).await.unwrap();
         store.reject("sync-cal").unwrap();
         assert!(store.find_candidate("sync-cal").is_none());
@@ -403,7 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn candidate_overwrite_rolls_history() {
-        let store = store("shion_skillstore_history");
+        let store = store("komo_skillstore_history");
         store.save(&skill("sync-cal")).await.unwrap();
         let mut v2 = skill("sync-cal");
         v2.instructions = "v2 body".to_string();
@@ -422,7 +422,7 @@ mod tests {
 
     #[tokio::test]
     async fn protected_active_skill_refuses_proposals() {
-        let store = store("shion_skillstore_protected");
+        let store = store("komo_skillstore_protected");
         store.save(&skill("sync-cal")).await.unwrap();
         store.promote("sync-cal").unwrap();
         store.set_protected("sync-cal", true).unwrap();
@@ -434,7 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_rejects_path_escaping_names() {
-        let store = store("shion_skillstore_names");
+        let store = store("komo_skillstore_names");
         let mut bad = skill("ok");
         bad.name = "../escape".to_string();
         assert!(store.save(&bad).await.is_err());
@@ -442,7 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn disable_and_enable_roundtrip() {
-        let store = store("shion_skillstore_disable");
+        let store = store("komo_skillstore_disable");
         store.save(&skill("sync-cal")).await.unwrap();
         store.promote("sync-cal").unwrap();
 
@@ -455,9 +455,9 @@ mod tests {
 
     #[test]
     fn install_active_dir_copies_the_whole_skill_tree() {
-        let store = store("shion_skillstore_install");
+        let store = store("komo_skillstore_install");
         // A multi-file skill: SKILL.md plus a supporting script.
-        let src = std::env::temp_dir().join("shion_install_src");
+        let src = std::env::temp_dir().join("komo_install_src");
         let _ = fs::remove_dir_all(&src);
         fs::create_dir_all(src.join("scripts")).unwrap();
         fs::write(
@@ -479,8 +479,8 @@ mod tests {
 
     #[test]
     fn install_refuses_to_overwrite_a_protected_skill() {
-        let store = store("shion_skillstore_install_protected");
-        let src = std::env::temp_dir().join("shion_install_src_prot");
+        let store = store("komo_skillstore_install_protected");
+        let src = std::env::temp_dir().join("komo_install_src_prot");
         let _ = fs::remove_dir_all(&src);
         fs::create_dir_all(&src).unwrap();
         fs::write(
@@ -500,8 +500,8 @@ mod tests {
 
     #[test]
     fn install_rejects_a_dir_without_a_valid_manifest() {
-        let store = store("shion_skillstore_install_nomanifest");
-        let src = std::env::temp_dir().join("shion_install_src_empty");
+        let store = store("komo_skillstore_install_nomanifest");
+        let src = std::env::temp_dir().join("komo_install_src_empty");
         let _ = fs::remove_dir_all(&src);
         fs::create_dir_all(&src).unwrap();
         assert!(store.install_active_dir(&src).is_err());
@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn legacy_import_lands_candidates_once() {
-        let store = store("shion_skillstore_import");
+        let store = store("komo_skillstore_import");
         let n = store.import_legacy_db(vec![skill("old-a"), skill("old-b")]);
         assert_eq!(n.unwrap(), 2);
         assert_eq!(store.list_candidates().len(), 2);
