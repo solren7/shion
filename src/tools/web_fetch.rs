@@ -12,9 +12,18 @@ use crate::domain::{
 const MAX_BYTES: usize = 8 * 1024;
 const USER_AGENT: &str = "komo-agent/0.1";
 
+/// Cap on caller-supplied request headers — enough for auth + content
+/// negotiation, far below anything abusive.
+const MAX_HEADERS: usize = 8;
+
 #[derive(Deserialize)]
 struct FetchArgs {
     url: String,
+    /// Optional request headers — the door to authenticated JSON APIs
+    /// (`X-Auth-Token` for Miniflux, `Authorization: Bearer …`), which is what
+    /// lets data-source skills work through this one read-only tool.
+    #[serde(default)]
+    headers: std::collections::HashMap<String, String>,
 }
 
 /// Fetches a URL and returns its readable text content (HTML stripped).
@@ -46,7 +55,8 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Fetch a web page by URL and return its readable text content."
+        "Fetch a URL (GET) and return its readable text content. Optional request \
+         headers support authenticated JSON APIs (e.g. an X-Auth-Token)."
     }
 
     /// Read-only GET: safe to retry on an ambiguous transient failure.
@@ -54,11 +64,33 @@ impl Tool for WebFetchTool {
         true
     }
 
+    /// Header values are exactly credential-shaped (API tokens, bearer auth) —
+    /// mask them before the args land in the run ledger. Header *names* stay,
+    /// so an audit still shows what kind of auth was sent, just not the secret.
+    fn redact_args(&self, args: &str) -> String {
+        match serde_json::from_str::<serde_json::Value>(args) {
+            Ok(mut v) => {
+                if let Some(headers) = v.get_mut("headers").and_then(|h| h.as_object_mut()) {
+                    for (_, value) in headers.iter_mut() {
+                        *value = serde_json::json!("<redacted>");
+                    }
+                }
+                v.to_string()
+            }
+            Err(_) => "<web_fetch args redacted>".to_string(),
+        }
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "url": { "type": "string", "description": "The absolute URL to fetch." }
+                "url": { "type": "string", "description": "The absolute URL to fetch." },
+                "headers": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Optional request headers (e.g. {\"X-Auth-Token\": \"…\"} for an authenticated API)."
+                }
             },
             "required": ["url"]
         })
@@ -67,6 +99,12 @@ impl Tool for WebFetchTool {
     async fn execute(&self, input: String) -> anyhow::Result<String> {
         let args: FetchArgs = serde_json::from_str(&input)
             .map_err(|e| anyhow::anyhow!("invalid web_fetch arguments: {e}"))?;
+        if args.headers.len() > MAX_HEADERS {
+            anyhow::bail!(
+                "too many headers ({}, max {MAX_HEADERS})",
+                args.headers.len()
+            );
+        }
 
         let request =
             ApprovalRequest::safe(format!("fetch {}", args.url)).with_action(ActionRef::Network {
@@ -80,15 +118,16 @@ impl Tool for WebFetchTool {
             ));
         }
 
-        let resp = self
+        let mut request = self
             .client
             .get(&args.url)
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .send()
-            .await
-            .map_err(|e| {
-                crate::tools::http::transport_error(e, format!("request to {} failed", args.url))
-            })?;
+            .header(reqwest::header::USER_AGENT, USER_AGENT);
+        for (name, value) in &args.headers {
+            request = request.header(name, value);
+        }
+        let resp = request.send().await.map_err(|e| {
+            crate::tools::http::transport_error(e, format!("request to {} failed", args.url))
+        })?;
 
         let status = resp.status();
         let body = resp
@@ -196,6 +235,33 @@ mod tests {
         let mut text = "short".to_string();
         truncate_to_char_boundary(&mut text, MAX_BYTES);
         assert_eq!(text, "short");
+    }
+
+    #[test]
+    fn redact_masks_header_values_but_keeps_names_and_url() {
+        let tool = WebFetchTool::new(Arc::new(DenyAll));
+        let args = json!({
+            "url": "http://miniflux:8080/v1/entries",
+            "headers": { "X-Auth-Token": "super-secret-token" }
+        })
+        .to_string();
+        let redacted = tool.redact_args(&args);
+        assert!(!redacted.contains("super-secret-token"));
+        assert!(redacted.contains("X-Auth-Token"));
+        assert!(redacted.contains("miniflux:8080"));
+    }
+
+    #[tokio::test]
+    async fn too_many_headers_is_an_error() {
+        let tool = WebFetchTool::new(Arc::new(DenyAll));
+        let headers: std::collections::HashMap<String, String> = (0..9)
+            .map(|i| (format!("H-{i}"), "v".to_string()))
+            .collect();
+        let err = tool
+            .execute(json!({ "url": "https://example.com", "headers": headers }).to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too many headers"));
     }
 
     #[test]
