@@ -209,7 +209,11 @@ pub async fn build(
         SystemPromptBuilder::new(model_config)
             .tools(tool_names)
             .skills_note(skills_note.clone())
-            .workspace_root(Some(root.clone())),
+            .workspace_root(Some(root.clone()))
+            // The main agent fields "how do I configure Komo" questions, so it
+            // gets the built-in platform manual (wechat login, pairing, …).
+            // Aux/delegate/briefing builders deliberately don't.
+            .operations_manual(),
     );
     let preamble: PreambleFn = Arc::new(move || prompt_builder.build());
 

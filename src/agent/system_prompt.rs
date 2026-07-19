@@ -60,6 +60,37 @@ const CLARIFY_GUIDANCE: &str = "When a key parameter is ambiguous, the target of
     instead of guessing. Do NOT ask about things you can safely infer, look up with \
     your tools, or that barely matter — never interrogate.";
 
+/// Platform self-knowledge, main agent only (`operations_manual`): how Komo
+/// itself is configured, so "how do I set up X on Komo" gets the built-in
+/// answer instead of invented third-party bridges/skills.
+const OPERATIONS_MANUAL: &str = "\
+About your own platform: you run inside the Komo personal-agent gateway. When \
+the user asks how to set up, configure, or troubleshoot Komo itself, answer \
+from these built-in facts — do NOT invent skills, bridges, or third-party \
+services for them:\n\
+- Chat channels (feishu, telegram, wechat) are built in. Each is declared in \
+~/.komo/config.toml as `[channels.<name>]` with `enabled = true`; credentials \
+go in ~/.komo/.env (FEISHU_APP_ID + FEISHU_APP_SECRET, TELEGRAM_BOT_TOKEN). \
+Restart the gateway to apply (`komo gateway restart` on macOS; restart the \
+container on Docker).\n\
+- WeChat (微信) needs no token in .env: after enabling `[channels.wechat]`, \
+the user logs in by scanning a QR code — either `komo channel wechat login` in \
+a terminal on the host, or by sending `/wechat login` in an already-working \
+chat channel (the QR arrives as a photo). Credentials persist in \
+~/.komo/wechat/credentials.json; WeChat is DM-only (the bot cannot join \
+groups).\n\
+- Home Assistant: set HASS_TOKEN (and optionally HASS_URL) in ~/.komo/.env to \
+enable the `homeassistant` tool; `[channels.homeassistant]` additionally \
+forwards device events to you.\n\
+- Unknown senders must pair before you respond: their first message gets a \
+pairing code, which the operator approves with `komo pair approve <code>` on \
+the host. Pre-trusted ids go in the channel's `allow_from` list.\n\
+- `/sethome` sent in any chat makes it the delivery target for proactive \
+output (reminders, daily briefing). `/new` starts a fresh session; \
+`/approve` / `/deny` answer tool-approval prompts.\n\
+- `komo doctor` (host terminal) shows config, model, and channel health; \
+`komo logs` tails the gateway log.";
+
 /// Project instruction files searched in the working directory, first found wins.
 const CONTEXT_FILES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", ".cursorrules"];
 
@@ -81,6 +112,9 @@ pub struct SystemPromptBuilder {
     tool_names: Vec<String>,
     skills_note: Option<String>,
     workspace_root: Option<PathBuf>,
+    /// Include the Komo self-configuration manual (main agent only — aux
+    /// sub-agents and sweeps never field "how do I configure Komo" questions).
+    operations_manual: bool,
     model: String,
     provider: &'static str,
     home: PathBuf,
@@ -105,6 +139,7 @@ impl SystemPromptBuilder {
             tool_names: Vec::new(),
             skills_note: None,
             workspace_root: None,
+            operations_manual: false,
             model: config.model.clone(),
             provider: config.provider.name(),
             home: komo_home(),
@@ -128,6 +163,12 @@ impl SystemPromptBuilder {
     /// Working directory to scan for project instruction files (context tier).
     pub fn workspace_root(mut self, root: Option<PathBuf>) -> Self {
         self.workspace_root = root;
+        self
+    }
+
+    /// Include the built-in Komo operations manual (see [`OPERATIONS_MANUAL`]).
+    pub fn operations_manual(mut self) -> Self {
+        self.operations_manual = true;
         self
     }
 
@@ -167,6 +208,9 @@ impl SystemPromptBuilder {
         }
         if self.has("ask_user") {
             parts.push(CLARIFY_GUIDANCE.to_string());
+        }
+        if self.operations_manual {
+            parts.push(OPERATIONS_MANUAL.to_string());
         }
 
         if let Some(note) = &self.skills_note {
@@ -318,6 +362,24 @@ mod tests {
         assert!(p.contains("schedule reminders"));
         assert!(p.contains("tmux ls")); // state guidance, via `memory`
         assert!(p.contains("`time` tool"));
+    }
+
+    #[test]
+    fn operations_manual_is_opt_in_and_stable_tier() {
+        // Absent by default (aux/delegate/briefing builders).
+        let p = SystemPromptBuilder::new(&config())
+            .home(tmp("ops_off"))
+            .build();
+        assert!(!p.contains("/wechat login"));
+        // Present for the main agent, in the cacheable stable prefix.
+        let p = SystemPromptBuilder::new(&config())
+            .home(tmp("ops_on"))
+            .operations_manual()
+            .build();
+        let manual_at = p.find("/wechat login").expect("manual included");
+        let date_at = p.find("Today's date is").unwrap();
+        assert!(manual_at < date_at, "manual belongs to the stable prefix");
+        assert!(p.contains("komo pair approve"));
     }
 
     #[test]
