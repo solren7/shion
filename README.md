@@ -2,7 +2,6 @@
 
 <p align="center">
   <img src="docs/images/komo_logo.png" alt="Komo mascot, wordmark, and Light through your days slogan" width="520">
-  <img src="docs/images/komo_avatar.png" alt="Komo pixel avatar" width="180">
 </p>
 
 A personal agent framework in Rust. One binary gives you interactive LLM chat,
