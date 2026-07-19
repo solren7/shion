@@ -432,7 +432,24 @@ pub fn build_llm(
             // CLI's OAuth tokens. `CodexHttpClient` re-stamps a fresh bearer on
             // every request; the static Cloudflare-dodging headers are baked in
             // here. `base` (config base_url) overrides the endpoint if set.
-            let auth = CodexAuth::load().context("loading Codex credentials")?;
+            //
+            // Missing/broken credentials degrade like a missing API key: the
+            // gateway must boot (a fresh box, or a container without
+            // ~/.codex mounted) instead of crash-looping, with every LLM call
+            // reporting the fix as the turn's reply.
+            let auth = match CodexAuth::load() {
+                Ok(auth) => auth,
+                Err(error) => {
+                    tracing::warn!(%error, "Codex credentials unavailable; LLM degraded");
+                    return Ok(Arc::new(UnconfiguredLlm {
+                        message: format!(
+                            "Codex credentials unavailable: {error:#}. Run `codex` to log \
+                             in (it writes ~/.codex/auth.json; $CODEX_HOME honored), then \
+                             restart the gateway."
+                        ),
+                    }));
+                }
+            };
             let client = openai::Client::builder()
                 .api_key(auth.initial_access_token())
                 .base_url(base.unwrap_or(CODEX_BASE_URL))

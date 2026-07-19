@@ -55,17 +55,16 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     }
     let rt = &config.runtime;
 
-    // Fail fast on a bad schedule before opening the db.
-    let schedule_expr = rt.maintenance_schedule.as_str();
-    let review_schedule = Schedule::parse(schedule_expr)?;
+    // A cron typo must not crash-loop the always-on gateway (same principle as
+    // the missing-credential warnings above): the maintenance schedule degrades
+    // to the built-in default cadence, an opt-in sweep (briefing/dream) is
+    // disabled — each with a warning naming the bad expression.
+    let (review_schedule, schedule_expr) = schedule_or_default(&rt.maintenance_schedule);
     let reminder_schedule = Schedule::parse("* * * * *")?;
-    // Opt-in daily briefing: parse its schedule now so a typo fails at startup.
-    let briefing_expr = &rt.briefing_schedule;
-    let briefing_schedule = briefing_expr.as_deref().map(Schedule::parse).transpose()?;
-    // Usage-driven memory consolidation ("dreaming", on by default); parse now
-    // so a typo fails at startup.
-    let dream_expr = &rt.dream_schedule;
-    let dream_schedule = dream_expr.as_deref().map(Schedule::parse).transpose()?;
+    let (briefing_schedule, briefing_expr) =
+        optional_schedule(rt.briefing_schedule.as_deref(), "briefing_schedule");
+    let (dream_schedule, dream_expr) =
+        optional_schedule(rt.dream_schedule.as_deref(), "dream_schedule");
 
     let db = Arc::new(Db::connect(&rt.db_url).await?);
     // Reconcile runs left `Running` by a crashed earlier process (launchd
@@ -344,8 +343,8 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     println!(
         "Komo gateway — maintenance `{}`, reminders every minute, briefing {}, dreaming {}, channels: {}. Ctrl-C to stop.\n",
         schedule_expr,
-        fmt_opt(briefing_expr),
-        fmt_opt(dream_expr),
+        fmt_opt(&briefing_expr),
+        fmt_opt(&dream_expr),
         if channels.is_empty() {
             "none".to_string()
         } else {
@@ -354,6 +353,40 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     );
 
     gateway.run(shutdown_signal()).await
+}
+
+/// Parse the maintenance cron, degrading a typo to the built-in default
+/// cadence: an always-on gateway must not crash-loop over a config typo.
+/// Returns the schedule plus the expression actually in effect (for display).
+fn schedule_or_default(expr: &str) -> (Schedule, String) {
+    match Schedule::parse(expr) {
+        Ok(schedule) => (schedule, expr.to_string()),
+        Err(error) => {
+            tracing::warn!(%error, default = crate::config::DEFAULT_MAINTENANCE_SCHEDULE,
+                "invalid maintenance schedule; falling back to the default");
+            let default = crate::config::DEFAULT_MAINTENANCE_SCHEDULE;
+            (
+                Schedule::parse(default).expect("built-in default cron is valid"),
+                default.to_string(),
+            )
+        }
+    }
+}
+
+/// Parse an opt-in sweep's cron; a typo disables that sweep with a warning
+/// (never the whole gateway). Returns the schedule plus the effective
+/// expression (`None` = the sweep is off, for the startup banner).
+fn optional_schedule(expr: Option<&str>, what: &str) -> (Option<Schedule>, Option<String>) {
+    match expr {
+        None => (None, None),
+        Some(expr) => match Schedule::parse(expr) {
+            Ok(schedule) => (Some(schedule), Some(expr.to_string())),
+            Err(error) => {
+                tracing::warn!(%error, config = what, "invalid schedule; sweep disabled");
+                (None, None)
+            }
+        },
+    }
 }
 
 /// Resolve when the process is asked to stop. Catches both Ctrl-C (SIGINT, the
@@ -380,5 +413,30 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_schedule_typo_degrades_to_default() {
+        let (_, expr) = schedule_or_default("not a cron");
+        assert_eq!(expr, crate::config::DEFAULT_MAINTENANCE_SCHEDULE);
+        let (_, expr) = schedule_or_default("*/5 * * * *");
+        assert_eq!(expr, "*/5 * * * *");
+    }
+
+    #[test]
+    fn optional_schedule_typo_disables_the_sweep() {
+        let (schedule, expr) = optional_schedule(Some("not a cron"), "briefing_schedule");
+        assert!(schedule.is_none());
+        assert!(expr.is_none());
+        let (schedule, expr) = optional_schedule(Some("0 3 * * *"), "dream_schedule");
+        assert!(schedule.is_some());
+        assert_eq!(expr.as_deref(), Some("0 3 * * *"));
+        let (schedule, _) = optional_schedule(None, "briefing_schedule");
+        assert!(schedule.is_none());
     }
 }
