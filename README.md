@@ -1,5 +1,10 @@
 # Komo
 
+<p align="center">
+  <img src="docs/images/komo_logo.png" alt="Komo mascot, wordmark, and Light through your days slogan" width="520">
+  <img src="docs/images/komo_avatar.png" alt="Komo pixel avatar" width="180">
+</p>
+
 A personal agent framework in Rust. One binary gives you interactive LLM chat,
 local tools, durable tasks and memories, scheduled reminders, and an always-on
 gateway for chat channels and proactive background work. State lives locally
