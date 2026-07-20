@@ -28,7 +28,7 @@ use crate::domain::{
     memory::{Memory, MemoryRepository},
     message::Message,
     notify::Notifier,
-    reminder::{ReminderRepository, ReminderStatus},
+    reminder::{Reminder, ReminderRepository, ReminderStatus},
     session::Session,
     task::{Task, TaskRepository},
 };
@@ -210,6 +210,32 @@ pub fn next_occurrence_local(expr: &str, after_unix: i64) -> anyhow::Result<i64>
     Ok(next.timestamp())
 }
 
+/// Deliver a group of due items as a **single coalesced notification**, so a
+/// sweep that finds several at once — the common case being the backlog flush
+/// right after a gateway restart, or several things due the same minute — fires
+/// one ping instead of one per item. A lone item keeps its plain form; multiple
+/// items become a bulleted digest under a count-tagged title. Delivery failures
+/// are swallowed (`.ok()`), matching the per-item callers this replaces.
+async fn notify_batch(notifier: &dyn Notifier, title: &str, messages: &[String]) {
+    match messages {
+        [] => {}
+        [only] => {
+            notifier.notify(title, only).await.ok();
+        }
+        many => {
+            let body = many
+                .iter()
+                .map(|m| format!("• {m}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            notifier
+                .notify(&format!("{title} ({} items)", many.len()), &body)
+                .await
+                .ok();
+        }
+    }
+}
+
 /// Sweep due reminders every minute and deliver them as desktop notifications.
 pub struct ReminderSweep {
     pub reminders: Arc<dyn ReminderRepository>,
@@ -222,20 +248,34 @@ impl Maintenance for ReminderSweep {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let mut summary = MaintenanceSummary::default();
 
-        for r in self.reminders.list_pending().await? {
-            if r.run_at > now {
-                continue;
-            }
-            let late = now - r.run_at;
+        let due: Vec<Reminder> = self
+            .reminders
+            .list_pending()
+            .await?
+            .into_iter()
+            .filter(|r| r.run_at <= now)
+            .collect();
 
+        // Phase 1 — notify first (still before any persist, so a crash prefers a
+        // duplicate over silent loss), but coalesced: split by presentation
+        // (on-time vs missed) and send each group as one ping.
+        let mut on_time = Vec::new();
+        let mut missed = Vec::new();
+        for r in &due {
+            if now - r.run_at > REMINDER_GRACE_SECS {
+                missed.push(r.message.clone());
+            } else {
+                on_time.push(r.message.clone());
+            }
+        }
+        notify_batch(&*self.notifier, "Komo reminder", &on_time).await;
+        notify_batch(&*self.notifier, "Komo (missed reminder)", &missed).await;
+
+        // Phase 2 — persist each reminder's state transition (no per-item notify
+        // now; the ping already went out above).
+        for r in &due {
+            let late = now - r.run_at;
             if r.is_recurring() {
-                // Notify first, then reschedule — prefer duplicate over silent loss.
-                let title = if late > REMINDER_GRACE_SECS {
-                    "Komo (missed reminder)"
-                } else {
-                    "Komo reminder"
-                };
-                self.notifier.notify(title, &r.message).await.ok();
                 // Compute next occurrence from now (not run_at) so a resting daemon
                 // always jumps to a future slot without replaying missed ticks.
                 match next_occurrence_local(&r.schedule, now) {
@@ -259,32 +299,22 @@ impl Maintenance for ReminderSweep {
                         }
                     }
                 }
-            } else {
-                // One-shot path — original v1 logic unchanged.
-                if late > REMINDER_GRACE_SECS {
-                    self.notifier
-                        .notify("Komo (missed reminder)", &r.message)
-                        .await
-                        .ok();
-                    if let Err(e) = self
-                        .reminders
-                        .set_status(&r.id, ReminderStatus::Missed)
-                        .await
-                    {
-                        warn!(error = %e, id = %r.id, "failed to mark reminder missed");
-                    }
-                } else {
-                    self.notifier.notify("Komo reminder", &r.message).await.ok();
-                    if let Err(e) = self
-                        .reminders
-                        .set_status(&r.id, ReminderStatus::Fired)
-                        .await
-                    {
-                        warn!(error = %e, id = %r.id, "failed to mark reminder fired");
-                    } else {
-                        summary.reminders_fired += 1;
-                    }
+            } else if late > REMINDER_GRACE_SECS {
+                if let Err(e) = self
+                    .reminders
+                    .set_status(&r.id, ReminderStatus::Missed)
+                    .await
+                {
+                    warn!(error = %e, id = %r.id, "failed to mark reminder missed");
                 }
+            } else if let Err(e) = self
+                .reminders
+                .set_status(&r.id, ReminderStatus::Fired)
+                .await
+            {
+                warn!(error = %e, id = %r.id, "failed to mark reminder fired");
+            } else {
+                summary.reminders_fired += 1;
             }
         }
         Ok(summary)
@@ -305,26 +335,40 @@ impl Maintenance for TaskSweep {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let mut summary = MaintenanceSummary::default();
 
-        for task in self.tasks.list_open().await? {
-            let Some(due_at) = task.due_at else {
-                continue;
-            };
-            if due_at > now || task.due_notified_at.is_some() {
-                continue;
+        let due: Vec<Task> = self
+            .tasks
+            .list_open()
+            .await?
+            .into_iter()
+            .filter(|t| matches!(t.due_at, Some(d) if d <= now) && t.due_notified_at.is_none())
+            .collect();
+
+        // Phase 1 — notify first (before the guard flips, so a crash re-pings
+        // rather than silently drops), coalesced into one ping per group so a
+        // morning with several tasks due, or a post-restart backlog, does not
+        // fire one desktop notification per task.
+        let body_of = |t: &Task| {
+            if t.waiting_on.is_empty() {
+                t.title.clone()
+            } else {
+                format!("{} (waiting on: {})", t.title, t.waiting_on)
             }
-            let title = if now - due_at > REMINDER_GRACE_SECS {
-                "Komo (overdue task)"
+        };
+        let mut due_now = Vec::new();
+        let mut overdue = Vec::new();
+        for t in &due {
+            // `due_at` is Some here (the filter guaranteed it).
+            if now - t.due_at.unwrap_or(now) > REMINDER_GRACE_SECS {
+                overdue.push(body_of(t));
             } else {
-                "Komo task due"
-            };
-            let body = if task.waiting_on.is_empty() {
-                task.title.clone()
-            } else {
-                format!("{} (waiting on: {})", task.title, task.waiting_on)
-            };
-            // Notify first, then mark — prefer duplicate over silent loss
-            // (same ordering as recurring reminders).
-            self.notifier.notify(title, &body).await.ok();
+                due_now.push(body_of(t));
+            }
+        }
+        notify_batch(&*self.notifier, "Komo task due", &due_now).await;
+        notify_batch(&*self.notifier, "Komo (overdue task)", &overdue).await;
+
+        // Phase 2 — flip the at-most-once guard on each task (it stays open).
+        for task in &due {
             let mut notified = task.clone();
             notified.due_notified_at = Some(now);
             if let Err(e) = self.tasks.update(&notified).await {
@@ -792,6 +836,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn sweep_coalesces_multiple_due_reminders() {
+        // Three on-time reminders due in the same sweep (the post-restart backlog
+        // shape) collapse into ONE notification, not three pings.
+        let (sweep, repo, notifier) = sweep_with(
+            vec![past_reminder(10), past_reminder(20), past_reminder(30)],
+            false,
+        );
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.reminders_fired, 3);
+
+        let calls = notifier.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "three due reminders must coalesce to one ping"
+        );
+        assert_eq!(calls[0].0, "Komo reminder (3 items)");
+
+        // Every reminder still transitioned (guard flipped), not just the ping.
+        let fired = repo
+            .reminders
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.status == ReminderStatus::Fired)
+            .count();
+        assert_eq!(fired, 3);
+    }
+
     // ── cron helpers ─────────────────────────────────────────────────────────
 
     #[test]
@@ -999,6 +1073,27 @@ mod tests {
         let summary = sweep.run().await.unwrap();
         assert_eq!(summary.tasks_notified, 0);
         assert_eq!(notifier.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn task_sweep_coalesces_multiple_due_tasks() {
+        // Several tasks due the same sweep collapse into one notification.
+        let (sweep, repo, notifier) =
+            task_sweep_with(vec![due_task(-30), due_task(-45), due_task(-60)]);
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.tasks_notified, 3);
+
+        let calls = notifier.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "three due tasks must coalesce to one ping");
+        assert_eq!(calls[0].0, "Komo task due (3 items)");
+        // Each task's guard flipped so the next sweep stays silent.
+        assert!(
+            repo.tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|t| t.due_notified_at.is_some())
+        );
     }
 
     #[tokio::test]

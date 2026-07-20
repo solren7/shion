@@ -751,18 +751,20 @@ pub const DREAM_MIN_UNIQUE_QUERIES: usize = 2;
 /// Cap on stored distinct query fingerprints per memory. Diversity is proven
 /// well before this; appending forever would only widen the row.
 pub const RECALL_QUERY_HASHES_CAP: usize = 8;
-/// A candidate older than this (days) with no recalls is archived — the
-/// "forget the flotsam" half of dreaming.
+/// A candidate this old (days) that has gone cold — never recalled, or not
+/// recalled within the same window — is archived: the "forget the flotsam" half
+/// of dreaming. Coldness is measured on `last_used_at`, not a lifetime
+/// `recall_count`, so a *weakly* recalled candidate (one or two hits long ago)
+/// is retired too rather than lingering in the pile forever.
 pub const DREAM_FORGET_AGE_DAYS: i64 = 30;
-/// Score a candidate must clear to be promoted (alongside the recall-count gate),
-/// so a barely-relevant fact recalled by coincidence does not auto-promote.
-pub const DREAM_PROMOTE_MIN_SCORE: f64 = 1.0;
 
 /// Dreaming score for a candidate: dominated by recall frequency, nudged by
 /// recency and importance. Explainable and embedding-free, matching the rest of
-/// komo's ranking. Higher = stronger case for promotion. (Query-diversity is
-/// a separate hard gate in [`dream_verdict`], not a score component — a
-/// diversity-failing candidate must not promote no matter how high it scores.)
+/// komo's ranking. This is a **display/ranking** signal only — it drives the
+/// `komo dream` preview ordering, not the verdict. Promotion is decided purely
+/// by the recall-count and query-diversity gates in [`dream_verdict`]; a score
+/// threshold was removed because, with `recall_count` its dominant term, it
+/// could never reject anything the count gate already accepted.
 pub fn dream_score(memory: &Memory, now: i64) -> f64 {
     let mut score = memory.recall_count as f64; // each recall = 1.0, the core signal
     score += memory.importance as f64 / 100.0; // 0..~1
@@ -782,13 +784,24 @@ pub fn dream_verdict(memory: &Memory, now: i64) -> DreamVerdict {
     if memory.status != MemoryStatus::Candidate {
         return DreamVerdict::Keep;
     }
-    let age_days = (now - memory.created_at).max(0) as f64 / 86_400.0;
+    // Promotion takes precedence: recalled often enough, by enough distinct
+    // queries. No score gate — see `dream_score`.
     if memory.recall_count >= DREAM_MIN_RECALL_COUNT
         && memory.recall_query_hashes.len() >= DREAM_MIN_UNIQUE_QUERIES
-        && dream_score(memory, now) >= DREAM_PROMOTE_MIN_SCORE
     {
-        DreamVerdict::Promote
-    } else if memory.recall_count == 0 && age_days as i64 > DREAM_FORGET_AGE_DAYS {
+        return DreamVerdict::Promote;
+    }
+    // Forget the flotsam: old enough to have had its chance, and now cold. Cold
+    // is measured on `last_used_at` (never used, or last used outside the forget
+    // window), not a lifetime `recall_count == 0` — the old check leaked the
+    // *weakly* recalled (one or two hits, then silence) into an ever-growing
+    // candidate pile that nothing ever retired.
+    let age_days = (now - memory.created_at).max(0) as f64 / 86_400.0;
+    let cold = match memory.last_used_at {
+        Some(last) => (now - last).max(0) as f64 / 86_400.0 > DREAM_FORGET_AGE_DAYS as f64,
+        None => true,
+    };
+    if cold && age_days as i64 > DREAM_FORGET_AGE_DAYS {
         DreamVerdict::Archive
     } else {
         DreamVerdict::Keep
@@ -1064,6 +1077,27 @@ mod tests {
         let now = 10_000 * 86_400;
         // Never recalled but still within the forget window — give it time.
         let m = candidate(0, DREAM_FORGET_AGE_DAYS - 1, now);
+        assert_eq!(dream_verdict(&m, now), DreamVerdict::Keep);
+    }
+
+    #[test]
+    fn dream_archives_weakly_recalled_gone_cold() {
+        let now = 10_000 * 86_400;
+        // Two recalls long ago, then silence: below the promote bar, and cold
+        // (last used outside the forget window) — this is the leak the old
+        // `recall_count == 0` archive check let linger forever. Now retired.
+        let mut m = candidate(2, DREAM_FORGET_AGE_DAYS + 10, now);
+        m.last_used_at = Some(now - (DREAM_FORGET_AGE_DAYS + 5) * 86_400);
+        assert_eq!(dream_verdict(&m, now), DreamVerdict::Archive);
+    }
+
+    #[test]
+    fn dream_keeps_weakly_recalled_still_warm() {
+        let now = 10_000 * 86_400;
+        // Old, only two recalls — but recalled recently, so it is still earning
+        // its keep and might yet reach the promote bar. Not archived.
+        let mut m = candidate(2, DREAM_FORGET_AGE_DAYS + 10, now);
+        m.last_used_at = Some(now - 5 * 86_400);
         assert_eq!(dream_verdict(&m, now), DreamVerdict::Keep);
     }
 
