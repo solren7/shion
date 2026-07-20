@@ -41,21 +41,21 @@ fn find_readable_skill(
             history: managed.candidate_history(name),
         });
     }
-    if let Some(skill) = managed.find_candidate(name) {
-        return Some(ReadableSkill {
-            skill,
-            status: "candidate",
-            path: managed.candidate_path(name),
-            history: managed.candidate_history(name),
-        });
-    }
-    shared.and_then(|shared| {
+    if let Some(found) = shared.and_then(|shared| {
         shared.find_active(name).map(|skill| ReadableSkill {
             skill,
             status: "shared (read-only)",
             path: shared.active_path(name),
             history: Vec::new(),
         })
+    }) {
+        return Some(found);
+    }
+    managed.find_candidate(name).map(|skill| ReadableSkill {
+        skill,
+        status: "candidate",
+        path: managed.candidate_path(name),
+        history: managed.candidate_history(name),
     })
 }
 
@@ -303,7 +303,13 @@ mod tests {
         let shared = FsSkillStore::new(base.join("shared"));
         write_skill(shared.root(), "only-shared", "shared body");
         write_skill(shared.root(), "duplicate", "shared version");
+        write_skill(shared.root(), "candidate-clash", "shared active version");
         write_skill(managed.root(), "duplicate", "managed version");
+        write_skill(
+            &managed.root().join(".candidates"),
+            "candidate-clash",
+            "candidate version",
+        );
 
         let found = find_readable_skill("only-shared", &managed, Some(&shared)).unwrap();
         assert_eq!(found.status, "shared (read-only)");
@@ -312,6 +318,10 @@ mod tests {
         let found = find_readable_skill("duplicate", &managed, Some(&shared)).unwrap();
         assert_eq!(found.status, "active");
         assert!(found.skill.instructions.contains("managed version"));
+
+        let found = find_readable_skill("candidate-clash", &managed, Some(&shared)).unwrap();
+        assert_eq!(found.status, "shared (read-only)");
+        assert!(found.skill.instructions.contains("shared active version"));
 
         let _ = fs::remove_dir_all(&base);
     }
