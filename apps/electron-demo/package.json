@@ -1,0 +1,36 @@
+{
+  "name": "komo-electron-demo",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Electron desktop demo for komo — chat (@assistant-ui/react) + dashboard (TanStack Query) over the gateway's HTTP api channel. A JS sibling of crates/komo-gui.",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"vite\" \"wait-on tcp:127.0.0.1:5273 && cross-env KOMO_ELECTRON_DEV=http://127.0.0.1:5273 electron .\"",
+    "build": "tsc -b && vite build",
+    "start": "npm run build && electron .",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "overrides": {
+    "@assistant-ui/store": "0.2.13"
+  },
+  "dependencies": {
+    "@assistant-ui/react": "0.12.28",
+    "@tanstack/react-query": "^5.100.6",
+    "dompurify": "^3.2.4",
+    "marked": "^15.0.6",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^33.2.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "wait-on": "^8.0.1"
+  }
+}
