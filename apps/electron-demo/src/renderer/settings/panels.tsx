@@ -5,6 +5,21 @@ import { apiField, apiGet, apiPost, fmtTs } from "../lib/ipc";
 import type { Memory, Run, StatusSnapshot, Task } from "../types";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+
+const MEM_FILTERS: [string, string][] = [
+  ["all", "全部"],
+  ["candidate", "候选"],
+  ["active", "活跃"],
+  ["archived", "归档"],
+  ["rejected", "拒绝"],
+];
 
 const POLL_MS = 6000;
 
@@ -104,17 +119,23 @@ export function MemoriesTab() {
   return (
     <div className={PANEL}>
       <div className="mb-1.5">
-        <select
-          className="px-2 py-1 rounded-[8px] text-[13px] border border-(--mc-border) bg-(--mc-bg) text-(--mc-fg)"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
+        <Select
+          value={filter || "all"}
+          onValueChange={(v) => setFilter(!v || v === "all" ? "" : String(v))}
         >
-          <option value="">全部</option>
-          <option value="candidate">候选</option>
-          <option value="active">活跃</option>
-          <option value="archived">归档</option>
-          <option value="rejected">拒绝</option>
-        </select>
+          <SelectTrigger size="sm" className="w-28">
+            <SelectValue>
+              {(value) => MEM_FILTERS.find(([v]) => v === value)?.[1] ?? "全部"}
+            </SelectValue>
+          </SelectTrigger>
+          <SelectContent>
+            {MEM_FILTERS.map(([v, label]) => (
+              <SelectItem key={v} value={v}>
+                {label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </div>
       {q.isPending ? (
         <Loading />

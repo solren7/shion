@@ -1,13 +1,11 @@
-import { useState } from "react";
-
 import { useApp, useConnection } from "../app-context";
 import { MemoriesTab, RunsTab, StatusTab, TasksTab } from "./panels";
-import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 
-type Tab = "general" | "tasks" | "memories" | "runs";
-const TABS: [Tab, string][] = [
+const TABS: [string, string][] = [
   ["general", "常规"],
   ["tasks", "任务"],
   ["memories", "记忆"],
@@ -15,66 +13,53 @@ const TABS: [Tab, string][] = [
 ];
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
-  const [tab, setTab] = useState<Tab>("general");
   const { connected } = useConnection();
 
   return (
-    <div
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/45 backdrop-blur-sm"
-      onClick={onClose}
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
     >
-      <div
-        className="w-[min(620px,92vw)] max-h-[82vh] flex flex-col overflow-hidden rounded-2xl bg-(--mc-bg-elev) border border-(--mc-border-strong) shadow-(--mc-shadow-card)"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between px-5 pt-4 pb-2.5">
-          <div className="font-bold text-(--mc-fg)">设置</div>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-7 text-(--mc-fg-muted) hover:text-(--mc-fg)"
-            onClick={onClose}
-            title="关闭"
+      <DialogContent className="flex flex-col gap-0 p-0 sm:max-w-[620px] max-h-[82vh] overflow-hidden">
+        <DialogHeader className="px-5 pt-4">
+          <DialogTitle>设置</DialogTitle>
+        </DialogHeader>
+
+        <Tabs defaultValue="general" className="mt-3 flex flex-col min-h-0 gap-0">
+          <TabsList
+            variant="line"
+            className="w-full h-auto justify-start rounded-none border-b border-border px-5"
           >
-            ✕
-          </Button>
-        </div>
+            {TABS.map(([v, label]) => (
+              <TabsTrigger key={v} value={v} className="flex-none">
+                {label}
+              </TabsTrigger>
+            ))}
+          </TabsList>
 
-        <div className="flex gap-1 px-5 border-b border-(--mc-border)">
-          {TABS.map(([t, label]) => (
-            <button
-              key={t}
-              className={`px-3 py-2 -mb-px border-b-2 text-[13px] cursor-pointer transition-colors ${
-                tab === t
-                  ? "border-(--mc-accent) text-(--mc-fg)"
-                  : "border-transparent text-(--mc-fg-muted) hover:text-(--mc-fg)"
-              }`}
-              onClick={() => setTab(t)}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-
-        <div className="flex-1 overflow-y-auto min-h-0 px-5 py-4">
-          {tab === "general" ? (
-            <GeneralTab />
-          ) : !connected ? (
-            <Empty>未连接到 gateway。</Empty>
-          ) : tab === "tasks" ? (
-            <TasksTab />
-          ) : tab === "memories" ? (
-            <MemoriesTab />
-          ) : (
-            <RunsTab />
-          )}
-        </div>
-      </div>
-    </div>
+          <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4">
+            <TabsContent value="general">
+              <GeneralTab />
+            </TabsContent>
+            <TabsContent value="tasks">
+              {connected ? <TasksTab /> : <Empty>未连接到 gateway。</Empty>}
+            </TabsContent>
+            <TabsContent value="memories">
+              {connected ? <MemoriesTab /> : <Empty>未连接到 gateway。</Empty>}
+            </TabsContent>
+            <TabsContent value="runs">
+              {connected ? <RunsTab /> : <Empty>未连接到 gateway。</Empty>}
+            </TabsContent>
+          </div>
+        </Tabs>
+      </DialogContent>
+    </Dialog>
   );
 }
 
-export function Empty({ children }: { children: React.ReactNode }) {
+function Empty({ children }: { children: React.ReactNode }) {
   return <div className="flex items-center justify-center py-8 text-(--mc-fg-faint)">{children}</div>;
 }
 

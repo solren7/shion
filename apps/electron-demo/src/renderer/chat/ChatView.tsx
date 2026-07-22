@@ -13,6 +13,15 @@ import type { Interactions, PendingApproval } from "../types";
 import { headerFor } from "../lib/ipc";
 import { MarkdownText } from "@/components/assistant-ui/markdown-text";
 import { Button, buttonVariants } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 
 function UserMessage() {
@@ -47,22 +56,19 @@ function ApprovalModal({
 }) {
   const dangerous = req.risk === "dangerous";
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/45 backdrop-blur-sm">
-      <div
-        className={`w-[min(480px,90vw)] p-5 rounded-2xl bg-(--mc-bg-elev) shadow-(--mc-shadow-card) border ${
-          dangerous ? "border-(--mc-danger)" : "border-(--mc-border-strong)"
-        }`}
+    <Dialog open onOpenChange={() => {}}>
+      <DialogContent
+        showCloseButton={false}
+        className={cn("sm:max-w-[480px]", dangerous && "ring-destructive/50")}
       >
-        <div className="font-bold mb-2.5 text-(--mc-fg)">
-          {dangerous ? "🛑 需要审批（危险操作）" : "⚠️ 需要审批"}
-        </div>
-        <div className="mb-2 break-words text-(--mc-fg)">{req.summary}</div>
+        <DialogHeader>
+          <DialogTitle>{dangerous ? "🛑 需要审批（危险操作）" : "⚠️ 需要审批"}</DialogTitle>
+          <DialogDescription className="break-words text-(--mc-fg)">{req.summary}</DialogDescription>
+        </DialogHeader>
         {req.detail && (
-          <div className="text-[13px] text-(--mc-fg-muted) whitespace-pre-wrap mb-2">
-            {req.detail}
-          </div>
+          <div className="text-[13px] text-(--mc-fg-muted) whitespace-pre-wrap">{req.detail}</div>
         )}
-        <div className="flex gap-2 justify-end mt-3.5">
+        <DialogFooter>
           <Button variant="gradient" size="sm" onClick={() => onDecide("once")}>
             批准本次
           </Button>
@@ -72,9 +78,9 @@ function ApprovalModal({
           <Button variant="destructive" size="sm" onClick={() => onDecide("deny")}>
             拒绝
           </Button>
-        </div>
-      </div>
-    </div>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -88,8 +94,8 @@ function ClarifyBar({ question, onAnswer }: { question: string; onAnswer: (text:
     <div className="mx-4 mb-2 px-3.5 py-2.5 rounded-[12px] border border-(--mc-accent-ring) bg-(--mc-accent-soft)">
       <div className="font-semibold mb-1.5 text-(--mc-fg)">❓ {question}</div>
       <div className="flex gap-2">
-        <input
-          className="flex-1 px-2.5 py-1.5 rounded-[10px] border border-(--mc-border) bg-(--mc-bg) text-(--mc-fg) outline-none focus:border-(--mc-accent)"
+        <Input
+          className="flex-1"
           value={text}
           placeholder="输入你的回答…"
           onChange={(e) => setText(e.target.value)}

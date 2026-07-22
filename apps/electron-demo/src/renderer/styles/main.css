@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "tw-animate-css";
 @import "./theme.css";
 
 /* Class-based dark mode: theme.css flips the tokens under html.dark, and this
