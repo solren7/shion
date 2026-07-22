@@ -37,6 +37,15 @@ struct SessionRecord {
     /// every session on every cycle. Reset to 0 when the transcript rotates.
     reviewed_through: i64,
 
+    /// Operator-set display name (empty = untitled). Added additively via
+    /// `SESSION_COLUMNS`; set through `SessionRepository::set_title`.
+    title: String,
+
+    /// Lifecycle status (`active` / `archive` / `deleted`). Additive column;
+    /// set through `SessionRepository::set_status`. The list view hides
+    /// `deleted`.
+    status: String,
+
     #[has_many]
     messages: toasty::Deferred<Vec<MessageRecord>>,
 }
@@ -197,10 +206,14 @@ impl Db {
         // extend this list (NOT NULL with a DEFAULT, or nullable) — a new
         // *table* still needs the delete-to-reset.
         if !is_new && let Some(p) = &path {
-            const SESSION_COLUMNS: &[(&str, &str)] = &[(
-                "reviewed_through",
-                "\"reviewed_through\" integer NOT NULL DEFAULT 0",
-            )];
+            const SESSION_COLUMNS: &[(&str, &str)] = &[
+                (
+                    "reviewed_through",
+                    "\"reviewed_through\" integer NOT NULL DEFAULT 0",
+                ),
+                ("title", "\"title\" text NOT NULL DEFAULT ''"),
+                ("status", "\"status\" text NOT NULL DEFAULT 'active'"),
+            ];
             ensure_columns(p, "session_records", SESSION_COLUMNS).await?;
             const RUN_COLUMNS: &[(&str, &str)] = &[(
                 "recoverable",
@@ -304,6 +317,8 @@ impl SessionRepository for Db {
             id: record.id,
             messages,
             created_at: record.created_at,
+            title: record.title,
+            status: record.status,
         }))
     }
 
@@ -338,6 +353,8 @@ impl SessionRepository for Db {
                 id: session.id.clone(),
                 created_at: session.created_at,
                 reviewed_through: 0,
+                title: session.title.clone(),
+                status: session.status.clone(),
             })
             .exec(&mut conn)
             .await;
@@ -412,6 +429,8 @@ impl SessionRepository for Db {
                 id: archived_id.clone(),
                 created_at: live.created_at,
                 reviewed_through: prior_reviewed,
+                title: live.title.clone(),
+                status: live.status.clone(),
             })
             .exec(&mut tx)
             .await?;
@@ -432,6 +451,55 @@ impl SessionRepository for Db {
             live.update().reviewed_through(0).exec(&mut tx).await?;
             tx.commit().await?;
             Ok(Some(archived_id))
+        })
+        .await
+    }
+
+    async fn set_title(&self, session_id: &str, title: &str) -> anyhow::Result<()> {
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let Ok(mut record) = SessionRecord::get_by_id(&mut conn, session_id).await else {
+                return Ok(()); // no such session — nothing to rename
+            };
+            record.update().title(title.to_string()).exec(&mut conn).await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn set_status(&self, session_id: &str, status: &str) -> anyhow::Result<()> {
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let Ok(mut record) = SessionRecord::get_by_id(&mut conn, session_id).await else {
+                return Ok(()); // no such session
+            };
+            record
+                .update()
+                .status(status.to_string())
+                .exec(&mut conn)
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_session(&self, session_id: &str) -> anyhow::Result<bool> {
+        // Transactional cascade: remove the session's messages then the session
+        // row itself, so a mid-sequence failure rolls back cleanly (mirrors
+        // `rotate` / `RunRepository::prune`). Runs/todos keyed by this session
+        // are left as harmless orphans — they never surface in the session list.
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let mut tx = conn.transaction().await?;
+            let Ok(record) = SessionRecord::get_by_id(&mut tx, session_id).await else {
+                return Ok(false);
+            };
+            for msg in record.messages().exec(&mut tx).await? {
+                msg.delete().exec(&mut tx).await?;
+            }
+            record.delete().exec(&mut tx).await?;
+            tx.commit().await?;
+            Ok(true)
         })
         .await
     }
@@ -1094,6 +1162,8 @@ async fn session_from_record(
 ) -> anyhow::Result<Session> {
     let id = record.id.clone();
     let created_at = record.created_at;
+    let title = record.title.clone();
+    let status = record.status.clone();
     let rows = record.messages().exec(conn).await?;
     let mut messages: Vec<Message> = rows
         .into_iter()
@@ -1108,6 +1178,8 @@ async fn session_from_record(
         id,
         messages,
         created_at,
+        title,
+        status,
     })
 }
 

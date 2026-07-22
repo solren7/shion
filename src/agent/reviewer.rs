@@ -48,6 +48,8 @@ impl Reviewer for ReflectiveReviewer {
             id: format!("review-{}", session.id),
             messages: vec![Message::user(prompt)],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            title: String::new(),
+            status: String::new(),
         };
 
         let reply = self.llm.complete(&review_session).await?;
@@ -434,6 +436,8 @@ mod tests {
                 "I'll send Bob the report tomorrow".to_string(),
             )],
             created_at: 0,
+            title: String::new(),
+            status: String::new(),
         }
     }
 

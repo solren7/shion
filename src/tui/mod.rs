@@ -241,6 +241,7 @@ async fn event_loop(
                                 sink: Arc::new(ChannelSink { tx: sink_tx.clone() }),
                                 interactive: true,
                                 auto_approve: false,
+                                event_sink: None,
                             }
                         });
                         tokio::spawn(async move {

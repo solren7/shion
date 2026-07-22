@@ -412,6 +412,8 @@ impl BriefingSweep {
             id: "briefing".to_string(),
             messages: vec![Message::user(prompt.to_string())],
             created_at: now,
+            title: String::new(),
+            status: String::new(),
         };
         self.llm.complete(&session).await
     }

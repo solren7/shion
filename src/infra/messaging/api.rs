@@ -38,7 +38,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::{
@@ -49,6 +49,7 @@ use crate::{
     },
     config::ApiConfig,
     domain::{
+        events::{ToolEventSink, TurnEvent},
         gateway::MessageHandler,
         memory::{MemoryStatus, parse_memory_status},
         pairing::ApproveOutcome,
@@ -180,6 +181,9 @@ fn build_router(state: AppState) -> Router {
         .route("/api/memories/{id}/pin", post(memory_pin))
         .route("/api/runs/prune", post(prune_runs))
         .route("/api/sessions/clean", post(clean_sessions))
+        .route("/api/sessions/{id}/title", post(set_session_title))
+        .route("/api/sessions/{id}/status", post(set_session_status))
+        .route("/api/sessions/{id}/delete", post(delete_session))
         .route("/api/pairings/approve", post(pair_approve))
         .route("/api/pairings/{id}/revoke", post(pair_revoke))
         .route("/api/dream/apply", post(dream_apply))
@@ -357,15 +361,26 @@ async fn chat_completions(
         SessionContext::detached(&session_id)
     };
 
-    // Synchronous: drive the turn directly and await the reply.
-    let reply = with_session(ctx, state.handler.handle(&session_id, input)).await?;
-
     let id = format!("chatcmpl-{}", uuid::Uuid::now_v7());
     let created = now();
 
     if req.stream {
-        Ok(stream_completion(id, created, model, reply).into_response())
+        // Live path: run the turn on a spawned task and stream tool-call events
+        // (started/finished) as they happen, then the final reply + [DONE]. The
+        // reply itself isn't token-incremental (rig's tool loop has no token
+        // stream) — this streams the *tool-call process*, which is the point.
+        Ok(stream_turn(
+            state.handler.clone(),
+            ctx,
+            session_id,
+            input,
+            id,
+            created,
+            model,
+        ))
     } else {
+        // Synchronous: drive the turn and await the full reply.
+        let reply = with_session(ctx, state.handler.handle(&session_id, input)).await?;
         Ok(Json(json!({
             "id": id,
             "object": "chat.completion",
@@ -381,40 +396,100 @@ async fn chat_completions(
     }
 }
 
-/// SSE rendering of a completed reply. The turn already produced the full text
-/// (the tool loop lives inside rig — no token stream yet), so we emit it as one
-/// delta chunk followed by the stop chunk and `[DONE]`. Streaming clients see a
-/// normal stream; it just isn't token-incremental.
-fn stream_completion(
+/// One item on the SSE stream for a streaming turn.
+enum SseMsg {
+    /// A live tool-call event (emitted from the executor via the sink).
+    Tool(TurnEvent),
+    /// The turn's final assistant reply (or an error rendered as text).
+    Final(String),
+}
+
+/// State for the SSE `unfold`: draining the channel, then a one-shot `[DONE]`.
+enum SseState {
+    Live(mpsc::UnboundedReceiver<SseMsg>),
+    Done,
+}
+
+/// [`ToolEventSink`] that forwards each `TurnEvent` onto the SSE channel.
+struct ChannelEventSink {
+    tx: mpsc::UnboundedSender<SseMsg>,
+}
+
+impl ToolEventSink for ChannelEventSink {
+    fn emit(&self, event: TurnEvent) {
+        // Best-effort: if the client hung up, the receiver is gone — drop it.
+        let _ = self.tx.send(SseMsg::Tool(event));
+    }
+}
+
+/// Run the turn on a spawned task and return an SSE response that streams live
+/// tool-call events as they happen, then the final reply and `[DONE]`.
+///
+/// Tool events go out as SSE frames with `event: tool` and a JSON `TurnEvent`
+/// body; the final reply goes out as an OpenAI-style `chat.completion.chunk`
+/// (default `message` event) carrying the whole text with `finish_reason:stop`.
+/// The reply is not token-incremental — rig's tool loop has no token stream —
+/// so this streams the tool-call process, not the assistant text.
+fn stream_turn(
+    handler: Arc<dyn MessageHandler>,
+    ctx: SessionContext,
+    session_id: String,
+    input: String,
     id: String,
     created: i64,
     model: String,
-    reply: String,
-) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-    let content_chunk = json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": { "role": "assistant", "content": reply },
-            "finish_reason": Value::Null,
-        }],
+) -> Response {
+    let (tx, rx) = mpsc::unbounded_channel::<SseMsg>();
+    // Attach the event sink so the executor emits tool events onto the channel.
+    let ctx = ctx.with_event_sink(Arc::new(ChannelEventSink { tx: tx.clone() }));
+
+    // Drive the turn; on completion push the final reply, then drop every sender
+    // (this `tx` and the sink's clone inside `ctx`) so the receiver closes.
+    tokio::spawn(async move {
+        let outcome = with_session(ctx, handler.handle(&session_id, input)).await;
+        let final_msg = match outcome {
+            Ok(text) => text,
+            Err(error) => format!("请求失败：{error:#}"),
+        };
+        let _ = tx.send(SseMsg::Final(final_msg));
     });
-    let stop_chunk = json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+
+    let stream = futures_util::stream::unfold(SseState::Live(rx), move |state| {
+        let id = id.clone();
+        let model = model.clone();
+        async move {
+            match state {
+                SseState::Live(mut rx) => match rx.recv().await {
+                    Some(SseMsg::Tool(event)) => {
+                        let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
+                        let ev = Event::default().event("tool").data(data);
+                        Some((Ok::<Event, Infallible>(ev), SseState::Live(rx)))
+                    }
+                    Some(SseMsg::Final(text)) => {
+                        let chunk = json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": { "role": "assistant", "content": text },
+                                "finish_reason": "stop",
+                            }],
+                        });
+                        let ev = Event::default().data(chunk.to_string());
+                        Some((Ok::<Event, Infallible>(ev), SseState::Live(rx)))
+                    }
+                    None => Some((
+                        Ok::<Event, Infallible>(Event::default().data("[DONE]")),
+                        SseState::Done,
+                    )),
+                },
+                SseState::Done => None,
+            }
+        }
     });
-    let events = vec![
-        Ok(Event::default().data(content_chunk.to_string())),
-        Ok(Event::default().data(stop_chunk.to_string())),
-        Ok(Event::default().data("[DONE]")),
-    ];
-    Sse::new(futures_util::stream::iter(events))
+    Sse::new(stream).into_response()
 }
 
 /// Continue an existing conversation only when the client opts in with
@@ -672,6 +747,47 @@ async fn prune_runs(
 async fn clean_sessions(State(state): State<AppState>) -> Result<Response, ApiError> {
     let removed = state.actions.clean_sessions().await?;
     Ok(Json(json!({ "removed": removed })).into_response())
+}
+
+#[derive(Deserialize)]
+struct TitleBody {
+    title: String,
+}
+
+/// Rename a session (operator/GUI). Loopback-gated.
+async fn set_session_title(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<TitleBody>,
+) -> Result<Json<Value>, ApiError> {
+    state.actions.set_session_title(&id, &body.title).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct StatusBody {
+    /// `"active"` | `"archive"` | `"deleted"`.
+    status: String,
+}
+
+/// Set a session's lifecycle status — archive / unarchive / soft-delete. A
+/// `deleted` session is hidden from the list but its rows remain. Loopback-gated.
+async fn set_session_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<StatusBody>,
+) -> Result<Json<Value>, ApiError> {
+    state.actions.set_session_status(&id, &body.status).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Delete a session and its messages so it drops off the list. Loopback-gated.
+async fn delete_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let removed = state.actions.delete_session(&id).await?;
+    Ok(Json(json!({ "removed": removed })))
 }
 
 #[derive(Deserialize)]

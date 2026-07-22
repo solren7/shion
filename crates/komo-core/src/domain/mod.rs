@@ -1,5 +1,6 @@
 pub mod approval;
 pub mod context;
+pub mod events;
 pub mod gateway;
 pub mod home;
 pub mod llm;

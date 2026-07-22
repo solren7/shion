@@ -645,6 +645,8 @@ impl GatewayDispatcher {
             interactive: true,
             // Real human prompting — not the trusted loopback-CLI shortcut.
             auto_approve: false,
+            // Chat channels don't stream tool events (no live watcher wiring).
+            event_sink: None,
         };
         tokio::spawn(async move {
             // Armed until normal completion below. If the task is cancelled

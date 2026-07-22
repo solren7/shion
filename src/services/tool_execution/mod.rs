@@ -28,9 +28,15 @@ pub use context::{
 };
 
 use crate::domain::approval::{ApprovalRequest, Approver};
+use crate::domain::events::TurnEvent;
 use crate::domain::llm::{ToolCallReq, ToolOutcome};
 use crate::domain::run::{RunStep, STEP_FIELD_CAP, truncate};
 use crate::domain::tool::{Tool, ToolError};
+
+/// Cap on a `TurnEvent` result/args preview — small so the live event stream
+/// stays lightweight (the full result is still capped separately for the model
+/// and stored in full-ish in the ledger).
+const EVENT_SUMMARY_CAP: usize = 300;
 
 use context::SESSION;
 use result::cap_tool_result;
@@ -201,6 +207,20 @@ impl ToolExecutionCore {
         let started_instant = std::time::Instant::now();
         let seq_field = ledger.as_ref().map(|(_, s)| *s).unwrap_or(-1);
 
+        // Live event: a watcher (streaming client) sees the call start. Args are
+        // the redacted form when ledgered, else redacted on the spot — never the
+        // raw input. No-op when no sink is attached (the common case).
+        if let Some(sink) = &context.session.event_sink {
+            let args = redacted_args
+                .clone()
+                .unwrap_or_else(|| tool.redact_args(&input));
+            sink.emit(TurnEvent::ToolStarted {
+                seq: seq_field,
+                name: name.to_string(),
+                args: truncate(&args, EVENT_SUMMARY_CAP),
+            });
+        }
+
         // Parse the model's JSON arguments once, here, so every tool sees a
         // typed `Value` (and `parse_args` can produce the canonical
         // `InvalidInput` error). Non-JSON args and the empty (no-arg) call are
@@ -309,6 +329,21 @@ impl ToolExecutionCore {
                 Err(ToolError::Failed(e)) => Err(e),
             }
         };
+
+        // Live event: the call finished (after retries collapse). Emitted
+        // regardless of ledger state so a watcher sees every call resolve.
+        if let Some(sink) = &context.session.event_sink {
+            let (ok, summary) = match &result {
+                Ok(out) => (true, truncate(out, EVENT_SUMMARY_CAP)),
+                Err(e) => (false, truncate(&format!("{e:#}"), EVENT_SUMMARY_CAP)),
+            };
+            sink.emit(TurnEvent::ToolFinished {
+                seq: seq_field,
+                name: name.to_string(),
+                ok,
+                summary,
+            });
+        }
 
         // Record the step — best-effort, never affecting the tool's own result.
         // Retries collapse into this one step: the retry is a robustness

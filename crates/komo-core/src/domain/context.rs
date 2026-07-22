@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::domain::approval::{ApprovalRequest, Approver};
+use crate::domain::events::ToolEventSink;
 use crate::domain::gateway::ReplySink;
 use crate::domain::run::RunRepository;
 
@@ -36,6 +37,11 @@ pub struct SessionContext {
     /// loopback callers, so a publicly-bound api never reaches it. Leave `false`
     /// everywhere else.
     pub auto_approve: bool,
+    /// Optional live event sink. When set (a streaming client is watching this
+    /// turn), the tool executor emits [`TurnEvent`](crate::domain::events::TurnEvent)s
+    /// as each tool starts and finishes. `None` for every ordinary turn — no
+    /// watcher, no emission. Attached via [`with_event_sink`](Self::with_event_sink).
+    pub event_sink: Option<Arc<dyn ToolEventSink>>,
 }
 
 impl SessionContext {
@@ -49,6 +55,7 @@ impl SessionContext {
             sink: Arc::new(NoopSink),
             interactive: false,
             auto_approve: false,
+            event_sink: None,
         }
     }
 
@@ -64,6 +71,7 @@ impl SessionContext {
             sink: Arc::new(NoopSink),
             interactive: false,
             auto_approve: true,
+            event_sink: None,
         }
     }
 
@@ -80,7 +88,15 @@ impl SessionContext {
             sink: Arc::new(NoopSink),
             interactive: true,
             auto_approve: false,
+            event_sink: None,
         }
+    }
+
+    /// Attach a live [`ToolEventSink`] so the tool executor emits `TurnEvent`s
+    /// for this turn (the streaming api path uses this to feed the SSE stream).
+    pub fn with_event_sink(mut self, sink: Arc<dyn ToolEventSink>) -> Self {
+        self.event_sink = Some(sink);
+        self
     }
 }
 

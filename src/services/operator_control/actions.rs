@@ -94,6 +94,18 @@ impl OperatorActions {
         self.sessions.delete_empty_sessions().await
     }
 
+    pub async fn set_session_title(&self, id: &str, title: &str) -> anyhow::Result<()> {
+        self.sessions.set_title(id, title).await
+    }
+
+    pub async fn set_session_status(&self, id: &str, status: &str) -> anyhow::Result<()> {
+        self.sessions.set_status(id, status).await
+    }
+
+    pub async fn delete_session(&self, id: &str) -> anyhow::Result<bool> {
+        self.sessions.delete_session(id).await
+    }
+
     pub async fn pending_reminders(&self) -> anyhow::Result<Vec<Reminder>> {
         let mut pending = self.reminders.list_pending().await?;
         pending.sort_by_key(|r| r.run_at);
@@ -210,10 +222,14 @@ pub async fn resolve_resume(runs: &dyn RunRepository, id: &str) -> anyhow::Resul
 pub fn session_summaries(sessions: Vec<Session>) -> Vec<SessionSummary> {
     sessions
         .into_iter()
+        // Hide soft-deleted sessions from the list; active + archived stay.
+        .filter(|s| s.status != komo_core::domain::session::SESSION_STATUS_DELETED)
         .map(|s| SessionSummary {
             created_at: s.created_at,
             messages: s.messages.len(),
             user_turns: s.user_turns(),
+            title: s.title,
+            status: s.status,
             id: s.id,
         })
         .collect()

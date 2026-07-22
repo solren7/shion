@@ -183,6 +183,7 @@ mod tests {
             sink: Arc::new(RecordingSink { sent }),
             interactive: true,
             auto_approve: false,
+            event_sink: None,
         };
         ToolContext::new(session, None, Arc::new(DenyAll))
     }

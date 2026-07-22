@@ -959,6 +959,7 @@ mod tests {
             max_turns: DEFAULT_MAX_TURNS,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_history_messages: DEFAULT_MAX_HISTORY_MESSAGES,
+            llm_timeout_secs: DEFAULT_LLM_TIMEOUT_SECS,
         };
         let s = format!("{cfg:?}");
         assert!(

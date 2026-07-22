@@ -16,6 +16,14 @@ pub struct SessionSummary {
     pub created_at: i64,
     pub messages: usize,
     pub user_turns: usize,
+    /// Operator-set display name (empty = untitled). `default` so a payload from
+    /// an older gateway still parses.
+    #[serde(default)]
+    pub title: String,
+    /// Lifecycle status: `active` / `archive` (`deleted` sessions are omitted
+    /// from the list). `default` for older-gateway compatibility.
+    #[serde(default)]
+    pub status: String,
 }
 
 /// A pairing row without the salted code hash / salt (never leaves the host).

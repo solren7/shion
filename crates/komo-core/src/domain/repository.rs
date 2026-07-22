@@ -40,6 +40,27 @@ pub trait SessionRepository: Send + Sync {
     /// archived id, or `None` when there was nothing to archive.
     async fn rotate(&self, session_id: &str) -> anyhow::Result<Option<String>>;
 
+    /// Set a session's display title (operator rename). No-op if the session
+    /// does not exist. Default is a no-op so stores that don't support titling
+    /// aren't forced to implement it.
+    async fn set_title(&self, _session_id: &str, _title: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Set a session's lifecycle status (`active` / `archive` / `deleted`) —
+    /// a soft state; the list view hides `deleted`. No-op if the session does
+    /// not exist. Default is a no-op.
+    async fn set_status(&self, _session_id: &str, _status: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Delete a session and its messages outright (operator delete — the row
+    /// disappears from the session list). Returns whether a session was
+    /// removed. Default is a no-op returning `false`.
+    async fn delete_session(&self, _session_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Lightweight scan for the review sweep: each session's id, live user-turn
     /// count, and review watermark, with no transcript loaded. Default returns
     /// nothing — a store without a watermark opts out of incremental review.
