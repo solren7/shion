@@ -3,12 +3,16 @@ import "@assistant-ui/react-markdown/styles/dot.css";
 import {
   type CodeHeaderProps,
   MarkdownTextPrimitive,
+  type SyntaxHighlighterProps,
   unstable_memoizeMarkdownComponents as memoizeMarkdownComponents,
   useIsMarkdownCodeBlock,
 } from "@assistant-ui/react-markdown";
+import { makePrismSyntaxHighlighter } from "@assistant-ui/react-syntax-highlighter/full";
+import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
 import remarkGfm from "remark-gfm";
 import { type FC, memo, useState } from "react";
 
+import { useApp } from "@/app-context";
 import { cn } from "@/lib/utils";
 
 const MarkdownTextImpl = () => {
@@ -22,6 +26,39 @@ const MarkdownTextImpl = () => {
 };
 
 export const MarkdownText = memo(MarkdownTextImpl);
+
+// Prism-based highlighting. The token colors come from the prism theme; the
+// background/padding is stripped so our own `pre` (bg-(--mc-bg)) shows through.
+const HL_CONFIG = {
+  customStyle: { margin: 0, padding: 0, background: "transparent", fontSize: "13px" },
+  codeTagProps: { style: { background: "transparent", fontFamily: "inherit" } },
+} as const;
+const DarkHighlighter = makePrismSyntaxHighlighter({ style: oneDark, ...HL_CONFIG });
+const LightHighlighter = makePrismSyntaxHighlighter({ style: oneLight, ...HL_CONFIG });
+
+// The async Prism loader resolves by canonical language name, not alias — map
+// the short forms the model tends to emit so ```ts / ```py still highlight.
+const LANG_ALIAS: Record<string, string> = {
+  ts: "typescript",
+  js: "javascript",
+  py: "python",
+  rb: "ruby",
+  rs: "rust",
+  sh: "bash",
+  shell: "bash",
+  zsh: "bash",
+  yml: "yaml",
+  md: "markdown",
+  cs: "csharp",
+  golang: "go",
+  "c++": "cpp",
+};
+
+const SyntaxHighlighter: FC<SyntaxHighlighterProps> = ({ language, ...props }) => {
+  const { theme } = useApp();
+  const Highlighter = theme === "dark" ? DarkHighlighter : LightHighlighter;
+  return <Highlighter language={LANG_ALIAS[language] ?? language} {...props} />;
+};
 
 function CopyIcon() {
   return (
@@ -76,6 +113,7 @@ function useCopyToClipboard({ copiedDuration = 3000 }: { copiedDuration?: number
 }
 
 const defaultComponents = memoizeMarkdownComponents({
+  SyntaxHighlighter,
   CodeHeader,
   h1: ({ className, ...props }) => (
     <h1
