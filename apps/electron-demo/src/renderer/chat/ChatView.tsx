@@ -5,24 +5,15 @@ import {
   MessagePrimitive,
   ThreadPrimitive,
   useLocalRuntime,
-  useMessagePartText,
   type ChatModelAdapter,
 } from "@assistant-ui/react";
 
 import { useApp } from "../app-context";
 import type { Interactions, PendingApproval } from "../types";
 import { headerFor } from "../lib/ipc";
-import { renderMarkdown } from "../lib/markdown";
+import { MarkdownText } from "@/components/assistant-ui/markdown-text";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-
-/** Assistant message text rendered as sanitized markdown. */
-function MarkdownText() {
-  const part = useMessagePartText();
-  return (
-    <div className="md" dangerouslySetInnerHTML={{ __html: renderMarkdown(part.text ?? "") }} />
-  );
-}
 
 function UserMessage() {
   return (

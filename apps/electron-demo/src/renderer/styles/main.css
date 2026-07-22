@@ -73,42 +73,6 @@ body {
   background-clip: content-box;
 }
 
-/* ---- markdown (assistant replies render sanitized HTML) ---- */
-.md {
-  line-height: 1.6;
-}
-.md > :first-child {
-  margin-top: 0;
-}
-.md > :last-child {
-  margin-bottom: 0;
-}
-.md p {
-  margin: 0.5em 0;
-}
-.md pre {
-  background: var(--mc-bg);
-  border: 1px solid var(--mc-border);
-  border-radius: var(--mc-radius-sm);
-  padding: 10px 12px;
-  overflow-x: auto;
-}
-.md code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.9em;
-}
-.md :not(pre) > code {
-  background: var(--mc-surface-2);
-  padding: 1px 5px;
-  border-radius: 5px;
-}
-.md a {
-  color: var(--mc-accent-2);
-  text-decoration: underline;
-  text-underline-offset: 2px;
-}
-.md ul,
-.md ol {
-  padding-left: 1.3em;
-  margin: 0.5em 0;
-}
+/* Assistant replies render via @assistant-ui/react-markdown; its component
+   styles (the `aui-md` tree in components/assistant-ui/markdown-text.tsx)
+   own the typography, so no global .md layer is needed here. */
