@@ -132,10 +132,12 @@ function registerIpc(): void {
     }
   });
 
-  // One chat turn. `mode` picks the loopback session context: interactive
-  // (approval/clarify suspend the turn, resolved out-of-band) or trusted
-  // (side-effecting tools auto-approve, like `komo chat`).
-  ipcMain.handle("komo:chat", async (_evt, req: ChatRequest) => {
+  // One chat turn over the SSE stream. `mode` picks the loopback session context:
+  // interactive (approval/clarify suspend the turn, resolved out-of-band) or
+  // trusted (side-effecting tools auto-approve, like `komo chat`). Tool-call
+  // events (`event: tool`) are forwarded live to the renderer via
+  // `komo:tool-event`; the final assistant text is accumulated and returned.
+  ipcMain.handle("komo:chat", async (evt, req: ChatRequest) => {
     if (!gateway) return { ok: false, error: "未连接" };
     const { header, message, mode } = req ?? {};
     const headers: Record<string, string> = {
@@ -153,15 +155,65 @@ function registerIpc(): void {
           headers,
           body: JSON.stringify({
             model: "komo",
-            stream: false,
+            stream: true,
             messages: [{ role: "user", content: message }],
           }),
         },
         REQUEST_TIMEOUT_MS,
       );
-      const data = await res.json();
-      if (!res.ok) return { ok: false, error: (data && data.error) || `HTTP ${res.status}` };
-      const reply = data?.choices?.[0]?.message?.content ?? "";
+      if (!res.ok || !res.body) {
+        const text = await res.text().catch(() => "");
+        let msg = `HTTP ${res.status}`;
+        try {
+          const j = JSON.parse(text);
+          if (j?.error) msg = j.error;
+        } catch {
+          /* keep default */
+        }
+        return { ok: false, error: msg };
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let reply = "";
+      const flushFrame = (frame: string) => {
+        let event = "message";
+        const dataLines: string[] = [];
+        for (const line of frame.split("\n")) {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+        }
+        const data = dataLines.join("\n");
+        if (!data || data === "[DONE]") return;
+        if (event === "tool") {
+          try {
+            evt.sender.send("komo:tool-event", { session: header, event: JSON.parse(data) });
+          } catch {
+            /* ignore malformed frame */
+          }
+        } else {
+          try {
+            const chunk = JSON.parse(data);
+            const piece = chunk?.choices?.[0]?.delta?.content;
+            if (piece) reply += piece;
+          } catch {
+            /* ignore malformed frame */
+          }
+        }
+      };
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          flushFrame(buf.slice(0, idx));
+          buf = buf.slice(idx + 2);
+        }
+      }
+      if (buf.trim()) flushFrame(buf);
       return { ok: true, reply };
     } catch (err) {
       return { ok: false, error: errMsg(err) };

@@ -38,6 +38,7 @@ export interface Run {
   status: string;
   recoverable: boolean;
   started_at: number;
+  ended_at: number | null;
   final_output: string;
   error: string;
 }
@@ -51,11 +52,25 @@ export interface RunStep {
   ok: boolean;
 }
 
+export interface SessionMessage {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string;
+  timestamp: number;
+}
+
+export interface RunDetail {
+  run: Run;
+  steps: RunStep[];
+}
+
 export interface SessionSummary {
   id: string;
   created_at: number;
   messages: number;
   user_turns: number;
+  title?: string;
+  /** "active" | "archive" (deleted sessions are omitted from the list). */
+  status?: string;
 }
 
 export interface PendingApproval {
