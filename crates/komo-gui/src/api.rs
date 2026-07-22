@@ -108,13 +108,11 @@ impl ApiClient {
             .build()
             .ok()?;
         let base = info.base_url();
-        Self::health_ok(&http, &base)
-            .await
-            .then_some(ApiClient {
-                base,
-                key: info.key,
-                http,
-            })
+        Self::health_ok(&http, &base).await.then_some(ApiClient {
+            base,
+            key: info.key,
+            http,
+        })
     }
 
     async fn health_ok(http: &reqwest::Client, base: &str) -> bool {
@@ -208,9 +206,8 @@ impl ApiClient {
             return Ok(None);
         }
         let mut map: Map<String, Value> = resp.error_for_status()?.json().await?;
-        let run: Run = serde_json::from_value(
-            map.remove("run").context("run response missing `run`")?,
-        )?;
+        let run: Run =
+            serde_json::from_value(map.remove("run").context("run response missing `run`")?)?;
         let steps: Vec<RunStep> = match map.remove("steps") {
             Some(v) => serde_json::from_value(v)?,
             None => Vec::new(),
@@ -334,7 +331,10 @@ impl ApiClient {
                 json!({ "decision": decision }),
             )
             .await?;
-        Ok(map.get("resolved").and_then(Value::as_bool).unwrap_or(false))
+        Ok(map
+            .get("resolved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
     }
 
     /// Answer a pending clarify question for `session`.
@@ -345,7 +345,10 @@ impl ApiClient {
                 json!({ "text": text }),
             )
             .await?;
-        Ok(map.get("resolved").and_then(Value::as_bool).unwrap_or(false))
+        Ok(map
+            .get("resolved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
     }
 
     // ---- chat --------------------------------------------------------------
@@ -366,7 +369,13 @@ impl ApiClient {
             ChatMode::Interactive => req.header("X-Komo-Interactive", "1"),
             ChatMode::Trusted => req.header("X-Komo-Trusted", "1"),
         };
-        let v: Value = req.json(&body).send().await?.error_for_status()?.json().await?;
+        let v: Value = req
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         Ok(v.pointer("/choices/0/message/content")
             .and_then(Value::as_str)
             .unwrap_or_default()

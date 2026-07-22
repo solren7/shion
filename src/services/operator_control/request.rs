@@ -140,4 +140,3 @@ pub enum PairApproveOutcome {
     NotFound,
     Locked { retry_after_secs: i64 },
 }
-

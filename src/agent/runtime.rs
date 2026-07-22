@@ -12,7 +12,8 @@ use crate::{
         session::Session,
     },
     services::tool_execution::{
-        RunContext, SessionContext, ToolExecutor, ToolTurnContext, current_session, with_session,
+        RunContext, SessionContext, ToolExecutor, ToolTurnContext, TurnResultBudget,
+        current_session, with_session,
     },
 };
 
@@ -21,6 +22,21 @@ use crate::{
 /// tools. The turn then terminates regardless of the model's next move.
 const BUDGET_REACHED_NOTE: &str = "Tool-call budget for this turn reached; do not call any \
      more tools. Reply to the user now using what you already have.";
+
+/// Sent to the user when the model ends a turn with no text at all (e.g. a final
+/// round that is only tool calls the loop won't run, or an empty completion).
+/// A chat channel rejects an empty message, so never hand one downstream.
+const EMPTY_REPLY_FALLBACK: &str = "(我这次没能生成回复，请再说一次或换个说法。)";
+
+/// Guard against handing an empty/whitespace-only reply to a channel (some
+/// reject it outright); substitute a user-facing fallback.
+fn non_empty(reply: String) -> String {
+    if reply.trim().is_empty() {
+        EMPTY_REPLY_FALLBACK.to_string()
+    } else {
+        reply
+    }
+}
 
 pub struct AgentRuntime {
     pub llm: Arc<dyn LlmClient>,
@@ -144,7 +160,30 @@ impl AgentRuntime {
         self.messages.save(session_id, &user_msg).await?;
         session.messages.push(user_msg);
 
-        let reply = self.run_agent_loop(&session, run).await?;
+        let reply = match self.run_agent_loop(&session, run).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                // The turn failed *after* the user message was persisted. Persist
+                // an assistant turn too, so the transcript stays user/assistant-
+                // alternating: the next turn's history would otherwise hold two
+                // consecutive user messages, which several providers reject (and
+                // the history-window repair only fixes a *leading* assistant
+                // message, not an interior double-user). The stored note is
+                // concise — the full error lives in the run ledger.
+                let note = format!(
+                    "(上一条消息处理失败，未能完成回复：{})",
+                    truncate(&format!("{error:#}"), 400)
+                );
+                if let Err(save_err) = self
+                    .messages
+                    .save(session_id, &Message::assistant(&note))
+                    .await
+                {
+                    warn!(%save_err, "failed to persist failed-turn placeholder (non-fatal)");
+                }
+                return Err(error);
+            }
+        };
 
         let assistant_msg = Message::assistant(&reply);
         self.messages.save(session_id, &assistant_msg).await?;
@@ -185,6 +224,9 @@ impl AgentRuntime {
         let context = ToolTurnContext {
             session: current_session().unwrap_or_else(|| SessionContext::detached(&session.id)),
             run: Some(run),
+            // Bound the turn's cumulative tool output (0 = unlimited), so a long
+            // tool chain can't quietly overflow the context window.
+            budget: TurnResultBudget::new(self.tool_executor.turn_result_cap()),
         };
         let mut driver = self.llm.begin_turn(session).await?;
         let mut step = driver.first().await?;
@@ -192,7 +234,7 @@ impl AgentRuntime {
 
         loop {
             match step {
-                Step::Final(text) => return Ok(text),
+                Step::Final(text) => return Ok(non_empty(text)),
                 Step::ToolCalls(calls) => {
                     rounds += 1;
                     let over_budget = rounds > self.max_turns;
@@ -219,12 +261,12 @@ impl AgentRuntime {
                     // Over budget, the note went back as well-formed tool results;
                     // terminate now no matter what the model did with it.
                     step = if over_budget {
-                        return Ok(match next {
+                        return Ok(non_empty(match next {
                             Step::Final(text) => text,
                             Step::ToolCalls(_) => "(Reached the tool-call limit for this turn; \
                                  answering with what I have.)"
                                 .to_string(),
-                        });
+                        }));
                     } else {
                         next
                     };
@@ -240,6 +282,8 @@ mod tests {
     use crate::{
         domain::{
             llm::{LlmClient, Step, ToolCallReq, TurnDriver},
+            message::Role,
+            repository::SessionRepository,
             run::RunStatus,
             session::Session,
             tool::Tool,
@@ -501,6 +545,69 @@ mod tests {
                 .content
                 .contains("unknown tool")
         );
+    }
+
+    /// An LLM whose turn always fails — stands in for a dead provider / a
+    /// completion timeout.
+    struct FailingLlm;
+    #[async_trait]
+    impl LlmClient for FailingLlm {
+        async fn complete(&self, _session: &Session) -> anyhow::Result<String> {
+            anyhow::bail!("provider down")
+        }
+        async fn begin_turn(&self, _session: &Session) -> anyhow::Result<Box<dyn TurnDriver>> {
+            anyhow::bail!("provider down")
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_turn_persists_an_assistant_placeholder_for_alternation() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_failed_turn.db"))
+                .await
+                .unwrap(),
+        );
+        let rt = AgentRuntime {
+            llm: Arc::new(FailingLlm),
+            sessions: db.clone(),
+            messages: db.clone(),
+            runs: db.clone(),
+            tool_executor: ToolExecutor::new(
+                crate::services::tool_execution::ToolExecutionConfig::default(),
+            ),
+            max_turns: 30,
+            history_window: 0,
+            review: None,
+        };
+
+        let result = rt.handle_input("cli:sf", "hi".into()).await;
+        assert!(result.is_err(), "the turn must surface the failure");
+
+        // The transcript must still alternate user → assistant, so the next
+        // turn's history doesn't hold two consecutive user messages.
+        let session = SessionRepository::find(&*db, "cli:sf")
+            .await
+            .unwrap()
+            .unwrap();
+        let roles: Vec<Role> = session.messages.iter().map(|m| m.role.clone()).collect();
+        assert_eq!(roles, vec![Role::User, Role::Assistant]);
+        assert!(session.messages[1].content.contains("处理失败"));
+
+        // The run is recorded as failed.
+        let runs = RunRepository::list(&*db, 10).await.unwrap();
+        assert_eq!(runs[0].status, RunStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn empty_final_answer_gets_a_fallback() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_empty_final.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, _) = scripted_runtime(db.clone(), vec![Step::Final("   ".into())], vec![], 30);
+        let reply = rt.handle_input("cli:se", "hi".into()).await.unwrap();
+        assert_eq!(reply, EMPTY_REPLY_FALLBACK);
     }
 
     #[tokio::test]

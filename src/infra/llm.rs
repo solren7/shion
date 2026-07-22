@@ -422,7 +422,8 @@ pub fn build_llm(
     let stream = matches!(config.provider, Provider::Codex);
     // Cap each completion so a hung provider request fails the turn instead of
     // wedging it in `running` (rig's client sets no request timeout). `0` = off.
-    let timeout = (config.llm_timeout_secs > 0).then(|| Duration::from_secs(config.llm_timeout_secs));
+    let timeout =
+        (config.llm_timeout_secs > 0).then(|| Duration::from_secs(config.llm_timeout_secs));
     // Seed the agent with an initial preamble; `complete` overrides it per turn.
     let initial = preamble();
 

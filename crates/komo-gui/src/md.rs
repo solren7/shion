@@ -48,6 +48,9 @@ mod tests {
     #[test]
     fn inline_html_is_escaped() {
         let html = to_html("a <img src=x onerror=alert(1)> b");
-        assert!(!html.contains("<img"), "inline HTML must be escaped: {html}");
+        assert!(
+            !html.contains("<img"),
+            "inline HTML must be escaped: {html}"
+        );
     }
 }

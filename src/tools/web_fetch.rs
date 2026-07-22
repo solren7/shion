@@ -11,6 +11,13 @@ use crate::domain::{
 const MAX_BYTES: usize = 8 * 1024;
 const USER_AGENT: &str = "komo-agent/0.1";
 
+/// Per-request timeout for the fetch client. `reqwest`'s default client sets no
+/// timeout at all, so a server that accepts the connection then never responds
+/// would hang the call until the executor's outer wall-clock backstop fired.
+/// This inner timeout fails faster and, being a proper request timeout, is
+/// classified transient — an idempotent GET is retried once or twice.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Cap on caller-supplied request headers — enough for auth + content
 /// negotiation, far below anything abusive.
 const MAX_HEADERS: usize = 8;
@@ -39,9 +46,13 @@ pub struct WebFetchTool {
 
 impl WebFetchTool {
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+        // A timeout-less client can hang indefinitely on an unresponsive server;
+        // fall back to the default client only if the builder somehow fails.
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_default();
+        Self { client }
     }
 }
 

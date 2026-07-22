@@ -29,6 +29,22 @@ pub const DEFAULT_LLM_TIMEOUT_SECS: u64 = 180;
 /// catches tools that don't self-trim.
 pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 16 * 1024;
 
+/// Built-in default per-turn cap on the *cumulative* bytes of tool output fed
+/// back to the model, when neither `KOMO_MAX_TURN_RESULT_BYTES` nor config.toml
+/// sets one. `max_tool_result_bytes` bounds a *single* result; this bounds the
+/// whole turn, so a long tool chain (dozens of rounds, each returning a capped
+/// result) can't silently accumulate past the context window and fail the turn
+/// only after all the side effects have already run. `0` disables the budget.
+pub const DEFAULT_MAX_TURN_RESULT_BYTES: usize = 256 * 1024;
+
+/// Built-in per-tool-call wall-clock timeout (seconds) when neither
+/// `KOMO_TOOL_TIMEOUT_SECS` nor config.toml sets one. A backstop so a tool that
+/// hangs forever (a shell command waiting on stdin, a `reqwest` client with no
+/// timeout of its own) fails the call cleanly instead of wedging the whole turn
+/// — and, since the loop can't finish, the session — indefinitely. Generous
+/// enough for a slow build or a large download; `0` disables the timeout.
+pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 120;
+
 /// Built-in default for `max_history_messages` when neither
 /// `KOMO_MAX_HISTORY_MESSAGES` nor config.toml sets one. Counts prior messages
 /// (user + assistant alternating, so ~25 turns), enough context for a chat
@@ -138,8 +154,14 @@ pub struct ModelConfig {
     pub aux_model: Option<String>,
     /// Maximum tool-calling round-trips per user turn.
     pub max_turns: usize,
-    /// Byte cap on a tool result handed back to the LLM (global backstop).
+    /// Byte cap on a single tool result handed back to the LLM (global backstop).
     pub max_tool_result_bytes: usize,
+    /// Cumulative per-turn cap on tool output fed back to the model (`0` =
+    /// unlimited). Bounds a whole tool chain, not one result.
+    pub max_turn_result_bytes: usize,
+    /// Per-tool-call wall-clock timeout in seconds — a hung tool fails the call
+    /// cleanly rather than wedging the turn forever (`0` = no timeout).
+    pub tool_timeout_secs: u64,
     /// Max prior messages replayed as history per turn (`0` = unlimited).
     pub max_history_messages: usize,
     /// Per-completion timeout in seconds — a hung provider request fails the
@@ -157,6 +179,8 @@ impl fmt::Debug for ModelConfig {
             .field("aux_model", &self.aux_model)
             .field("max_turns", &self.max_turns)
             .field("max_tool_result_bytes", &self.max_tool_result_bytes)
+            .field("max_turn_result_bytes", &self.max_turn_result_bytes)
+            .field("tool_timeout_secs", &self.tool_timeout_secs)
             .field("max_history_messages", &self.max_history_messages)
             .field("llm_timeout_secs", &self.llm_timeout_secs)
             .finish()
@@ -182,6 +206,8 @@ impl ModelConfig {
             aux_model: self.aux_model.clone(),
             max_turns: self.max_turns,
             max_tool_result_bytes: self.max_tool_result_bytes,
+            max_turn_result_bytes: self.max_turn_result_bytes,
+            tool_timeout_secs: self.tool_timeout_secs,
             max_history_messages: self.max_history_messages,
             llm_timeout_secs: self.llm_timeout_secs,
         }
@@ -330,6 +356,14 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
             .max_tool_result_bytes
             .or(file.max_tool_result_bytes)
             .unwrap_or(DEFAULT_MAX_TOOL_RESULT_BYTES),
+        max_turn_result_bytes: env
+            .max_turn_result_bytes
+            .or(file.max_turn_result_bytes)
+            .unwrap_or(DEFAULT_MAX_TURN_RESULT_BYTES),
+        tool_timeout_secs: env
+            .tool_timeout_secs
+            .or(file.tool_timeout_secs)
+            .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS),
         max_history_messages: env
             .max_history_messages
             .or(file.max_history_messages)
@@ -958,6 +992,8 @@ mod tests {
             aux_model: None,
             max_turns: DEFAULT_MAX_TURNS,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_turn_result_bytes: DEFAULT_MAX_TURN_RESULT_BYTES,
+            tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
             max_history_messages: DEFAULT_MAX_HISTORY_MESSAGES,
             llm_timeout_secs: DEFAULT_LLM_TIMEOUT_SECS,
         };

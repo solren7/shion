@@ -36,6 +36,13 @@ use crate::{
 /// How long the shutdown notice may take before we stop waiting and shut down.
 const SHUTDOWN_NOTICE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long to let in-flight agent turns finish before tearing down. A turn is a
+/// detached task, so without this drain a graceful stop would cut it mid-loop
+/// and leave its run `interrupted` (crash reconciliation still catches any that
+/// outlast the window). Poll interval for that drain.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_DRAIN_POLL: Duration = Duration::from_millis(200);
+
 /// `AgentRuntime` is the production message handler: an inbound message is just
 /// another turn in its session lifecycle.
 #[async_trait]
@@ -61,8 +68,13 @@ pub trait Channel: Send + Sync {
 /// The scheduled background work the gateway hosts (the `daemon.rs` supervisor
 /// loop, reused verbatim).
 pub struct MaintenanceService {
+    /// Short label for logs and the breaker alert (e.g. `"reminders"`).
+    pub name: String,
     pub schedule: Schedule,
     pub maintenance: Arc<dyn Maintenance>,
+    /// Optional notifier the supervisor uses to surface a tripped circuit
+    /// breaker to the operator's home channel. `None` = fail silently (log only).
+    pub alert: Option<Arc<dyn Notifier>>,
 }
 
 pub struct Gateway {
@@ -123,8 +135,16 @@ impl Gateway {
                 let stop = async move {
                     let _ = rx.changed().await;
                 };
-                if let Err(error) = supervise(&service.schedule, service.maintenance, stop).await {
-                    error!(%error, "maintenance service stopped");
+                if let Err(error) = supervise(
+                    &service.schedule,
+                    service.maintenance,
+                    &service.name,
+                    service.alert,
+                    stop,
+                )
+                .await
+                {
+                    error!(service = %service.name, %error, "maintenance service stopped");
                 }
             }));
         }
@@ -144,6 +164,26 @@ impl Gateway {
         shutdown.await;
         info!("shutdown signal received; stopping gateway");
 
+        // Stop the channels and maintenance loops first (they stop accepting new
+        // work), then give any in-flight turns a bounded chance to finish so
+        // their reply + run ledger land instead of being cut off `interrupted`.
+        let _ = stop_tx.send(true);
+        let drain_start = tokio::time::Instant::now();
+        loop {
+            let in_flight = dispatcher.inflight_count();
+            if in_flight == 0 {
+                break;
+            }
+            if drain_start.elapsed() >= SHUTDOWN_DRAIN_TIMEOUT {
+                warn!(
+                    in_flight,
+                    "shutdown drain timed out; some turns will be interrupted"
+                );
+                break;
+            }
+            tokio::time::sleep(SHUTDOWN_DRAIN_POLL).await;
+        }
+
         // Tell the home channel we're going offline before tearing down. The
         // notifier's sender is independent of the channel serve loops, so this
         // still works as they wind down; a bounded timeout keeps a hung network
@@ -159,8 +199,6 @@ impl Gateway {
                 Err(_) => warn!("shutdown notice timed out"),
             }
         }
-
-        let _ = stop_tx.send(true);
 
         for handle in handles {
             let _ = handle.await;

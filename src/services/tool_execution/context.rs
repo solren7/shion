@@ -14,6 +14,9 @@
 //! `ctx.session` instead. The run context is purely explicit — no ambient state
 //! decides whether a turn is ledgered.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 pub use crate::domain::context::{RunContext, SessionContext, ToolContext};
 
 /// Everything the executor needs to know about the turn a round of tool calls
@@ -24,6 +27,65 @@ pub struct ToolTurnContext {
     /// `Some` when the turn is recorded in the run ledger (the main agent);
     /// `None` for callers without a ledger (rig's fallback path).
     pub run: Option<RunContext>,
+    /// Cumulative tool-output budget for this turn. A round's tool calls share
+    /// it via an `Arc`, so the total is tracked across the concurrent calls and
+    /// across rounds — see [`TurnResultBudget`].
+    pub budget: TurnResultBudget,
+}
+
+/// Per-turn cap on the *cumulative* bytes of tool output fed back to the model.
+///
+/// `max_tool_result_bytes` bounds one result; this bounds the whole turn, so a
+/// long tool chain (dozens of rounds, each returning a capped result) can't
+/// quietly accumulate past the context window and fail the turn only after its
+/// side effects have already run. Once the running total crosses the cap, the
+/// executor swaps each further result for a short note telling the model to stop
+/// gathering and answer with what it has. Shared across a round's concurrent
+/// calls via an `Arc<AtomicUsize>`; the counter is approximate under that
+/// concurrency (a small overshoot is fine for a backstop).
+#[derive(Clone)]
+pub struct TurnResultBudget {
+    consumed: Arc<AtomicUsize>,
+    /// `0` disables the budget (unlimited).
+    cap: usize,
+}
+
+impl TurnResultBudget {
+    /// A budget capping cumulative tool output at `cap` bytes (`0` = unlimited).
+    pub fn new(cap: usize) -> Self {
+        Self {
+            consumed: Arc::new(AtomicUsize::new(0)),
+            cap,
+        }
+    }
+
+    /// A disabled budget — for execution paths with no per-turn accounting
+    /// (rig's fallback, tests).
+    pub fn unlimited() -> Self {
+        Self::new(0)
+    }
+
+    /// Account for a tool result about to be returned. `Ok(out)` when there is
+    /// still budget (the result is admitted and its size recorded); `Err(note)`
+    /// once the turn is over budget — the note replaces the result. Disabled
+    /// (`cap == 0`) always admits.
+    pub(super) fn admit(&self, out: String) -> Result<String, String> {
+        if self.cap == 0 {
+            return Ok(out);
+        }
+        let already = self.consumed.load(Ordering::Relaxed);
+        if already >= self.cap {
+            return Err(format!(
+                "[tool result omitted: this turn has already returned ~{} KB of tool output, \
+                 over the {} KB per-turn budget. Stop calling tools and answer the user with \
+                 what you already have; start a new turn if you genuinely need more.]",
+                already / 1024,
+                self.cap / 1024
+            ));
+        }
+        self.consumed.fetch_add(out.len(), Ordering::Relaxed);
+        Ok(out)
+    }
 }
 
 tokio::task_local! {

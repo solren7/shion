@@ -64,6 +64,8 @@ pub struct KomoEnv {
     pub dream_schedule: Option<String>,
     pub max_turns: Option<usize>,
     pub max_tool_result_bytes: Option<usize>,
+    pub max_turn_result_bytes: Option<usize>,
+    pub tool_timeout_secs: Option<u64>,
     pub max_history_messages: Option<usize>,
     pub llm_timeout_secs: Option<u64>,
     pub review_interval: Option<usize>,
@@ -137,6 +139,8 @@ impl KomoEnv {
             dream_schedule,
             max_turns,
             max_tool_result_bytes,
+            max_turn_result_bytes,
+            tool_timeout_secs,
             max_history_messages,
             llm_timeout_secs,
             review_interval,
@@ -238,6 +242,15 @@ pub struct FileConfig {
     /// against context-window bloat (default: 16384). See
     /// `services::tool_execution` (the executor's result cap).
     pub max_tool_result_bytes: Option<usize>,
+    /// Cumulative per-turn cap on tool output fed back to the model (default:
+    /// 262144; `0` = unlimited). Bounds a whole tool chain, not one result — a
+    /// long chain of capped results can't silently overflow the context window.
+    pub max_turn_result_bytes: Option<usize>,
+    /// Per-tool-call wall-clock timeout in seconds — a hung tool (a shell
+    /// command waiting on stdin, a timeout-less HTTP client) fails the call
+    /// instead of wedging the turn (default: 120; `0` = no timeout). See
+    /// `services::tool_execution`.
+    pub tool_timeout_secs: Option<u64>,
     /// Max prior messages replayed as history per turn — the global backstop
     /// against an ever-growing chat session sending its whole transcript to the
     /// model every turn (default: 50; `0` = unlimited). See

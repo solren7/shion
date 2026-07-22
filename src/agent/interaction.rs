@@ -428,6 +428,14 @@ impl GatewayDispatcher {
         }
     }
 
+    /// Number of sessions with a turn currently in flight. The gateway's
+    /// bounded shutdown drain polls this so active turns get a chance to finish
+    /// (and persist their reply + run) before teardown, leaving fewer runs
+    /// marked `interrupted`.
+    pub fn inflight_count(&self) -> usize {
+        self.inflight.lock().unwrap().len()
+    }
+
     /// Handle one inbound message. Returns promptly: a plain message spawns its
     /// turn and returns, so the caller's receive loop is never blocked.
     pub async fn handle(

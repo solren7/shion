@@ -33,8 +33,26 @@ use crate::domain::{
     task::{Task, TaskRepository},
 };
 
-/// Stop the daemon once this many maintenance cycles fail back-to-back.
+/// Trip the circuit breaker once this many maintenance cycles fail back-to-back.
+/// Tripping no longer kills the service — it forces a cooldown before retrying
+/// (see [`supervise`]).
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
+
+/// Escalating cooldowns applied after successive breaker trips: a service that
+/// keeps failing backs off further each time (capped at the last entry) instead
+/// of hammering a broken dependency every cron tick. Crucially it never stops
+/// permanently — an always-on personal agent must recover on its own once the
+/// underlying problem (db lock, network) clears, without a gateway restart.
+const BREAKER_COOLDOWNS: [Duration; 4] = [
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+    Duration::from_secs(900),
+    Duration::from_secs(3600),
+];
+
+/// Bounded time to deliver the breaker alert so a hung notifier can't stall the
+/// cooldown.
+const BREAKER_ALERT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A parsed cron schedule. Wraps `croner` so the supervisor never touches the
 /// cron crate directly and the "when does it next fire" math stays testable.
@@ -594,12 +612,21 @@ fn breaker_tripped(consecutive_failures: &mut u32, cycle_ok: bool) -> bool {
     }
 }
 
-/// Run maintenance on `schedule` until `shutdown` resolves or the circuit
-/// breaker trips. Returns `Ok` on a clean shutdown, `Err` when the breaker stops
-/// the loop.
+/// Run maintenance on `schedule` until `shutdown` resolves. Returns `Ok` on a
+/// clean shutdown. The circuit breaker no longer stops the loop: after
+/// [`MAX_CONSECUTIVE_FAILURES`] back-to-back failures it forces an escalating
+/// cooldown (and alerts `alert`, if set) before retrying, so a transient outage
+/// can't silently kill a sweep for the rest of the process's life — the sweep
+/// recovers on its own once the underlying problem clears.
+///
+/// `name` labels the service in logs and the alert. `alert` is an optional
+/// notifier for surfacing a tripped breaker to the operator's home channel
+/// (best-effort, bounded) — otherwise the death would be invisible.
 pub async fn supervise<S>(
     schedule: &Schedule,
     maintenance: Arc<dyn Maintenance>,
+    name: &str,
+    alert: Option<Arc<dyn Notifier>>,
     shutdown: S,
 ) -> anyhow::Result<()>
 where
@@ -607,14 +634,21 @@ where
 {
     tokio::pin!(shutdown);
     let mut consecutive_failures = 0u32;
+    // How many times the breaker has tripped without a recovery in between —
+    // indexes the escalating cooldown. Reset by any successful cycle.
+    let mut trips = 0usize;
 
     loop {
         let wait = schedule.next_after(Utc::now())?;
-        info!(seconds = wait.as_secs(), "next maintenance cycle scheduled");
+        info!(
+            service = name,
+            seconds = wait.as_secs(),
+            "next maintenance cycle scheduled"
+        );
 
         tokio::select! {
             _ = &mut shutdown => {
-                info!("shutdown signal received; stopping daemon");
+                info!(service = name, "shutdown signal received; stopping daemon");
                 return Ok(());
             }
             _ = tokio::time::sleep(wait) => {}
@@ -624,6 +658,7 @@ where
         let cycle_ok = match maintenance.run().await {
             Ok(summary) => {
                 info!(
+                    service = name,
                     sessions = summary.sessions_reviewed,
                     memories = summary.memories_written,
                     skills = summary.skills_written,
@@ -638,15 +673,51 @@ where
                 true
             }
             Err(error) => {
-                error!(%error, "maintenance cycle failed");
+                error!(service = name, %error, "maintenance cycle failed");
                 false
             }
         };
 
-        if breaker_tripped(&mut consecutive_failures, cycle_ok) {
-            anyhow::bail!(
-                "{MAX_CONSECUTIVE_FAILURES} consecutive maintenance failures; stopping daemon"
+        // Always update the consecutive-failure counter (a good cycle resets it).
+        let tripped = breaker_tripped(&mut consecutive_failures, cycle_ok);
+        if cycle_ok {
+            // A good cycle clears the escalation ladder.
+            trips = 0;
+        } else if tripped {
+            let cooldown = BREAKER_COOLDOWNS[trips.min(BREAKER_COOLDOWNS.len() - 1)];
+            trips += 1;
+            error!(
+                service = name,
+                failures = MAX_CONSECUTIVE_FAILURES,
+                cooldown_s = cooldown.as_secs(),
+                "circuit breaker tripped; cooling down before retrying (service not stopped)"
             );
+            // Surface the trip to the operator — an unreachable sweep would
+            // otherwise fail silently. Best-effort and bounded so a hung
+            // notifier can't stall the cooldown.
+            if let Some(alert) = &alert {
+                let title = "⚠️ Komo 维护任务异常";
+                let body = format!(
+                    "维护任务「{name}」连续失败 {MAX_CONSECUTIVE_FAILURES} 次，暂停 {} 分钟后自动重试。",
+                    (cooldown.as_secs() + 59) / 60
+                );
+                match tokio::time::timeout(BREAKER_ALERT_TIMEOUT, alert.notify(title, &body)).await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => warn!(service = name, %error, "failed to send breaker alert"),
+                    Err(_) => warn!(service = name, "breaker alert timed out"),
+                }
+            }
+            // Reset the window so the service gets a fresh set of attempts after
+            // the cooldown rather than tripping again on the first failure.
+            consecutive_failures = 0;
+            tokio::select! {
+                _ = &mut shutdown => {
+                    info!(service = name, "shutdown during breaker cooldown; stopping daemon");
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(cooldown) => {}
+            }
         }
     }
 }
@@ -976,6 +1047,43 @@ mod tests {
         assert_eq!(failures, 0);
         assert!(!breaker_tripped(&mut failures, false));
         assert_eq!(failures, 1);
+    }
+
+    /// A maintenance that always fails, counting its runs — for asserting the
+    /// supervisor keeps retrying after a breaker trip instead of dying.
+    struct AlwaysFail {
+        runs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Maintenance for AlwaysFail {
+        async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("always fails")
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervise_recovers_after_breaker_trip_instead_of_dying() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let maint: Arc<dyn Maintenance> = Arc::new(AlwaysFail { runs: runs.clone() });
+        let schedule = Schedule::parse("* * * * *").unwrap();
+        // A never-recovering sweep, run for ~30 virtual minutes (the paused
+        // clock auto-advances through the cron waits and cooldowns). Before the
+        // recovery change this would `bail!` after 5 failures; now it must keep
+        // retrying across cooldowns and exit cleanly only on shutdown.
+        let shutdown = tokio::time::sleep(Duration::from_secs(30 * 60));
+        let result = supervise(&schedule, maint, "test", None, shutdown).await;
+        assert!(
+            result.is_ok(),
+            "a tripped breaker must not error out the supervisor"
+        );
+        assert!(
+            runs.load(Ordering::Relaxed) > MAX_CONSECUTIVE_FAILURES as usize,
+            "supervisor should keep retrying after each cooldown, ran {}",
+            runs.load(Ordering::Relaxed)
+        );
     }
 
     // ── TaskSweep ─────────────────────────────────────────────────────────────

@@ -90,9 +90,11 @@ pub async fn build(
 
     // The executor owns execution policy (result cap, per-turn call budget) as
     // instance config — no process globals.
-    let mut tools = ToolExecutor::new(ToolExecutionConfig::with_result_cap(
-        model_config.max_tool_result_bytes,
-    ))
+    let mut tools = ToolExecutor::new(
+        ToolExecutionConfig::with_result_cap(model_config.max_tool_result_bytes)
+            .with_turn_budget(model_config.max_turn_result_bytes)
+            .with_call_timeout_secs(model_config.tool_timeout_secs),
+    )
     .with_approver(approver.clone());
     tools.register(Arc::new(TimeTool));
     tools.register(Arc::new(FileTool::new(workspace.clone())));
@@ -268,9 +270,11 @@ pub async fn build(
         config.runtime.policy.policy.clone(),
         Arc::new(UnattendedDeny),
     );
-    let mut briefing_tools = ToolExecutor::new(ToolExecutionConfig::with_result_cap(
-        model_config.max_tool_result_bytes,
-    ))
+    let mut briefing_tools = ToolExecutor::new(
+        ToolExecutionConfig::with_result_cap(model_config.max_tool_result_bytes)
+            .with_turn_budget(model_config.max_turn_result_bytes)
+            .with_call_timeout_secs(model_config.tool_timeout_secs),
+    )
     .with_approver(briefing_approver.clone());
     briefing_tools.register(Arc::new(TimeTool));
     briefing_tools.register(Arc::new(WebFetchTool::new()));

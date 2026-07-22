@@ -461,7 +461,11 @@ impl SessionRepository for Db {
             let Ok(mut record) = SessionRecord::get_by_id(&mut conn, session_id).await else {
                 return Ok(()); // no such session — nothing to rename
             };
-            record.update().title(title.to_string()).exec(&mut conn).await?;
+            record
+                .update()
+                .title(title.to_string())
+                .exec(&mut conn)
+                .await?;
             Ok(())
         })
         .await

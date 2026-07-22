@@ -187,7 +187,10 @@ fn build_router(state: AppState) -> Router {
         .route("/api/pairings/approve", post(pair_approve))
         .route("/api/pairings/{id}/revoke", post(pair_revoke))
         .route("/api/dream/apply", post(dream_apply))
-        .route("/api/interactions/{session}/approval", post(resolve_approval))
+        .route(
+            "/api/interactions/{session}/approval",
+            post(resolve_approval),
+        )
         .route("/api/interactions/{session}/answer", post(answer_question))
         .route_layer(middleware::from_fn(require_loopback));
 

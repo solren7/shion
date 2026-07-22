@@ -192,16 +192,22 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     ));
     let mut gateway = Gateway::new(dispatcher)
         .with_maintenance(MaintenanceService {
+            name: "review".to_string(),
             schedule: review_schedule,
             maintenance: review_sweep,
+            alert: Some(notifier.clone()),
         })
         .with_maintenance(MaintenanceService {
+            name: "reminders".to_string(),
             schedule: reminder_schedule,
             maintenance: reminder_sweep,
+            alert: Some(notifier.clone()),
         })
         .with_maintenance(MaintenanceService {
+            name: "tasks".to_string(),
             schedule: Schedule::parse("* * * * *")?,
             maintenance: task_sweep,
+            alert: Some(notifier.clone()),
         });
 
     // Daily briefing — only when the user opted in with `briefing_schedule`.
@@ -228,8 +234,10 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             });
         }
         gateway = gateway.with_maintenance(MaintenanceService {
+            name: "briefing".to_string(),
             schedule,
             maintenance: briefing_sweep,
+            alert: Some(notifier.clone()),
         });
     }
 
@@ -241,8 +249,10 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             memories: wired.memories.clone(),
         });
         gateway = gateway.with_maintenance(MaintenanceService {
+            name: "dreaming".to_string(),
             schedule,
             maintenance: dream_sweep,
+            alert: Some(notifier.clone()),
         });
     }
 

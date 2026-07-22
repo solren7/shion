@@ -1,8 +1,10 @@
+use std::process::Stdio;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 
 use crate::domain::{
     approval::{ActionRef, ApprovalRequest},
@@ -118,6 +120,13 @@ const SECRET_KEY_MARKERS: &[&str] = &[
 
 /// Flags whose *following* token is a secret (`--password hunter2`).
 const SECRET_FLAGS: &[&str] = &["--password", "--token", "--api-key", "--secret", "-p"];
+
+/// Upper bound on how many bytes of stdout/stderr each stream is read into
+/// memory. Well above the LLM result cap (which truncates the model-facing text
+/// anyway), so it never clips useful output — it only stops a command that
+/// spews unbounded output (`cat` a huge file, `yes`) from OOMing the gateway.
+/// Reading stops at the cap and the child is killed (`kill_on_drop`).
+const MAX_STREAM_BYTES: u64 = 256 * 1024;
 
 /// A token that "looks like" an opaque credential: long and a single run of
 /// url-safe-ish characters with no shell punctuation.
@@ -251,29 +260,68 @@ impl Tool for ShellTool {
         }
 
         let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg(&args.command);
+        cmd.arg("-c")
+            .arg(&args.command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // If the executor's wall-clock timeout aborts the task awaiting this
+            // command, dropping the `Child` must kill the process — otherwise
+            // `sh` (and its children) would be orphaned and keep running.
+            .kill_on_drop(true);
         if let Some(root) = self.workspace.roots().first() {
             cmd.current_dir(root);
         }
-        let output = cmd
-            .output()
-            .await
+        let mut child = cmd
+            .spawn()
             .map_err(|e| ToolError::Failed(anyhow::anyhow!("failed to spawn command: {e}")))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let status = output
-            .status
+        // Read both streams concurrently, each bounded to MAX_STREAM_BYTES, so a
+        // command emitting unbounded output can't buffer the whole thing into
+        // memory and OOM the gateway. `stdin(null)` above means a command that
+        // reads stdin sees EOF instead of blocking forever waiting for input.
+        let mut out_pipe = child.stdout.take();
+        let mut err_pipe = child.stderr.take();
+        let read_out = async {
+            let mut buf = Vec::new();
+            if let Some(p) = out_pipe.as_mut() {
+                let _ = p.take(MAX_STREAM_BYTES).read_to_end(&mut buf).await;
+            }
+            buf
+        };
+        let read_err = async {
+            let mut buf = Vec::new();
+            if let Some(p) = err_pipe.as_mut() {
+                let _ = p.take(MAX_STREAM_BYTES).read_to_end(&mut buf).await;
+            }
+            buf
+        };
+        let (out_bytes, err_bytes) = tokio::join!(read_out, read_err);
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| ToolError::Failed(anyhow::anyhow!("failed to await command: {e}")))?;
+
+        let stdout = String::from_utf8_lossy(&out_bytes);
+        let stderr = String::from_utf8_lossy(&err_bytes);
+        let status = status
             .code()
             .map(|c| c.to_string())
             .unwrap_or_else(|| "signal".to_string());
 
+        let clipped = |raw: &[u8]| (raw.len() as u64) >= MAX_STREAM_BYTES;
         let mut result = format!("exit status: {status}");
         if !stdout.trim().is_empty() {
             result.push_str(&format!("\n--- stdout ---\n{}", stdout.trim_end()));
+            if clipped(&out_bytes) {
+                result.push_str("\n…[stdout truncated at the output limit]");
+            }
         }
         if !stderr.trim().is_empty() {
             result.push_str(&format!("\n--- stderr ---\n{}", stderr.trim_end()));
+            if clipped(&err_bytes) {
+                result.push_str("\n…[stderr truncated at the output limit]");
+            }
         }
         Ok(ToolOutput::text(result).with_title(format!("shell: {}", args.command)))
     }
@@ -436,6 +484,44 @@ mod tests {
         let args = json!({ "command": "x token=supersecretvalue123456" }).to_string();
         let redacted = tool.redact_args(&args);
         assert!(!redacted.contains("supersecretvalue123456"));
+    }
+
+    #[tokio::test]
+    async fn output_is_bounded_at_the_stream_limit() {
+        // A command that emits more than the stream cap must be truncated, not
+        // buffered whole into memory.
+        let tool = ShellTool::new(workspace());
+        let bytes = MAX_STREAM_BYTES + 50_000;
+        let out = tool
+            .call(
+                json!({ "command": format!("yes a | head -c {bytes}") }),
+                &ctx_with(Arc::new(AlwaysApprove)),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.text.contains("stdout truncated"),
+            "expected a truncation marker, got {} bytes",
+            out.text.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn command_reading_stdin_sees_eof_instead_of_hanging() {
+        // stdin is wired to /dev/null, so a command that reads stdin gets EOF
+        // and exits promptly rather than blocking forever waiting for input.
+        let tool = ShellTool::new(workspace());
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tool.call(
+                json!({ "command": "cat" }),
+                &ctx_with(Arc::new(AlwaysApprove)),
+            ),
+        )
+        .await
+        .expect("cat must not hang on stdin")
+        .unwrap();
+        assert!(out.text.contains("exit status: 0"));
     }
 
     #[tokio::test]

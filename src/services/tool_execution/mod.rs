@@ -20,11 +20,13 @@ mod retry;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tracing::{Instrument, info, info_span, warn};
 
 pub use context::{
-    RunContext, SessionContext, ToolContext, ToolTurnContext, current_session, with_session,
+    RunContext, SessionContext, ToolContext, ToolTurnContext, TurnResultBudget, current_session,
+    with_session,
 };
 
 use crate::domain::approval::{ApprovalRequest, Approver};
@@ -50,32 +52,62 @@ use retry::{TOOL_RETRY_BACKOFF_MS, TOOL_RETRY_MAX_ATTEMPTS, should_retry};
 /// never to callers without a run context.
 const DEFAULT_MAX_TOOL_CALLS_PER_TURN: i64 = 100;
 
+/// Hard ceiling on how many tool calls a *single* round may actually execute.
+/// The per-turn budget bounds the total, but a single malformed round can
+/// request thousands of calls at once; without this each one would spawn a
+/// task and write a ledger step, flooding both. Calls past the ceiling get a
+/// short note instead — logged, never silently dropped. Set well above any
+/// legitimate parallel tool use in one round.
+const MAX_CALLS_PER_ROUND: usize = 32;
+
 /// Instance-owned execution policy.
 #[derive(Debug, Clone, Copy)]
 pub struct ToolExecutionConfig {
-    /// Byte cap on a tool result handed back to the LLM.
+    /// Byte cap on a single tool result handed back to the LLM.
     pub max_result_bytes: usize,
+    /// Cumulative per-turn cap on tool output fed back to the model (`0` =
+    /// unlimited). Enforced via the turn's [`TurnResultBudget`].
+    pub max_turn_result_bytes: usize,
     /// Per-turn cap on ledgered tool calls (logical calls, not retry attempts).
     pub max_calls_per_turn: i64,
+    /// Wall-clock timeout for one tool call (`None` = no timeout). A hung tool
+    /// is aborted and the call fails cleanly rather than wedging the turn.
+    pub max_call_duration: Option<Duration>,
 }
 
 impl Default for ToolExecutionConfig {
     fn default() -> Self {
         Self {
             max_result_bytes: crate::config::DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_turn_result_bytes: crate::config::DEFAULT_MAX_TURN_RESULT_BYTES,
             max_calls_per_turn: DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+            max_call_duration: Some(Duration::from_secs(
+                crate::config::DEFAULT_TOOL_TIMEOUT_SECS,
+            )),
         }
     }
 }
 
 impl ToolExecutionConfig {
-    /// The default policy with a specific result cap (the one setting that is
-    /// user-configurable, via `max_tool_result_bytes`).
+    /// The default policy with a specific single-result cap (the most commonly
+    /// tuned setting, via `max_tool_result_bytes`).
     pub fn with_result_cap(max_result_bytes: usize) -> Self {
         Self {
             max_result_bytes,
             ..Self::default()
         }
+    }
+
+    /// Set the cumulative per-turn output budget (`0` = unlimited).
+    pub fn with_turn_budget(mut self, max_turn_result_bytes: usize) -> Self {
+        self.max_turn_result_bytes = max_turn_result_bytes;
+        self
+    }
+
+    /// Set the per-call wall-clock timeout (`0` seconds = no timeout).
+    pub fn with_call_timeout_secs(mut self, secs: u64) -> Self {
+        self.max_call_duration = (secs > 0).then(|| Duration::from_secs(secs));
+        self
     }
 }
 
@@ -134,6 +166,12 @@ impl ToolExecutor {
         self.core.tools.values().cloned().collect()
     }
 
+    /// The cumulative per-turn tool-output budget this executor enforces (`0` =
+    /// unlimited). The runtime seeds each turn's [`TurnResultBudget`] from it.
+    pub fn turn_result_cap(&self) -> usize {
+        self.core.config.max_turn_result_bytes
+    }
+
     /// The shared execution core, for adapters (`RigTool`) that must satisfy a
     /// foreign trait's call signature while keeping one execution semantics.
     pub fn core(&self) -> Arc<ToolExecutionCore> {
@@ -152,17 +190,35 @@ impl ToolExecutor {
         calls: &[ToolCallReq],
         context: &ToolTurnContext,
     ) -> Vec<ToolOutcome> {
-        let futures = calls.iter().map(|call| async move {
-            let content = match self.core.tools.get(&call.name) {
-                Some(tool) => match self
-                    .core
-                    .execute(tool.clone(), call.args.clone(), context)
-                    .await
-                {
-                    Ok(out) => out,
-                    Err(error) => format!("tool `{}` failed: {error:#}", call.name),
-                },
-                None => format!("error: unknown tool `{}`", call.name),
+        // Bound the per-round fan-out: a single malformed round can request far
+        // more calls than any real parallel tool use. Calls past the ceiling get
+        // a note without spawning a task or writing a ledger step, so a runaway
+        // round can't flood either. Never silent — log what was skipped.
+        if calls.len() > MAX_CALLS_PER_ROUND {
+            warn!(
+                requested = calls.len(),
+                ceiling = MAX_CALLS_PER_ROUND,
+                "tool round exceeded the per-round call ceiling; extra calls skipped"
+            );
+        }
+        let futures = calls.iter().enumerate().map(|(i, call)| async move {
+            let content = if i >= MAX_CALLS_PER_ROUND {
+                format!(
+                    "error: too many tool calls in one round (limit {MAX_CALLS_PER_ROUND}); \
+                     this call was skipped. Request fewer tools per round."
+                )
+            } else {
+                match self.core.tools.get(&call.name) {
+                    Some(tool) => match self
+                        .core
+                        .execute(tool.clone(), call.args.clone(), context)
+                        .await
+                    {
+                        Ok(out) => out,
+                        Err(error) => format!("tool `{}` failed: {error:#}", call.name),
+                    },
+                    None => format!("error: unknown tool `{}`", call.name),
+                }
             };
             ToolOutcome {
                 id: call.id.clone(),
@@ -272,8 +328,30 @@ impl ToolExecutionCore {
                         })
                         .instrument(span),
                 );
+                // Wall-clock timeout backstop: a tool that hangs forever (a
+                // shell command waiting on stdin, a timeout-less HTTP client)
+                // would otherwise await indefinitely and wedge the turn — and
+                // the session, since the loop can't finish. On elapse, abort the
+                // task (kill_on_drop tools reap their child) and fail the call.
+                // The message deliberately avoids the "timeout/timed out"
+                // markers so the retry classifier treats it as terminal — a
+                // wall-clock exhaustion won't succeed on an immediate retry.
+                let abort = join.abort_handle();
+                let joined = match self.config.max_call_duration {
+                    Some(d) => match tokio::time::timeout(d, join).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            abort.abort();
+                            break Err(ToolError::Failed(anyhow::anyhow!(
+                                "tool `{name}` exceeded its {}s execution limit and was aborted",
+                                d.as_secs()
+                            )));
+                        }
+                    },
+                    None => join.await,
+                };
                 let attempt_result: Result<crate::domain::tool::ToolOutput, ToolError> =
-                    match join.await {
+                    match joined {
                         Ok(result) => result,
                         Err(join_err) if join_err.is_panic() => {
                             let panic = join_err.into_panic();
@@ -386,7 +464,17 @@ impl ToolExecutionCore {
 
         // Cap the LLM-facing result *after* the ledger records the original, so
         // the audit trail stays faithful while the model's context stays bounded.
-        result.map(|out| cap_tool_result(out, self.config.max_result_bytes))
+        // Then charge it against the turn's cumulative budget: once the turn is
+        // over budget, the result is swapped for a short note so a long tool
+        // chain can't quietly overflow the context window (the ledger still has
+        // the real result above).
+        result.map(|out| {
+            let capped = cap_tool_result(out, self.config.max_result_bytes);
+            match context.budget.admit(capped) {
+                Ok(out) => out,
+                Err(note) => note,
+            }
+        })
     }
 
     /// The trait-required fallback for a rig-driven completion (not on komo's
@@ -400,6 +488,8 @@ impl ToolExecutionCore {
         let context = ToolTurnContext {
             session: current_session().unwrap_or_else(|| SessionContext::detached("")),
             run: None,
+            // No per-turn accounting on the rig fallback path.
+            budget: TurnResultBudget::unlimited(),
         };
         self.execute(tool, input, &context).await
     }
@@ -604,6 +694,7 @@ mod tests {
         ToolTurnContext {
             session: SessionContext::detached("cli:test"),
             run: Some(RunContext::new("run-1".into(), repo)),
+            budget: TurnResultBudget::unlimited(),
         }
     }
 
@@ -611,6 +702,7 @@ mod tests {
         ToolTurnContext {
             session: SessionContext::detached("cli:test"),
             run: None,
+            budget: TurnResultBudget::unlimited(),
         }
     }
 
@@ -842,5 +934,100 @@ mod tests {
         let executor = executor(vec![Arc::new(EchoTool)], ToolExecutionConfig::default());
         let out = one(&executor, call("echo", "x"), &unledgered()).await;
         assert_eq!(out.content, "echoed: x");
+    }
+
+    /// A tool that never returns on its own — stands in for a hung shell command
+    /// or a timeout-less HTTP client.
+    struct HangingTool;
+    #[async_trait]
+    impl Tool for HangingTool {
+        fn name(&self) -> &'static str {
+            "hang"
+        }
+        fn description(&self) -> &'static str {
+            "never returns"
+        }
+        async fn execute(&self, _input: String) -> anyhow::Result<String> {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok("unreachable".into())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_tool_is_aborted_by_the_call_timeout() {
+        // Without a timeout this call would await forever and wedge the turn.
+        let executor = executor(
+            vec![Arc::new(HangingTool)],
+            ToolExecutionConfig {
+                max_call_duration: Some(Duration::from_secs(1)),
+                ..Default::default()
+            },
+        );
+        let out = one(&executor, call("hang", "{}"), &unledgered()).await;
+        assert!(
+            out.content.contains("exceeded its 1s execution limit"),
+            "got: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn round_caps_fan_out_and_notes_the_overflow() {
+        // A single round requesting far more calls than the ceiling must not
+        // execute (or ledger) them all — the overflow gets a note.
+        let executor = executor(vec![Arc::new(EchoTool)], ToolExecutionConfig::default());
+        let calls: Vec<ToolCallReq> = (0..MAX_CALLS_PER_ROUND + 5)
+            .map(|i| call("echo", &format!("{i}")))
+            .collect();
+        let outcomes = executor.execute_round(&calls, &unledgered()).await;
+        assert_eq!(outcomes.len(), calls.len());
+        assert!(outcomes[0].content.starts_with("echoed:"));
+        assert!(
+            outcomes[MAX_CALLS_PER_ROUND - 1]
+                .content
+                .starts_with("echoed:")
+        );
+        assert!(
+            outcomes[MAX_CALLS_PER_ROUND]
+                .content
+                .contains("too many tool calls"),
+            "got: {}",
+            outcomes[MAX_CALLS_PER_ROUND].content
+        );
+    }
+
+    fn budgeted(cap: usize) -> ToolTurnContext {
+        ToolTurnContext {
+            session: SessionContext::detached("cli:test"),
+            run: None,
+            budget: TurnResultBudget::new(cap),
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_budget_omits_results_once_the_turn_is_over_budget() {
+        // BigTool returns 10 KB. With a 5 KB per-turn budget, the first call is
+        // admitted (nothing consumed yet) and the second is omitted with a note —
+        // so a long tool chain can't quietly overflow the context window.
+        let executor = executor(vec![Arc::new(BigTool)], ToolExecutionConfig::default());
+        let ctx = budgeted(5 * 1024);
+        let first = one(&executor, call("big", "{}"), &ctx).await;
+        assert_eq!(first.content.len(), 10_000, "first result admitted in full");
+        let second = one(&executor, call("big", "{}"), &ctx).await;
+        assert!(
+            second.content.contains("per-turn budget"),
+            "second result should be omitted once over budget, got len {}",
+            second.content.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn unlimited_turn_budget_never_omits() {
+        let executor = executor(vec![Arc::new(BigTool)], ToolExecutionConfig::default());
+        let ctx = budgeted(0); // 0 = unlimited
+        for _ in 0..5 {
+            let out = one(&executor, call("big", "{}"), &ctx).await;
+            assert_eq!(out.content.len(), 10_000);
+        }
     }
 }
