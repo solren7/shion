@@ -36,10 +36,27 @@ Open the printed URL, leave **Base URL** blank (same-origin → proxied), and
 paste the gateway key. `bun run build` emits a static `dist/` for the gateway
 to serve.
 
-## Status
+## Serving from the gateway (production)
 
-The web target is scaffolded and builds; same-origin serving from the gateway
-(the `ServeDir` route) and relaxing the loopback-gated interactive/approval
-endpoints for keyed remote callers are follow-ups — until then a non-loopback
-browser gets read-only panels + chat, with approval/clarify and session writes
-unavailable.
+Point the gateway at the built SPA and it serves it same-origin (no CORS, no
+dev proxy):
+
+```toml
+# ~/.komo/config.toml
+[channels.api]
+enabled = true
+bind = "127.0.0.1"          # or 0.0.0.0 behind a trusted proxy
+port = 8765
+web_dir = "/abs/path/to/apps/web/dist"
+remote_interactive = true   # let keyed remote browsers approve/clarify
+```
+
+With `enabled = true`, set `API_SERVER_KEY` in `~/.komo/.env`. Then open
+`http://<host>:8765/` and paste that key on the connect screen. Static assets
+are public; `/api` + `/v1` stay key-gated.
+
+`remote_interactive` controls whether **non-loopback** (keyed remote) browsers
+may run interactive turns and resolve approval/clarify prompts. Off by default
+(those assume a host operator behind a loopback socket); `X-Komo-Trusted`
+auto-approve stays loopback-only regardless. A same-machine browser is loopback,
+so it always has full interactivity.

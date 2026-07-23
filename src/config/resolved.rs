@@ -271,6 +271,12 @@ pub struct ApiConfig {
     /// back after bind and published in the rendezvous file for the CLI.
     pub port: u16,
     pub server_key: String,
+    /// Optional built web SPA to serve same-origin (static assets public, api
+    /// key-gated). `None` = no static serving.
+    pub web_dir: Option<String>,
+    /// Allow keyed remote callers to use interactive turns + resolve
+    /// approval/clarify (see [`crate::config::sources::ApiFileConfig`]).
+    pub remote_interactive: bool,
 }
 
 /// Resolve one consistent read of the sources into the runtime snapshot plus
@@ -478,6 +484,9 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         },
     };
     let api_file = channels.api.unwrap_or_default();
+    // Shared by both branches (external and loopback-only).
+    let api_web_dir = api_file.web_dir.clone().filter(|s| !s.is_empty());
+    let api_remote_interactive = api_file.remote_interactive.unwrap_or(false);
     let api = if api_file.enabled {
         // Externally reachable: honor the configured bind/port and require a key.
         match require_secret(&secrets.api_server_key, "api", "API_SERVER_KEY") {
@@ -488,6 +497,8 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
                     .unwrap_or_else(|| DEFAULT_API_BIND.to_string()),
                 port: api_file.port.unwrap_or(DEFAULT_API_PORT),
                 server_key,
+                web_dir: api_web_dir.clone(),
+                remote_interactive: api_remote_interactive,
             }),
             Err(message) => misconfigured(&mut issues, "channels.api", message),
         }
@@ -503,6 +514,8 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
                 .clone()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()),
+            web_dir: api_web_dir,
+            remote_interactive: api_remote_interactive,
         })
     };
 

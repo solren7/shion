@@ -125,7 +125,14 @@ user is the host operator; gated to **loopback** callers, so a publicly-bound ap
 never gets it). `/pair approve` in chat remains the other in-gateway admission
 path. The api channel is loopback-only on an ephemeral port by default;
 `[channels.api] enabled = true` widens it to an external bind/port (requires
-`API_SERVER_KEY`) for Open WebUI / the dashboard.
+`API_SERVER_KEY`) for Open WebUI / the dashboard. Two further `[channels.api]`
+options serve the web client (`apps/web`): `web_dir = "…/apps/web/dist"` serves
+that built SPA same-origin as the router's fallback (static assets are public,
+like `/health`; `/api` + `/v1` stay key-gated — so no CORS is involved), and
+`remote_interactive = true` lets **keyed remote** (non-loopback) callers run
+interactive turns (`X-Komo-Interactive`) and resolve approval/clarify prompts
+over `/api/interactions/*` (off by default — those assume a host operator behind
+a loopback socket; `X-Komo-Trusted` auto-approve stays loopback-only regardless).
 
 Building requires `protoc` (`brew install protobuf`): the feishu channel's websocket
 frames are protobuf, and `lark-websocket-protobuf` compiles its `.proto` at build time.

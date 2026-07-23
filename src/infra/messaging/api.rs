@@ -39,6 +39,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
+use tower_http::services::{ServeDir, ServeFile};
 use tracing::{info, warn};
 
 use crate::{
@@ -86,12 +87,19 @@ struct AppState {
     approvals: Arc<ApprovalState>,
     /// Shared with the `ask_user` tool: same, for mid-turn clarify questions.
     clarify: Arc<ClarifyState>,
+    /// Allow keyed remote (non-loopback) callers to run interactive turns and
+    /// resolve approval/clarify prompts. Off by default — those paths assume a
+    /// host operator behind a loopback socket. `X-Komo-Trusted` (auto-approve)
+    /// stays loopback-only regardless of this flag.
+    remote_interactive: bool,
 }
 
 /// The HTTP API channel. Holds the listen config and the shared handler state.
 pub struct ApiChannel {
     bind: String,
     port: u16,
+    /// Optional built web SPA served same-origin (static public, api key-gated).
+    web_dir: Option<String>,
     state: AppState,
 }
 
@@ -109,6 +117,7 @@ impl ApiChannel {
         Self {
             bind: config.bind.clone(),
             port: config.port,
+            web_dir: config.web_dir.clone(),
             state: AppState {
                 api_key: Arc::new(config.server_key.clone()),
                 handler,
@@ -117,6 +126,7 @@ impl ApiChannel {
                 home,
                 approvals,
                 clarify,
+                remote_interactive: config.remote_interactive,
             },
         }
     }
@@ -148,7 +158,7 @@ impl Channel for ApiChannel {
             port: local.port(),
             key: self.state.api_key.as_ref().clone(),
         });
-        let app = build_router(self.state.clone());
+        let app = build_router(self.state.clone(), self.web_dir.as_deref());
         let graceful = async move {
             let _ = shutdown.changed().await;
         };
@@ -167,9 +177,9 @@ impl Channel for ApiChannel {
     }
 }
 
-/// Build the router: `/health` is public, everything else sits behind the
-/// bearer-key middleware.
-fn build_router(state: AppState) -> Router {
+/// Build the router: `/health` and (if configured) the static web SPA are
+/// public; everything else sits behind the bearer-key middleware.
+fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
     // Control-plane writes: host-operator actions (memory governance, run
     // prune, session clean, pairing admission, dream apply). Loopback-gated as
     // a *layer*, not per-handler checks, so a write route added here is gated
@@ -187,12 +197,22 @@ fn build_router(state: AppState) -> Router {
         .route("/api/pairings/approve", post(pair_approve))
         .route("/api/pairings/{id}/revoke", post(pair_revoke))
         .route("/api/dream/apply", post(dream_apply))
+        .route_layer(middleware::from_fn(require_loopback));
+
+    // Interactive resolution (the GUI's approval modal + clarify answer). Always
+    // allowed over loopback; reachable by keyed remote callers only when
+    // `remote_interactive` is set (a remote GUI resolving its own prompts). The
+    // `require_auth` layer below still applies via the merge into `protected`.
+    let interactive_writes = Router::new()
         .route(
             "/api/interactions/{session}/approval",
             post(resolve_approval),
         )
         .route("/api/interactions/{session}/answer", post(answer_question))
-        .route_layer(middleware::from_fn(require_loopback));
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_interactive_access,
+        ));
 
     let protected = Router::new()
         .route("/v1/models", get(list_models))
@@ -213,12 +233,43 @@ fn build_router(state: AppState) -> Router {
         .route("/api/dream", get(dream_preview))
         .route("/api/interactions/{session}", get(get_interactions))
         .merge(operator_writes)
+        .merge(interactive_writes)
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
-    Router::new()
-        .route("/health", get(health))
-        .merge(protected)
-        .with_state(state)
+    let mut router = Router::new().route("/health", get(health)).merge(protected);
+
+    // Serve the built web SPA same-origin as the unauthenticated fallback: the
+    // bundle isn't secret (the key it then uses is), and same-origin means no
+    // CORS. Unknown non-API paths fall back to index.html for the SPA. `/api`
+    // and `/v1` are matched routes above, so they never reach this fallback.
+    if let Some(dir) = web_dir {
+        let index = std::path::Path::new(dir).join("index.html");
+        router = router.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)));
+    }
+
+    router.with_state(state)
+}
+
+/// Gate the interactive-resolution endpoints: always allow loopback (the local
+/// GUI / CLI); allow keyed remote callers only when `remote_interactive` is on.
+/// Auth is enforced separately by the `require_auth` layer.
+async fn require_interactive_access(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if peer.ip().is_loopback() || state.remote_interactive {
+        return next.run(req).await;
+    }
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "interactive endpoints are loopback-only \
+                      (set [channels.api] remote_interactive = true to allow keyed remote access)"
+        })),
+    )
+        .into_response()
 }
 
 /// Reject any control-plane write not arriving over loopback. These are
@@ -354,8 +405,12 @@ async fn chat_completions(
     // Trusted wins over interactive if a caller somehow sets both; anyone else
     // gets the detached (auto-deny) context.
     let is_loopback = peer.ip().is_loopback();
+    // Trusted (auto-approve) is loopback-only; interactive may also be granted to
+    // keyed remote callers when `remote_interactive` is configured (they resolve
+    // approvals/clarify out-of-band, same as the local GUI).
     let trusted = is_loopback && headers.contains_key("x-komo-trusted");
-    let interactive = is_loopback && headers.contains_key("x-komo-interactive");
+    let interactive =
+        (is_loopback || state.remote_interactive) && headers.contains_key("x-komo-interactive");
     let ctx = if trusted {
         SessionContext::trusted(&session_id)
     } else if interactive {
@@ -881,11 +936,12 @@ async fn dream_preview(State(state): State<AppState>) -> Result<Json<Value>, Api
 
 // ---- interactive approval / clarify (for the GUI) --------------------------
 //
-// A loopback interactive HTTP turn (`X-Komo-Interactive`) suspends on approval
-// and clarify prompts just like a chat channel, but there is no reply sink a
-// human reads — the GUI polls `GET /api/interactions/{session}` for the pending
+// An interactive HTTP turn (`X-Komo-Interactive`) suspends on approval and
+// clarify prompts just like a chat channel, but there is no reply sink a human
+// reads — the GUI polls `GET /api/interactions/{session}` for the pending
 // prompt and resolves it with a `POST`. The GET is an ordinary protected read;
-// the two POSTs are host-operator writes, so they sit behind `require_loopback`.
+// the two POSTs sit behind `require_interactive_access` (loopback always;
+// keyed remote only with `[channels.api] remote_interactive = true`).
 
 /// The prompt(s) a suspended interactive turn is currently waiting on. Either
 /// field is `null` when nothing of that kind is pending.

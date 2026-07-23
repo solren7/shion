@@ -442,6 +442,17 @@ pub struct ApiFileConfig {
     pub bind: Option<String>,
     /// Listen port (default 8765 when `enabled`; an ephemeral port otherwise).
     pub port: Option<u16>,
+    /// Serve a built web SPA (e.g. `apps/web/dist`) from the api channel as a
+    /// same-origin fallback: static assets are public (unauthenticated, like
+    /// `/health`), `/api` + `/v1` stay key-gated. Absent = no static serving.
+    pub web_dir: Option<String>,
+    /// Allow non-loopback (keyed, remote) callers to use interactive chat turns
+    /// (`X-Komo-Interactive`) and resolve approval/clarify prompts over
+    /// `/api/interactions/*`. Off by default: those are loopback-only, since a
+    /// remote caller has no host operator behind the socket. `X-Komo-Trusted`
+    /// (auto-approve) stays loopback-only regardless. Only meaningful with
+    /// `enabled = true` (an external bind).
+    pub remote_interactive: Option<bool>,
 }
 
 #[cfg(test)]
