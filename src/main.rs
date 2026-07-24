@@ -15,6 +15,10 @@ mod tui;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Multiple transitive clients enable Rustls crypto backends. Rustls 0.23
+    // refuses to guess between them, so choose one once, before Feishu's
+    // open-lark WebSocket runtime creates its TLS connector.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     // cwd .env first (developer override), then ~/.komo/.env.
     // dotenvy never overwrites an already-set variable, so the first loader wins.
     let _ = dotenvy::dotenv();
