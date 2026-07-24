@@ -197,6 +197,111 @@ impl Maintenance for DreamSweep {
     }
 }
 
+/// Periodic RSS sampler — komo's analog of hermes' `gateway/memory_monitor.py`.
+///
+/// A long-lived gateway holds no per-session process state (transcripts live in
+/// the db, there is no per-session agent cache), so its resident set should sit
+/// roughly flat. The value here is the *time series* it prints: a slow leak — a
+/// map that never releases a session, an unbounded cache — surfaces as a
+/// climbing `rss=` in the logs long before it becomes an OOM, which is exactly
+/// how hermes kept catching and fixing leaks over time.
+///
+/// It reads only the process's own RSS — no repository, no LLM, no allocation of
+/// note — so it is effectively infallible and never trips the circuit breaker
+/// (wired with `alert: None`). Each cycle logs one line:
+/// `[MEMORY] rss=11.4MB peak=12.1MB`, where `peak` is tracked across the process
+/// lifetime so a monotonic climb is obvious even without log aggregation.
+pub struct MemoryMonitorSweep {
+    peak_rss: std::sync::atomic::AtomicU64,
+}
+
+impl MemoryMonitorSweep {
+    pub fn new() -> Self {
+        Self {
+            peak_rss: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for MemoryMonitorSweep {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Maintenance for MemoryMonitorSweep {
+    async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
+        match current_rss_bytes() {
+            Some(rss) => {
+                // fetch_max returns the prior peak; the live peak is max(prior, rss).
+                let peak = self
+                    .peak_rss
+                    .fetch_max(rss, std::sync::atomic::Ordering::Relaxed)
+                    .max(rss);
+                info!(
+                    target: "komo::memory",
+                    rss_bytes = rss,
+                    peak_bytes = peak,
+                    "[MEMORY] rss={} peak={}",
+                    fmt_bytes(rss),
+                    fmt_bytes(peak),
+                );
+            }
+            // Unsupported platform: make the absence of a reading visible without
+            // failing the cycle (which would otherwise count toward the breaker).
+            None => warn!(target: "komo::memory", "[MEMORY] rss unavailable on this platform"),
+        }
+        Ok(MaintenanceSummary::default())
+    }
+}
+
+/// Human-friendly byte formatting for the `[MEMORY]` log line.
+fn fmt_bytes(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    format!("{:.1}MB", bytes as f64 / MB)
+}
+
+/// The process's current resident set size (RSS) in bytes, or `None` on a
+/// platform we don't sample. Uses only `libc` (already a dependency) — no extra
+/// crate, no `sysinfo`.
+#[cfg(target_os = "macos")]
+// libc marks the mach task-port accessors deprecated in favor of the `mach2`
+// crate; we keep the one symbol here rather than take on that dependency.
+#[allow(deprecated)]
+fn current_rss_bytes() -> Option<u64> {
+    // MACH_TASK_BASIC_INFO carries `resident_size` in bytes.
+    unsafe {
+        let mut info: libc::mach_task_basic_info = std::mem::zeroed();
+        let mut count = (std::mem::size_of::<libc::mach_task_basic_info>()
+            / std::mem::size_of::<libc::natural_t>())
+            as libc::mach_msg_type_number_t;
+        // `mach_task_self_` (the static port) rather than the deprecated
+        // `mach_task_self()` fn, so we avoid pulling in the `mach2` crate.
+        let kr = libc::task_info(
+            libc::mach_task_self_,
+            libc::MACH_TASK_BASIC_INFO,
+            &mut info as *mut _ as libc::task_info_t,
+            &mut count,
+        );
+        (kr == libc::KERN_SUCCESS).then_some(info.resident_size as u64)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_rss_bytes() -> Option<u64> {
+    // /proc/self/statm field 2 (0-indexed 1) is the resident set size in pages.
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    (page_size > 0).then(|| resident_pages * page_size as u64)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn current_rss_bytes() -> Option<u64> {
+    None
+}
+
 /// Grace window: reminders missed by up to this many seconds are delivered late
 /// (with a "missed" prefix); older ones are marked missed without re-notifying.
 const REMINDER_GRACE_SECS: i64 = 600;
@@ -729,6 +834,35 @@ mod tests {
     use crate::domain::task::{Task, TaskStatus};
     use chrono::{Datelike, TimeZone, Timelike};
     use std::sync::Mutex;
+
+    // ── MemoryMonitorSweep ────────────────────────────────────────────────────
+
+    #[test]
+    fn fmt_bytes_renders_one_decimal_megabytes() {
+        assert_eq!(fmt_bytes(0), "0.0MB");
+        assert_eq!(fmt_bytes(1024 * 1024), "1.0MB");
+        assert_eq!(fmt_bytes(11_639_808), "11.1MB");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn current_rss_is_nonzero_on_supported_platforms() {
+        let rss = current_rss_bytes().expect("RSS should be readable on macOS/Linux");
+        assert!(rss > 0, "a running test process must have a nonzero RSS");
+    }
+
+    #[tokio::test]
+    async fn memory_monitor_run_succeeds_and_tracks_peak() {
+        let sweep = MemoryMonitorSweep::new();
+        // Infallible by contract — a sampling failure must not fail the cycle.
+        sweep.run().await.expect("monitor cycle must not error");
+        // On a platform we sample, a reading was taken and recorded as the peak;
+        // elsewhere it stays 0. Either way peak is monotonic across cycles.
+        let after_first = sweep.peak_rss.load(std::sync::atomic::Ordering::Relaxed);
+        sweep.run().await.expect("second monitor cycle must not error");
+        let after_second = sweep.peak_rss.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after_second >= after_first, "peak RSS must never decrease");
+    }
 
     // ── FakeReminderRepository ────────────────────────────────────────────────
 

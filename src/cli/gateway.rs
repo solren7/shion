@@ -4,8 +4,8 @@ use std::sync::Arc;
 use crate::{
     agent::{
         daemon::{
-            BriefingSweep, DreamSweep, Maintenance, ReminderSweep, ReviewSweep, Schedule,
-            TaskSweep, WorkdayGated,
+            BriefingSweep, DreamSweep, Maintenance, MemoryMonitorSweep, ReminderSweep, ReviewSweep,
+            Schedule, TaskSweep, WorkdayGated,
         },
         gateway::{Gateway, MaintenanceService},
         interaction::{ApprovalState, ChatApprover, GatewayDispatcher},
@@ -208,6 +208,14 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             schedule: Schedule::parse("* * * * *")?,
             maintenance: task_sweep,
             alert: Some(notifier.clone()),
+        })
+        // Always-on RSS observability (hermes' memory_monitor analog). Reads only
+        // the process's own resident set, so it's infallible — no breaker alert.
+        .with_maintenance(MaintenanceService {
+            name: "memory-monitor".to_string(),
+            schedule: Schedule::parse("*/5 * * * *")?,
+            maintenance: Arc::new(MemoryMonitorSweep::new()),
+            alert: None,
         });
 
     // Daily briefing — only when the user opted in with `briefing_schedule`.
