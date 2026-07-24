@@ -36,6 +36,7 @@ pub struct StoreUrls {
     pub db: String,
     pub kanban: String,
     pub memory: String,
+    pub cron: String,
 }
 
 impl StoreUrls {
@@ -44,6 +45,7 @@ impl StoreUrls {
             db: runtime.db_url.clone(),
             kanban: runtime.kanban_db_url.clone(),
             memory: runtime.memory_db_url.clone(),
+            cron: runtime.cron_db_url.clone(),
         }
     }
 }
@@ -189,6 +191,7 @@ mod tests {
             db: format!("turso:{}", dir.join("state.db").display()),
             kanban: format!("turso:{}", dir.join("kanban.db").display()),
             memory: format!("turso:{}", dir.join("memory.db").display()),
+            cron: format!("turso:{}", dir.join("cron.db").display()),
         }
     }
 

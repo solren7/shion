@@ -31,6 +31,13 @@ komo memory triage                # interactively clear the candidate pile (olde
 komo memory report                # quality report: status/confidence counts + piles needing triage
 komo dream [--apply]              # usage-driven consolidation: preview (default) or run one cycle — promote well-recalled candidates, archive never-recalled ones
 
+komo cron list                    # scheduled jobs (cron.db, with last-run status) + pending reminders
+komo cron add <name> <cron> <cmd> [-- args…]  # schedule a command job (deterministic, stdout → home channel)
+komo cron add-agent <name> <cron> <prompt> [--skill S]…  # schedule an agent turn (unattended, full tools, policy-gated)
+komo cron run <name>              # fire a job now (due on the gateway's next sweep tick)
+komo cron enable|disable <name>   # resume / pause a job without deleting it
+komo cron remove <name>           # delete a job
+
 komo run list [--limit N]         # recent runs (one per turn), newest first; ⟲ marks recoverable
 komo run inspect <id>             # one run in full: input, plan, outcome, every tool step
 komo run resume [<id>]            # re-dispatch an interrupted run (defaults to the latest recoverable)
@@ -76,12 +83,14 @@ tool results again.
 `~/.komo/state.db` is disposable developer state (sessions, messages, session
 todos, skills, reminders, pairings, settings, **run ledger**) — delete it freely
 to reset.
-Two kinds of **durable personal data live in their own files** so resetting
+Three kinds of **durable personal data live in their own files** so resetting
 `state.db` never wipes them: cross-session **tasks in `~/.komo/kanban.db`**
-(`infra/persistence/kanban.rs`) and long-term **memories in `~/.komo/memory.db`**
-(`infra/memory/memory_db.rs`). After a schema change on **disposable** state,
+(`infra/persistence/kanban.rs`), long-term **memories in `~/.komo/memory.db`**
+(`infra/memory/memory_db.rs`), and scheduled **cron jobs in `~/.komo/cron.db`**
+(`infra/persistence/cron.rs`). After a schema change on **disposable** state,
 delete the affected file — `push_schema` only runs for newly created database
-files: a `TaskRecord` change means deleting `kanban.db`, any other model means
+files: a `TaskRecord` change means deleting `kanban.db`, a `CronJobRecord`
+change `cron.db`, any other model means
 `state.db` (e.g. a `RunRecord`/`RunStepRecord` change — the run ledger lives in
 `state.db`). **Column additions can skip the reset**: the shared
 `infra/persistence/mod.rs::ensure_columns` runs an additive `ALTER TABLE ADD
@@ -146,6 +155,60 @@ the opt-in daily `briefing_schedule` + its `briefing_workdays_only` gate, the
 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`, `TELEGRAM_BOT_TOKEN`, `HASS_TOKEN`) only
 in `~/.komo/.env`. Priority: built-in defaults < config.toml < `KOMO_*` env
 vars. `KOMO_HOME` relocates the whole directory.
+
+**Scheduled cron jobs** (`komo cron`): the gateway runs operator-configured jobs
+on cron schedules and delivers the output through the same `HomeNotifier` as
+reminders. Jobs live in their own durable **`~/.komo/cron.db`**
+(`infra/persistence/cron.rs::CronDb`, domain `komo-core`'s `domain/cron.rs`,
+`CronAction` enum) — not in config.toml (an operator accumulates many) and not
+in disposable state.db (a job vanishing on a reset means its work silently
+stops). Each job is one of two modes (hermes' cron modes, minus the schedule
+kinds — 5-field cron only):
+
+- **command** (`komo cron add`, hermes' `no_agent`): run a fixed program,
+  deliver its stdout verbatim. Deterministic, no LLM. The command is
+  operator-authored (CLI or loopback-gated api — the same trust boundary as
+  running the gateway itself), so it executes directly: no shell tool, no
+  approver, no `[policy]`. The reliable default for scripts (e.g. alarmhandler).
+- **agent** (`komo cron add-agent`): run a prompt through an **unattended,
+  tool-capable agent turn** (wiring's `cron_runtime`), deliver the reply.
+  Optional `--skill` names are loaded first (progressive disclosure). The agent
+  has the **full tool set** (shell/file/skill/web/…), but side effects use the
+  briefing's unattended safety model — a `PolicyApprover` over a deny-all inner,
+  so a `Risk::Normal` action passes **only** through an `unattended = true`
+  `[policy]` rule. Main model, no memory enricher, per-run session
+  (`cron:<name>:<unix>`) so each run is an isolated, run-ledgered turn.
+
+```bash
+# command mode — deterministic script
+komo cron add weekly-alarmhandler-rotation "0 14 * * 5" \
+  /path/to/alarmhandler_no_agent_notify.py -- --flag   # args after `--`
+  # [--workdir /path] [--timeout-secs 900]
+# agent mode — prompt + optional skills, runs an unattended agent turn
+komo cron add-agent morning-brief "0 8 * * *" "总结我今天的日程和待办" \
+  --skill calendar --skill weather
+komo cron list                    # jobs (kind + last-run status) and reminders
+komo cron run <name>              # fire now (due on the next sweep tick)
+komo cron enable|disable <name>   # keep but stop scheduling / resume
+komo cron remove <name>
+```
+
+Execution is one every-minute `CronJobSweep` (`agent/daemon.rs`) reading the
+store per tick — jobs added/removed/toggled while the gateway runs take effect
+within a minute, no restart. The sweep **claims before running** (advances
+`next_run_at` first), so a crash mid-run never re-fires a slot and a
+longer-than-a-minute job is never double-started; a gateway asleep over a slot
+runs the job late, once (computed from now, like recurring reminders).
+Validation (cron parse, unique name, per-kind required fields) lives in the
+shared operator action (`operator_control/actions.rs::add_cron_job`), so the CLI
+and api paths can't fork; `komo cron` works with the gateway up (routed to
+`/api/cron/*`; writes loopback-gated) or down (direct `cron.db` open). Every
+outcome is delivered, success and failure alike, and recorded on the job
+(`last_status`/`last_error`, shown in `komo cron list` and `komo doctor`) — a
+failed command/turn still returns `Ok` (the operator was told; breaker cooldowns
+are meaningless on a weekly cron), only delivery failure fails the cycle. Command
+jobs aren't run-ledgered (sweeps run outside any session); agent jobs are (they
+run a real turn on `cron_runtime`, so `komo run list` shows them).
 
 The `codex` provider (`provider = "codex"`) is the exception to the API-key
 rule: it has no env key, authenticating instead from the Codex CLI's OAuth login
@@ -381,6 +444,7 @@ kanban.db connections), and two cross-cutting files at the top level —
 - `Schedule` wraps `croner` (5-field Unix cron, e.g. `0 * * * *`); `Maintenance` trait is the scheduled unit of work
 - `ReviewSweep` is the one fixed action: it delegates to the shared `agent/review_coordinator.rs::ReviewCoordinator` (`ReviewTrigger::Scheduled`) and maps the `ReviewReport` into its maintenance summary. The coordinator owns the whole protocol for **both** triggers — the cheap `review_candidates()` projection (session id + live user-turn count + `reviewed_through` watermark, no transcripts) decides which sessions have unseen turns, only those are loaded in full and reviewed, `mark_reviewed` advances the watermark best-effort (clamped against stale detached writes — see `SessionRepository::mark_reviewed`), and a per-session in-flight guard (process-local, RAII-released) means a post-turn review and a sweep hitting the same session review it once. The runtime's post-turn trigger (`ReviewTrigger::AfterTurn`, fired via the same coordinator instance every `review_interval` user turns) advances the same watermark, so the two never duplicate work. Beyond memories/skills, the reviewer also extracts commitments ("I'll do X", "waiting on Y") and captures them as `inbox` tasks tagged with the origin `source` + a content-derived `source_message_id` dedup key (`TaskRepository::find_by_source_message_id` guards against re-capturing across sweeps). Auto-extracted tasks only ever land in `inbox`, never `todo`; extracted memories land as `candidate` (scoped to the origin channel, deduped via the in-memory `seen_keys` set over the session's prior extractions), never pinned/active; and extracted skills land as **candidate files** (`~/.komo/skills/.candidates/`, protected skills refuse even proposals), never active — the user triages all three up the ladder (`komo task` / `komo memory promote|pin` / `komo skills promote|reject`).
 - `ReminderSweep` delivers due reminders via `Notifier` every minute (10-min grace window; older ones are marked `missed`)
+- `CronJobSweep` reads `cron.db` every minute and executes due jobs — command jobs run the process, agent jobs run a turn on the unattended `cron_runtime` (claim-first; output via `Notifier` — see the Scheduled cron jobs section above)
 - `TaskSweep` notifies once when an open task comes due (the task stays open; `due_notified_at` is the at-most-once guard)
 - `BriefingSweep` is the opt-in daily briefing (roadmap §4): it reads open tasks + recently-learned memories, builds the digest (`briefing_prompt` is the pure, clock-injected prompt builder — returns `None` when there's nothing worth a ping), and delivers it through the same `Notifier`. Only scheduled when `briefing_schedule` is set (no default — proactive pings stay opt-in); wired in `cli/gateway.rs`. The compose step prefers a **tool-capable agent turn** (roadmap §2): wiring's `briefing_runtime` is a second, small `AgentRuntime` on the aux model with a read-only tool set (time / web_fetch / web_search / skill / HA when configured — no shell/file/task/memory) and a `PolicyApprover` over a deny-all inner, so a `Risk::Normal` action passes only through an `unattended = true` policy rule; briefing skills (calendar, weather) are how external data gets in. One session per day (`briefing:YYYY-MM-DD`), every execution lands in the run ledger, and any error degrades to the original tool-less `llm.complete` so the briefing always goes out.
 - `WorkdayGated` (also `agent/daemon.rs`) is a `Maintenance` decorator that gates any sweep to Chinese **working days** — the "上班才执行" gate. cron still picks the time slot; the gate decides whether today counts as a workday at all (statutory holiday → skip, ordinary weekend → skip, 调休 makeup weekend → run). Lookups go through `domain::workday::WorkdayCalendar`, degrading to a Monday–Friday default (`is_weekday`) on any data outage so a real workday never gets blocked. Opt-in via `briefing_workdays_only` (config.toml / `KOMO_BRIEFING_WORKDAYS_ONLY`); when on, `cli/gateway.rs` wraps the briefing sweep. Calendar impl is `infra/workday.rs::HolidayCalendar`: it fetches one year at a time from a free holiday API (`api.jiejiariapi.com`, `date → isOffDay`) and caches each year to `~/.komo/workdays/{year}.json` — fetched the first time any date in a year is queried, then reused (a yearly refresh, no extra cron). `komo workday [date]` is the operator probe (also primes the cache).

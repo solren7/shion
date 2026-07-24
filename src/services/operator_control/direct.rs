@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 
 use crate::domain::{
+    cron::CronJobRepository,
     home::HomeRepository,
     memory::MemoryRepository,
     pairing::{ApproveOutcome, PairingRepository},
@@ -20,7 +21,7 @@ use crate::domain::{
 };
 use crate::infra::{
     memory::memory_db::MemoryDb,
-    persistence::{db::Db, kanban::KanbanDb},
+    persistence::{cron::CronDb, db::Db, kanban::KanbanDb},
 };
 
 use super::actions;
@@ -34,6 +35,7 @@ pub(super) struct DirectOperatorAdapter {
     db: OnceCell<Arc<Db>>,
     kanban: OnceCell<Arc<KanbanDb>>,
     memory: OnceCell<Arc<MemoryDb>>,
+    cron: OnceCell<Arc<CronDb>>,
 }
 
 impl DirectOperatorAdapter {
@@ -43,6 +45,7 @@ impl DirectOperatorAdapter {
             db: OnceCell::new(),
             kanban: OnceCell::new(),
             memory: OnceCell::new(),
+            cron: OnceCell::new(),
         }
     }
 
@@ -64,6 +67,13 @@ impl DirectOperatorAdapter {
     pub(super) async fn memory(&self) -> anyhow::Result<&Arc<MemoryDb>> {
         self.memory
             .get_or_try_init(|| async { Ok(Arc::new(MemoryDb::connect(&self.urls.memory).await?)) })
+            .await
+    }
+
+    /// The durable cron-job store (`cron.db`), opened on first use.
+    pub(super) async fn cron(&self) -> anyhow::Result<&Arc<CronDb>> {
+        self.cron
+            .get_or_try_init(|| async { Ok(Arc::new(CronDb::connect(&self.urls.cron).await?)) })
             .await
     }
 
@@ -121,6 +131,9 @@ impl DirectOperatorAdapter {
             OperatorQuery::HomeOverride => OperatorQueryResult::HomeOverride(
                 HomeRepository::get(self.db().await?.as_ref()).await?,
             ),
+            OperatorQuery::CronJobs => {
+                OperatorQueryResult::CronJobs(self.cron().await?.list().await?)
+            }
         })
     }
 
@@ -182,6 +195,29 @@ impl DirectOperatorAdapter {
                 OperatorCommandResult::DreamApplied {
                     promoted: summary.memories_promoted,
                     archived: summary.memories_archived,
+                }
+            }
+            OperatorCommand::CronAdd { spec } => OperatorCommandResult::CronAdded(Box::new(
+                actions::add_cron_job(self.cron().await?.as_ref(), spec, now()).await?,
+            )),
+            OperatorCommand::CronRemove { name } => {
+                if !CronJobRepository::delete(self.cron().await?.as_ref(), &name).await? {
+                    anyhow::bail!(actions::no_cron_job_message(&name));
+                }
+                OperatorCommandResult::CronRemoved
+            }
+            OperatorCommand::CronSetEnabled { name, enabled } => {
+                match actions::set_cron_enabled(self.cron().await?.as_ref(), &name, enabled, now())
+                    .await?
+                {
+                    Some(job) => OperatorCommandResult::CronUpdated(Box::new(job)),
+                    None => anyhow::bail!(actions::no_cron_job_message(&name)),
+                }
+            }
+            OperatorCommand::CronTrigger { name } => {
+                match actions::trigger_cron_job(self.cron().await?.as_ref(), &name, now()).await? {
+                    Some(job) => OperatorCommandResult::CronUpdated(Box::new(job)),
+                    None => anyhow::bail!(actions::no_cron_job_message(&name)),
                 }
             }
         })

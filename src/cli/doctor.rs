@@ -44,8 +44,55 @@ pub async fn doctor(config: &ConfigSnapshot, control: &OperatorControl) -> anyho
     println!("\nchannels:");
     channel_health(config);
     home_channel_health(control, config).await;
+    cron_health(control).await;
     run_health(control).await;
     Ok(())
+}
+
+/// Scheduled cron jobs (cron.db): count, disabled ones, and any whose last run
+/// failed — the operator's "is my weekly job actually running" glance.
+async fn cron_health(control: &OperatorControl) {
+    use crate::domain::cron::CronRunStatus;
+    println!("\ncron jobs:");
+    let fetched = control
+        .query(OperatorQuery::CronJobs)
+        .await
+        .map(|r| match r {
+            OperatorQueryResult::CronJobs(jobs) => jobs,
+            _ => unreachable!("CronJobs query answers with CronJobs"),
+        });
+    let jobs = match fetched {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            println!("  {BAD} could not read cron store: {e:#}");
+            return;
+        }
+    };
+    if jobs.is_empty() {
+        println!("  (none — `komo cron add <name> <schedule> <command>`)");
+        return;
+    }
+    for job in &jobs {
+        let mark = if !job.enabled {
+            OFF
+        } else if job.last_status == Some(CronRunStatus::Failed) {
+            BAD
+        } else {
+            OK
+        };
+        let state = if job.enabled {
+            format!("next {}", local_time(job.next_run_at))
+        } else {
+            "disabled".to_string()
+        };
+        let last = match (&job.last_status, job.last_run_at) {
+            (Some(status), Some(at)) => {
+                format!(", last {} {}", status.as_str(), local_time(at))
+            }
+            _ => String::new(),
+        };
+        println!("  {mark} {}  [{}]  {state}{last}", job.name, job.schedule);
+    }
 }
 
 /// Is a gateway process actually running and answering? (The channel lines
@@ -129,6 +176,7 @@ fn schedule_health(config: &ConfigSnapshot) {
     }
     println!("  reminders    every minute");
     println!("  tasks        every minute");
+    println!("  cron jobs    every minute (see `komo cron list`)");
 }
 
 /// The permission policy: configured?, rule count, load errors.

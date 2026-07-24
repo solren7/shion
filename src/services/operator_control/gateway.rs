@@ -47,6 +47,9 @@ impl GatewayOperatorAdapter {
             OperatorQuery::HomeOverride => {
                 OperatorQueryResult::HomeOverride(self.client.home_override().await?)
             }
+            OperatorQuery::CronJobs => {
+                OperatorQueryResult::CronJobs(self.client.cron_jobs().await?)
+            }
         })
     }
 
@@ -81,6 +84,21 @@ impl GatewayOperatorAdapter {
             OperatorCommand::DreamApply => {
                 let (promoted, archived) = self.client.dream_apply().await?;
                 OperatorCommandResult::DreamApplied { promoted, archived }
+            }
+            OperatorCommand::CronAdd { spec } => {
+                OperatorCommandResult::CronAdded(Box::new(self.client.cron_add(&spec).await?))
+            }
+            OperatorCommand::CronRemove { name } => {
+                self.client.cron_remove(&name).await?;
+                OperatorCommandResult::CronRemoved
+            }
+            OperatorCommand::CronSetEnabled { name, enabled } => {
+                OperatorCommandResult::CronUpdated(Box::new(
+                    self.client.cron_set_enabled(&name, enabled).await?,
+                ))
+            }
+            OperatorCommand::CronTrigger { name } => {
+                OperatorCommandResult::CronUpdated(Box::new(self.client.cron_trigger(&name).await?))
             }
         })
     }

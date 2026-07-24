@@ -88,6 +88,8 @@ pub struct RuntimeConfig {
     pub kanban_db_url: String,
     /// `turso:` URL of the durable memory db (`memory.db`).
     pub memory_db_url: String,
+    /// `turso:` URL of the durable scheduled-job db (`cron.db`).
+    pub cron_db_url: String,
     /// Provider/model selection plus the agent-loop knobs that ride with it.
     pub model: ModelConfig,
     /// Reviewer cadence: run the reflective reviewer every N user turns.
@@ -524,6 +526,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         db_url: db_url("state.db"),
         kanban_db_url: db_url("kanban.db"),
         memory_db_url: db_url("memory.db"),
+        cron_db_url: db_url("cron.db"),
         home,
         model,
         review_interval: env
@@ -992,6 +995,10 @@ mod tests {
         assert_eq!(
             snap.runtime.memory_db_url,
             "turso:/tmp/komo-test-home/memory.db"
+        );
+        assert_eq!(
+            snap.runtime.cron_db_url,
+            "turso:/tmp/komo-test-home/cron.db"
         );
     }
 

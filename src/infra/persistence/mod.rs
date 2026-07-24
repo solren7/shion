@@ -1,5 +1,6 @@
 //! Persistence infra: the toasty-backed connections (state.db, kanban.db),
 //! now over the Turso engine with a per-operation connection pool.
+pub mod cron;
 pub mod db;
 pub mod kanban;
 

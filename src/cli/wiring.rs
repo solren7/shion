@@ -58,6 +58,10 @@ pub struct Wiring {
     /// read-only tool set, policy-gated with a deny-all inner approver — only
     /// explicit `unattended` policy rules can grant a `Risk::Normal` action.
     pub briefing_runtime: Arc<AgentRuntime>,
+    /// The cron sweep's agent for `CronAction::Agent` jobs: the full tool set
+    /// (unlike briefing) but the same unattended policy gating. Main model, no
+    /// memory enricher.
+    pub cron_runtime: Arc<AgentRuntime>,
 }
 
 /// Build the agent against `db` (sessions/messages/etc.) and `kanban` (durable
@@ -88,39 +92,11 @@ pub async fn build(
     // File operations are confined to the current working directory.
     let workspace = Arc::new(Workspace::current_dir()?);
 
-    // The executor owns execution policy (result cap, per-turn call budget) as
-    // instance config — no process globals.
-    let mut tools = ToolExecutor::new(
-        ToolExecutionConfig::with_result_cap(model_config.max_tool_result_bytes)
-            .with_turn_budget(model_config.max_turn_result_bytes)
-            .with_call_timeout_secs(model_config.tool_timeout_secs),
-    )
-    .with_approver(approver.clone());
-    tools.register(Arc::new(TimeTool));
-    tools.register(Arc::new(FileTool::new(workspace.clone())));
-    tools.register(Arc::new(ShellTool::new(workspace.clone())));
-    tools.register(Arc::new(WebFetchTool::new()));
-    tools.register(Arc::new(WebSearchTool::new()));
-    tools.register(Arc::new(SessionTool::new(db.clone())));
-    tools.register(Arc::new(ReminderTool::new(db.clone())));
-    tools.register(Arc::new(TaskTool::new(kanban.clone())));
-    tools.register(Arc::new(TodoTool::new(db.clone())));
-
+    // ── Shared dependencies (built once, used by every tool set) ─────────────
     // Mid-turn clarification (roadmap §7): the sentinel tool suspends the turn
     // on a question; whoever routes inbound messages (gateway dispatcher, TUI)
     // resolves the answer through this shared state.
     let clarify = Arc::new(ClarifyState::new());
-    tools.register(Arc::new(AskUserTool::new(clarify.clone())));
-
-    // Home Assistant tool, only when configured (HASS_TOKEN set; HASS_URL
-    // optional, defaults to homeassistant.local:8123).
-    if let Some(ha) = &config.runtime.homeassistant_tool {
-        tools.register(Arc::new(HomeAssistantTool::new(
-            ha.base_url.clone(),
-            ha.token.clone(),
-            approver.clone(),
-        )));
-    }
 
     // Memories live in their own SQLite file (~/.komo/memory.db), shared by the
     // `memory` tool, the reflective reviewer, the L1 pinned injection, and the
@@ -135,7 +111,6 @@ pub async fn build(
         tracing::info!(imported, "migrated legacy markdown memories into memory.db");
     }
     let memory_repo: Arc<dyn MemoryRepository> = Arc::new(memory_db);
-    tools.register(Arc::new(MemoryTool::new(memory_repo.clone())));
 
     // The delegate tool runs a separate, tool-less sub-agent on the (optionally
     // cheaper) aux model. It gets a minimal identity-only preamble — no tools,
@@ -146,7 +121,6 @@ pub async fn build(
     // Aux/delegate sub-agents must not be fed the user's memory library — and
     // the aux agent never gets an aux of its own (no recursion).
     let aux_llm = build_llm(&aux_config, None, aux_preamble, None)?;
-    tools.register(Arc::new(DelegateTool::new(aux_llm.clone())));
 
     // The governed skill store: `~/.komo/skills` is the komo-owned home for
     // durable skills (files, not db — roadmap §9). Reviewer proposals land in
@@ -187,11 +161,47 @@ pub async fn build(
             skills.catalog_capped(SKILL_CATALOG_CAP)
         )
     });
-    tools.register(Arc::new(SkillTool::new(
-        skills.clone(),
-        skill_store.clone(),
-        approver.clone(),
-    )));
+
+    // The full tool set, parameterized only by its approver — so the main agent
+    // and the unattended cron agent share one definition and can never drift.
+    // The executor owns execution policy (result cap, per-turn call budget) as
+    // instance config — no process globals.
+    let build_full_tools = |approver: Arc<dyn Approver>| -> ToolExecutor {
+        let mut tools = ToolExecutor::new(
+            ToolExecutionConfig::with_result_cap(model_config.max_tool_result_bytes)
+                .with_turn_budget(model_config.max_turn_result_bytes)
+                .with_call_timeout_secs(model_config.tool_timeout_secs),
+        )
+        .with_approver(approver.clone());
+        tools.register(Arc::new(TimeTool));
+        tools.register(Arc::new(FileTool::new(workspace.clone())));
+        tools.register(Arc::new(ShellTool::new(workspace.clone())));
+        tools.register(Arc::new(WebFetchTool::new()));
+        tools.register(Arc::new(WebSearchTool::new()));
+        tools.register(Arc::new(SessionTool::new(db.clone())));
+        tools.register(Arc::new(ReminderTool::new(db.clone())));
+        tools.register(Arc::new(TaskTool::new(kanban.clone())));
+        tools.register(Arc::new(TodoTool::new(db.clone())));
+        tools.register(Arc::new(AskUserTool::new(clarify.clone())));
+        // Home Assistant tool, only when configured (HASS_TOKEN set).
+        if let Some(ha) = &config.runtime.homeassistant_tool {
+            tools.register(Arc::new(HomeAssistantTool::new(
+                ha.base_url.clone(),
+                ha.token.clone(),
+                approver.clone(),
+            )));
+        }
+        tools.register(Arc::new(MemoryTool::new(memory_repo.clone())));
+        tools.register(Arc::new(DelegateTool::new(aux_llm.clone())));
+        tools.register(Arc::new(SkillTool::new(
+            skills.clone(),
+            skill_store.clone(),
+            approver.clone(),
+        )));
+        tools
+    };
+
+    let tools = build_full_tools(approver.clone());
 
     // Assemble the tiered system prompt: stable identity + tool-aware guidance
     // (gated on the tools actually loaded) + skills catalog, then the workspace
@@ -257,6 +267,45 @@ pub async fn build(
         history_window: model_config.max_history_messages,
         review: Some(review.clone()),
     };
+
+    // ── Cron agent runtime (general cron, agent mode) ────────────────────────
+    // Runs `CronAction::Agent` jobs: the SAME full tool set as the main agent
+    // (so a scheduled job can act — shell, git, skills), but with the briefing's
+    // unattended safety model — a `PolicyApprover` over a deny-all inner, so a
+    // `Risk::Normal` action passes only through an explicit `unattended = true`
+    // policy rule. Main model (jobs can be arbitrarily complex), no memory
+    // enricher (sweeps aren't fed the user's memory library), and the run ledger
+    // is shared so every job execution is auditable via `komo run list`.
+    let cron_approver = crate::agent::policy_approver::PolicyApprover::wrap(
+        config.runtime.policy.policy.clone(),
+        Arc::new(UnattendedDeny),
+    );
+    let cron_tools = build_full_tools(cron_approver);
+    let cron_tool_names = cron_tools
+        .definitions()
+        .iter()
+        .map(|t| t.name().to_string())
+        .collect();
+    // No operations_manual / user_profile: the cron agent is a background task
+    // executor, not the user-facing assistant.
+    let cron_builder = Arc::new(
+        SystemPromptBuilder::new(model_config)
+            .tools(cron_tool_names)
+            .skills_note(skills_note.clone())
+            .workspace_root(Some(root.clone())),
+    );
+    let cron_preamble: PreambleFn = Arc::new(move || cron_builder.build());
+    let cron_llm = build_llm(model_config, Some(&cron_tools), cron_preamble, None)?;
+    let cron_runtime = Arc::new(AgentRuntime {
+        llm: cron_llm,
+        sessions: db.clone(),
+        messages: db.clone(),
+        runs: db.clone(),
+        tool_executor: cron_tools,
+        max_turns: model_config.max_turns,
+        history_window: model_config.max_history_messages,
+        review: None,
+    });
 
     // ── Briefing runtime (roadmap §2) ────────────────────────────────────────
     // A second, deliberately small agent the BriefingSweep drives: aux model,
@@ -324,6 +373,7 @@ pub async fn build(
         skills: skill_store,
         clarify,
         briefing_runtime,
+        cron_runtime,
     })
 }
 

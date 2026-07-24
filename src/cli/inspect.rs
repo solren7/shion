@@ -4,6 +4,7 @@
 //! runtime. They are the operator's view into what the gateway will act on.
 
 use crate::{
+    domain::cron::{CronAction, CronJob, CronJobSpec, CronRunStatus},
     domain::task::TaskStatus,
     services::operator_control::{
         OperatorCommand, OperatorCommandResult, OperatorControl, OperatorQuery, OperatorQueryResult,
@@ -16,9 +17,12 @@ pub(crate) fn local_time(unix: i64) -> String {
         .unwrap_or_else(|| unix.to_string())
 }
 
-/// List pending reminders with their schedules (recurring ones show the cron
-/// expression, one-shots are marked as such).
+/// List scheduled jobs (cron.db) and pending reminders — the two things the
+/// gateway fires on a clock.
 pub async fn cron_list(control: &OperatorControl) -> anyhow::Result<()> {
+    let OperatorQueryResult::CronJobs(jobs) = control.query(OperatorQuery::CronJobs).await? else {
+        unreachable!("CronJobs query answers with CronJobs");
+    };
     let OperatorQueryResult::Reminders(mut pending) =
         control.query(OperatorQuery::Reminders).await?
     else {
@@ -26,14 +30,24 @@ pub async fn cron_list(control: &OperatorControl) -> anyhow::Result<()> {
     };
     pending.sort_by_key(|r| r.run_at);
 
+    if jobs.is_empty() {
+        println!("No scheduled jobs. (`komo cron add <name> <schedule> <command>`)");
+    } else {
+        println!("jobs:");
+        for job in &jobs {
+            print_cron_job(job);
+        }
+    }
+
     if pending.is_empty() {
-        println!("No pending reminders.");
+        println!("\nNo pending reminders.");
         return Ok(());
     }
+    println!("\nreminders:");
     for r in pending {
         if r.is_recurring() {
             println!(
-                "{}  [{}]  next {}  {}",
+                "  {}  [{}]  next {}  {}",
                 r.id,
                 r.schedule,
                 local_time(r.run_at),
@@ -41,12 +55,134 @@ pub async fn cron_list(control: &OperatorControl) -> anyhow::Result<()> {
             );
         } else {
             println!(
-                "{}  [one-shot]  due {}  {}",
+                "  {}  [one-shot]  due {}  {}",
                 r.id,
                 local_time(r.run_at),
                 r.message
             );
         }
+    }
+    Ok(())
+}
+
+/// One job line (+ a detail line for its last run, when it has one).
+fn print_cron_job(job: &CronJob) {
+    let state = if !job.enabled {
+        "disabled".to_string()
+    } else {
+        format!("next {}", local_time(job.next_run_at))
+    };
+    let target = match &job.action {
+        CronAction::Command { command, args, .. } => std::iter::once(command.as_str())
+            .chain(args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
+        CronAction::Agent { prompt, skills } => {
+            let skills = if skills.is_empty() {
+                String::new()
+            } else {
+                format!(" [skills: {}]", skills.join(", "))
+            };
+            format!("agent: {}{skills}", oneline(prompt, 80))
+        }
+    };
+    println!(
+        "  {}  ({})  [{}]  {}  → {}",
+        job.name,
+        job.action.kind(),
+        job.schedule,
+        state,
+        target
+    );
+    if let (Some(at), Some(status)) = (job.last_run_at, &job.last_status) {
+        let mut line = format!("      last run {} {}", local_time(at), status.as_str());
+        if *status == CronRunStatus::Failed && !job.last_error.is_empty() {
+            let first = job.last_error.lines().next().unwrap_or_default();
+            line.push_str(&format!(" — {first}"));
+        }
+        println!("{line}");
+    }
+}
+
+/// Create a scheduled job (validated by the shared operator action).
+pub async fn cron_add(control: &OperatorControl, spec: CronJobSpec) -> anyhow::Result<()> {
+    let OperatorCommandResult::CronAdded(job) =
+        control.command(OperatorCommand::CronAdd { spec }).await?
+    else {
+        unreachable!("CronAdd answers with CronAdded");
+    };
+    println!(
+        "Added {} job `{}` [{}] — first run {}.",
+        job.action.kind(),
+        job.name,
+        job.schedule,
+        local_time(job.next_run_at)
+    );
+    if !control.via_gateway() {
+        println!("(no gateway running — it fires once `komo gateway` is up)");
+    }
+    Ok(())
+}
+
+pub async fn cron_remove(control: &OperatorControl, name: &str) -> anyhow::Result<()> {
+    let OperatorCommandResult::CronRemoved = control
+        .command(OperatorCommand::CronRemove {
+            name: name.to_string(),
+        })
+        .await?
+    else {
+        unreachable!("CronRemove answers with CronRemoved");
+    };
+    println!("Removed job `{name}`.");
+    Ok(())
+}
+
+pub async fn cron_set_enabled(
+    control: &OperatorControl,
+    name: &str,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    let OperatorCommandResult::CronUpdated(job) = control
+        .command(OperatorCommand::CronSetEnabled {
+            name: name.to_string(),
+            enabled,
+        })
+        .await?
+    else {
+        unreachable!("CronSetEnabled answers with CronUpdated");
+    };
+    if enabled {
+        println!(
+            "Enabled job `{}` — next run {}.",
+            job.name,
+            local_time(job.next_run_at)
+        );
+    } else {
+        println!("Disabled job `{}`.", job.name);
+    }
+    Ok(())
+}
+
+/// Make a job due now; the gateway's every-minute sweep picks it up.
+pub async fn cron_run(control: &OperatorControl, name: &str) -> anyhow::Result<()> {
+    let OperatorCommandResult::CronUpdated(job) = control
+        .command(OperatorCommand::CronTrigger {
+            name: name.to_string(),
+        })
+        .await?
+    else {
+        unreachable!("CronTrigger answers with CronUpdated");
+    };
+    if control.via_gateway() {
+        println!(
+            "Job `{}` triggered — it runs on the gateway's next sweep tick (within a minute).",
+            job.name
+        );
+    } else {
+        println!(
+            "Job `{}` marked due — it runs once a gateway is up (`komo gateway start`).",
+            job.name
+        );
     }
     Ok(())
 }

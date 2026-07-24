@@ -17,6 +17,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
 use crate::domain::{
+    cron::{CronJob, CronJobSpec},
     memory::Memory,
     reminder::Reminder,
     run::{Run, RunStep},
@@ -318,6 +319,70 @@ impl GatewayClient {
     /// Revoke a pairing by id server-side; returns whether a row was removed.
     pub async fn pair_revoke(&self, id: &str) -> anyhow::Result<bool> {
         self.post_field(&format!("/api/pairings/{id}/revoke"), json!({}), "revoked")
+            .await
+    }
+
+    /// Every scheduled cron job (backs `komo cron list`).
+    pub async fn cron_jobs(&self) -> anyhow::Result<Vec<CronJob>> {
+        self.get_field("/api/cron", "jobs").await
+    }
+
+    /// POST a cron write and surface the endpoint's own error message (bad
+    /// cron expression, duplicate name, unknown job) instead of a raw HTTP
+    /// failure. A body-less 404 still gets the version-skew hint — an old
+    /// gateway holds the db lock, so there is no fallback.
+    async fn cron_post(&self, path: &str, body: Value) -> anyhow::Result<Map<String, Value>> {
+        let resp = self
+            .http
+            .post(self.url(path))
+            .bearer_auth(&self.key)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let v: Value = resp.json().await.unwrap_or_default();
+            match v.get("error").and_then(|e| e.as_str()) {
+                Some(msg) => anyhow::bail!(msg.to_string()),
+                None if status == reqwest::StatusCode::NOT_FOUND => anyhow::bail!(
+                    "the running gateway doesn't serve `{path}` — it predates this command.\n\
+                     Restart it onto the current binary (`komo gateway restart`) and retry."
+                ),
+                None => anyhow::bail!("gateway answered {status}"),
+            }
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// [`cron_post`], pulling the updated/created job out of the reply.
+    async fn cron_post_job(&self, path: &str, body: Value) -> anyhow::Result<CronJob> {
+        let mut map = self.cron_post(path, body).await?;
+        let val = map
+            .remove("job")
+            .context("gateway response missing `job`")?;
+        Ok(serde_json::from_value(val)?)
+    }
+
+    /// Create a cron job server-side (validated there; see `actions::add_cron_job`).
+    pub async fn cron_add(&self, spec: &CronJobSpec) -> anyhow::Result<CronJob> {
+        self.cron_post_job("/api/cron/add", serde_json::to_value(spec)?)
+            .await
+    }
+
+    pub async fn cron_remove(&self, name: &str) -> anyhow::Result<()> {
+        self.cron_post(&format!("/api/cron/{name}/remove"), json!({}))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn cron_set_enabled(&self, name: &str, enabled: bool) -> anyhow::Result<CronJob> {
+        let action = if enabled { "enable" } else { "disable" };
+        self.cron_post_job(&format!("/api/cron/{name}/{action}"), json!({}))
+            .await
+    }
+
+    pub async fn cron_trigger(&self, name: &str) -> anyhow::Result<CronJob> {
+        self.cron_post_job(&format!("/api/cron/{name}/trigger"), json!({}))
             .await
     }
 

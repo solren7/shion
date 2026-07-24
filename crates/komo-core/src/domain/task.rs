@@ -76,10 +76,7 @@ pub struct Task {
 impl Task {
     pub fn new(title: String) -> Self {
         Self {
-            id: format!(
-                "task-{}",
-                time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-            ),
+            id: format!("task-{}", uuid::Uuid::now_v7()),
             title,
             note: String::new(),
             status: TaskStatus::Inbox,

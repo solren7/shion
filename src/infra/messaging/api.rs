@@ -50,6 +50,7 @@ use crate::{
     },
     config::ApiConfig,
     domain::{
+        cron::CronJobSpec,
         events::{ToolEventSink, TurnEvent},
         gateway::MessageHandler,
         memory::{MemoryStatus, parse_memory_status},
@@ -60,7 +61,8 @@ use crate::{
         operator_control::{
             MemoryTransitionAction, ResumeOutcome,
             actions::{
-                OperatorActions, TransitionOutcome, not_recoverable_message, resolve_resume,
+                OperatorActions, TransitionOutcome, no_cron_job_message, not_recoverable_message,
+                resolve_resume,
             },
         },
         tool_execution::{SessionContext, with_session},
@@ -197,6 +199,11 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/pairings/approve", post(pair_approve))
         .route("/api/pairings/{id}/revoke", post(pair_revoke))
         .route("/api/dream/apply", post(dream_apply))
+        .route("/api/cron/add", post(cron_add))
+        .route("/api/cron/{name}/remove", post(cron_remove))
+        .route("/api/cron/{name}/enable", post(cron_enable))
+        .route("/api/cron/{name}/disable", post(cron_disable))
+        .route("/api/cron/{name}/trigger", post(cron_trigger))
         .route_layer(middleware::from_fn(require_loopback));
 
     // Interactive resolution (the GUI's approval modal + clarify answer). Always
@@ -227,6 +234,7 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/runs/{id}", get(get_run))
         .route("/api/runs/{id}/resume", post(resume_run))
         .route("/api/reminders", get(list_reminders))
+        .route("/api/cron", get(list_cron_jobs))
         .route("/api/skills", get(list_skills))
         .route("/api/skills/{name}/audit", get(skill_audit))
         .route("/api/pairings", get(list_pairings))
@@ -899,6 +907,89 @@ async fn dream_apply(State(state): State<AppState>) -> Result<Response, ApiError
 async fn list_reminders(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let pending = state.actions.pending_reminders().await?;
     Ok(Json(json!({ "reminders": pending })))
+}
+
+// ---- cron-job endpoints (backs `komo cron`) ---------------------------------
+
+/// Every scheduled cron job, by name.
+async fn list_cron_jobs(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let jobs = state.actions.list_cron_jobs().await?;
+    Ok(Json(json!({ "jobs": jobs })))
+}
+
+/// The uniform 404 for an unknown job name — body carries the same message the
+/// direct path bails with, so the CLI prints one thing on either transport.
+fn cron_not_found(name: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": no_cron_job_message(name) })),
+    )
+        .into_response()
+}
+
+/// Create a job. Validation failures (bad cron expression, duplicate name,
+/// missing command) are the caller's to fix → 400 with the message.
+async fn cron_add(State(state): State<AppState>, Json(spec): Json<CronJobSpec>) -> Response {
+    match state.actions.add_cron_job(spec).await {
+        Ok(job) => Json(json!({ "job": job })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn cron_remove(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    Ok(if state.actions.remove_cron_job(&name).await? {
+        Json(json!({ "removed": true })).into_response()
+    } else {
+        cron_not_found(&name)
+    })
+}
+
+async fn cron_enable(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    cron_set_enabled(state, name, true).await
+}
+
+async fn cron_disable(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    cron_set_enabled(state, name, false).await
+}
+
+async fn cron_set_enabled(
+    state: AppState,
+    name: String,
+    enabled: bool,
+) -> Result<Response, ApiError> {
+    Ok(
+        match state.actions.set_cron_enabled(&name, enabled).await? {
+            Some(job) => Json(json!({ "job": job })).into_response(),
+            None => cron_not_found(&name),
+        },
+    )
+}
+
+/// Make a job due now (fires on the sweep's next tick). A disabled job is a
+/// 400 (the shared action refuses it), an unknown one a 404.
+async fn cron_trigger(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    match state.actions.trigger_cron_job(&name).await {
+        Ok(Some(job)) => Json(json!({ "job": job })).into_response(),
+        Ok(None) => cron_not_found(&name),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 /// Registered skills (backs `komo skills list`), by name.

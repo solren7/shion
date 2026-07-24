@@ -72,10 +72,7 @@ impl Memory {
     pub fn new(kind: MemoryKind, content: impl Into<String>) -> Self {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         Self {
-            id: format!(
-                "mem-{}",
-                time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-            ),
+            id: format!("mem-{}", uuid::Uuid::now_v7()),
             kind,
             content: content.into(),
             status: MemoryStatus::Active,

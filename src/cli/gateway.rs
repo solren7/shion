@@ -4,8 +4,8 @@ use std::sync::Arc;
 use crate::{
     agent::{
         daemon::{
-            BriefingSweep, DreamSweep, Maintenance, MemoryMonitorSweep, ReminderSweep, ReviewSweep,
-            Schedule, TaskSweep, WorkdayGated,
+            BriefingSweep, CronJobSweep, DreamSweep, Maintenance, MemoryMonitorSweep,
+            ReminderSweep, ReviewSweep, Schedule, TaskSweep, WorkdayGated,
         },
         gateway::{Gateway, MaintenanceService},
         interaction::{ApprovalState, ChatApprover, GatewayDispatcher},
@@ -14,6 +14,7 @@ use crate::{
     config::{ConfigSnapshot, IssueSeverity},
     domain::{
         approval::Approver,
+        cron::CronJobRepository,
         gateway::{MessageHandler, WeChatLogin},
         home::HomeRepository,
         notify::Notifier,
@@ -34,7 +35,7 @@ use crate::{
             telegram::{TelegramChannel, TelegramSender},
             wechat::{WeChatChannel, WeChatQrLogin, WeChatSender, build_bot},
         },
-        persistence::{db::Db, kanban::KanbanDb},
+        persistence::{cron::CronDb, db::Db, kanban::KanbanDb},
         workday::HolidayCalendar,
     },
     services::operator_control::actions::OperatorActions,
@@ -78,6 +79,8 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     }
     // Durable tasks in their own file, separate from disposable session state.
     let kanban = Arc::new(KanbanDb::connect(&rt.kanban_db_url).await?);
+    // Durable scheduled cron jobs, ditto (`komo cron`).
+    let cron_jobs: Arc<dyn CronJobRepository> = Arc::new(CronDb::connect(&rt.cron_db_url).await?);
 
     // Tool actions that need approval are gated over the chat channel: the
     // agent sends an approval prompt and waits for the user's `/approve` (or
@@ -249,6 +252,22 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         });
     }
 
+    // Cron jobs (`komo cron add`, stored in cron.db): one every-minute sweep
+    // reads the store and executes due jobs, so jobs added/removed/toggled
+    // while the gateway runs take effect on the next tick — no restart.
+    let cron_job_count = cron_jobs.list().await.map(|j| j.len()).unwrap_or(0);
+    gateway = gateway.with_maintenance(MaintenanceService {
+        name: "cron-jobs".to_string(),
+        schedule: Schedule::parse("* * * * *")?,
+        maintenance: Arc::new(CronJobSweep {
+            jobs: cron_jobs.clone(),
+            notifier: notifier.clone(),
+            // Agent-mode jobs run on the unattended full-tool cron runtime.
+            runtime: Some(wired.cron_runtime.clone()),
+        }),
+        alert: Some(notifier.clone()),
+    });
+
     // Dreaming — only when the user opted in with `dream_schedule`. Reads the
     // whole memory library, promotes well-recalled candidates to active, and
     // archives ones that never earned a recall. Never auto-pins.
@@ -335,6 +354,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             skills: wired.skills.clone(),
             pairings: pairings.clone(),
             home: db.clone(),
+            cron_jobs: cron_jobs.clone(),
         });
         gateway = gateway.add_channel(Box::new(ApiChannel::new(
             api,
@@ -361,10 +381,11 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             .unwrap_or_else(|| "off".to_string())
     };
     println!(
-        "Komo gateway — maintenance `{}`, reminders every minute, briefing {}, dreaming {}, channels: {}. Ctrl-C to stop.\n",
+        "Komo gateway — maintenance `{}`, reminders every minute, briefing {}, dreaming {}, jobs: {}, channels: {}. Ctrl-C to stop.\n",
         schedule_expr,
         fmt_opt(&briefing_expr),
         fmt_opt(&dream_expr),
+        format!("{cron_job_count} in cron.db"),
         if channels.is_empty() {
             "none".to_string()
         } else {

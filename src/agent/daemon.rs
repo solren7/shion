@@ -23,6 +23,7 @@ use croner::Cron;
 use tracing::{error, info, warn};
 
 use crate::domain::{
+    cron::{CronAction, CronJob, CronJobRepository, CronRunStatus},
     gateway::MessageHandler,
     llm::LlmClient,
     memory::{Memory, MemoryRepository},
@@ -98,6 +99,8 @@ pub struct MaintenanceSummary {
     pub memories_promoted: usize,
     /// Candidate memories the dream sweep archived (never earned a recall) this cycle.
     pub memories_archived: usize,
+    /// Cron-job commands that ran to a zero exit this sweep.
+    pub jobs_run: usize,
 }
 
 /// The fixed maintenance action: review every stored session that has at least
@@ -300,6 +303,284 @@ fn current_rss_bytes() -> Option<u64> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn current_rss_bytes() -> Option<u64> {
     None
+}
+
+/// Cap on the job output forwarded in a notification, so a chatty script can't
+/// blow past a chat platform's message limit. The delivered text is what the
+/// operator reads — logs keep nothing extra, so the cap discloses truncation.
+const JOB_OUTPUT_CAP: usize = 3000;
+
+/// Sweep the cron store (`~/.komo/cron.db`) every minute and execute due jobs —
+/// hermes' `no_agent` cron jobs analog. A job's command is operator-authored
+/// (`komo cron add` / the loopback-gated api — the same trust boundary as
+/// running the gateway itself), so it executes directly: no shell tool, no
+/// approver, no `[policy]` involvement. Reading the store per tick means jobs
+/// added/removed/toggled while the gateway runs take effect on the next tick,
+/// no restart.
+///
+/// **Claim-first**: a due job's `next_run_at` is advanced (and `last_run_at`
+/// stamped) *before* the command runs, so a crash mid-run can't re-fire the
+/// slot on restart, and a job running longer than a sweep tick can't be
+/// double-started. A gateway asleep over a slot runs the job late, once —
+/// `next_run_at` is computed from now, never replaying missed ticks (same rule
+/// as recurring reminders).
+///
+/// Every outcome is delivered, success and failure alike: a weekly job whose
+/// failures were only log lines would silently stop doing its work for weeks.
+/// A failed *command* still leaves the cycle `Ok` — the operator was told, and
+/// the breaker's minutes-scale cooldowns are meaningless on a weekly cron. Only
+/// delivery failure fails the cycle (nothing reached the operator, which *is*
+/// worth the breaker alert).
+pub struct CronJobSweep {
+    pub jobs: Arc<dyn CronJobRepository>,
+    pub notifier: Arc<dyn Notifier>,
+    /// The unattended, tool-capable agent that runs `CronAction::Agent` jobs
+    /// (wiring's `cron_runtime`: full tool set, policy-gated with a deny-all
+    /// inner approver — a `Risk::Normal` action passes only through an
+    /// `unattended` policy rule). `None` = command-only; an agent job then
+    /// degrades to an error delivery (the gateway always wires it).
+    pub runtime: Option<Arc<dyn MessageHandler>>,
+}
+
+#[async_trait]
+impl Maintenance for CronJobSweep {
+    async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut summary = MaintenanceSummary::default();
+        let due: Vec<CronJob> = self
+            .jobs
+            .list()
+            .await?
+            .into_iter()
+            .filter(|j| j.is_due(now))
+            .collect();
+
+        let mut delivery_failures = 0usize;
+        for mut job in due {
+            // Claim the slot before executing (see the type docs). A broken
+            // expression (bypassed add-time validation) disables the job with
+            // the reason recorded, rather than erroring every tick.
+            match next_occurrence_local(&job.schedule, now) {
+                Ok(next) => job.next_run_at = next,
+                Err(e) => {
+                    warn!(job = %job.name, error = %e, "broken cron schedule; disabling job");
+                    job.enabled = false;
+                    job.last_error = format!("invalid schedule: {e}");
+                }
+            }
+            job.last_run_at = Some(now);
+            if let Err(error) = self.jobs.update(&job).await {
+                // Unclaimed → don't run: missing one slot beats double-running it.
+                warn!(%error, job = %job.name, "failed to claim cron job; skipping this run");
+                continue;
+            }
+            if !job.enabled {
+                continue;
+            }
+
+            let started = std::time::Instant::now();
+            let (title, body, ok) = self.execute(&job, now).await;
+            if ok {
+                info!(job = %job.name, kind = job.action.kind(), elapsed_s = started.elapsed().as_secs(), "cron job succeeded");
+                summary.jobs_run += 1;
+            } else {
+                error!(job = %job.name, kind = job.action.kind(), elapsed_s = started.elapsed().as_secs(), outcome = %body, "cron job failed");
+            }
+            if let Err(error) = self.notifier.notify(&title, &body).await {
+                warn!(%error, job = %job.name, "failed to deliver cron job outcome");
+                delivery_failures += 1;
+            }
+            // Record the outcome best-effort (the run itself already happened).
+            job.last_status = Some(if ok {
+                CronRunStatus::Ok
+            } else {
+                CronRunStatus::Failed
+            });
+            job.last_error = if ok { String::new() } else { body };
+            if let Err(error) = self.jobs.update(&job).await {
+                warn!(%error, job = %job.name, "failed to record cron job outcome");
+            }
+        }
+        if delivery_failures > 0 {
+            anyhow::bail!("{delivery_failures} cron job notification(s) failed to deliver");
+        }
+        Ok(summary)
+    }
+}
+
+impl CronJobSweep {
+    /// Dispatch one due job to its action, returning (title, body, success).
+    async fn execute(&self, job: &CronJob, now: i64) -> (String, String, bool) {
+        match &job.action {
+            CronAction::Command {
+                command,
+                args,
+                workdir,
+                timeout_secs,
+            } => {
+                execute_cron_command(
+                    &job.name,
+                    command,
+                    args,
+                    workdir.as_deref(),
+                    Duration::from_secs(*timeout_secs),
+                )
+                .await
+            }
+            CronAction::Agent { prompt, skills } => {
+                self.execute_cron_agent(&job.name, prompt, skills, now)
+                    .await
+            }
+        }
+    }
+
+    /// Run an agent-mode job: one unattended turn on the cron runtime, its reply
+    /// delivered. A per-run session (`cron:<name>:<unix>`) keeps each scheduled
+    /// run an isolated, cleanly-ledgered turn — no cross-run contamination.
+    async fn execute_cron_agent(
+        &self,
+        name: &str,
+        prompt: &str,
+        skills: &[String],
+        now: i64,
+    ) -> (String, String, bool) {
+        let fail_title = format!("Komo job「{name}」failed");
+        let Some(handler) = &self.runtime else {
+            return (
+                fail_title,
+                "agent-mode cron jobs need the gateway's cron runtime, which is not wired"
+                    .to_string(),
+                false,
+            );
+        };
+        let session_id = format!("cron:{name}:{now}");
+        match handler
+            .handle(&session_id, cron_agent_prompt(prompt, skills))
+            .await
+        {
+            Ok(reply) => {
+                let reply = reply.trim();
+                let body = if reply.is_empty() {
+                    "(agent produced no output)".to_string()
+                } else {
+                    truncate_head(reply, JOB_OUTPUT_CAP)
+                };
+                (format!("Komo job「{name}」"), body, true)
+            }
+            Err(e) => (fail_title, format!("agent turn failed: {e}"), false),
+        }
+    }
+}
+
+/// Wrap an agent-job prompt with the skill-loading preamble (progressive
+/// disclosure — the turn loads each named skill before acting), mirroring the
+/// briefing's `agentic_briefing_prompt`. Pure, so the wording is testable.
+fn cron_agent_prompt(prompt: &str, skills: &[String]) -> String {
+    if skills.is_empty() {
+        return prompt.to_string();
+    }
+    let list = skills.join(", ");
+    format!(
+        "First load {} skill(s) with the `skill` tool (action=view: {list}) and follow \
+         the loaded instructions. Then carry out this task:\n\n{prompt}",
+        skills.len()
+    )
+}
+
+/// Run one command-mode job and render the notification (title, body, success).
+/// Free function so the outcome wording is testable without a store or notifier.
+async fn execute_cron_command(
+    name: &str,
+    command: &str,
+    args: &[String],
+    workdir: Option<&str>,
+    timeout: Duration,
+) -> (String, String, bool) {
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Dropping the wait future (timeout) must kill the process — a
+        // runaway job can't outlive its budget as an orphan.
+        .kill_on_drop(true);
+    if let Some(dir) = workdir {
+        cmd.current_dir(dir);
+    }
+    let fail_title = format!("Komo job「{name}」failed");
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return (
+                fail_title,
+                format!("could not start `{command}`: {e}"),
+                false,
+            );
+        }
+    };
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Err(_) => {
+            return (
+                fail_title,
+                format!("timed out after {}s (process killed)", timeout.as_secs()),
+                false,
+            );
+        }
+        Ok(Err(e)) => return (fail_title, format!("could not collect output: {e}"), false),
+        Ok(Ok(output)) => output,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        // The script's stdout is the message (hermes' no_agent contract: the
+        // wrapper formats its own push text). Head-capped — these messages
+        // lead with the summary.
+        let body = match stdout.trim() {
+            "" => "(command produced no output)".to_string(),
+            s => truncate_head(s, JOB_OUTPUT_CAP),
+        };
+        (format!("Komo job「{name}」"), body, true)
+    } else {
+        // Tail-capped: failure detail (a traceback, git's last words)
+        // accumulates at the end.
+        let mut combined = stdout.trim().to_string();
+        if !stderr.trim().is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(stderr.trim());
+        }
+        let body = format!(
+            "exit status: {}\n{}",
+            output.status,
+            truncate_tail(&combined, JOB_OUTPUT_CAP)
+        );
+        (fail_title, body, false)
+    }
+}
+
+/// Keep the first `cap` bytes (on a char boundary), disclosing the cut.
+fn truncate_head(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let mut end = cap;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n…(output truncated)", &s[..end])
+}
+
+/// Keep the last `cap` bytes (on a char boundary), disclosing the cut.
+fn truncate_tail(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let mut start = s.len() - cap;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…(earlier output truncated)\n{}", &s[start..])
 }
 
 /// Grace window: reminders missed by up to this many seconds are delivered late
@@ -772,6 +1053,7 @@ where
                     briefings = summary.briefings_sent,
                     promoted = summary.memories_promoted,
                     archived = summary.memories_archived,
+                    jobs = summary.jobs_run,
                     elapsed_s = started.elapsed().as_secs(),
                     "maintenance cycle complete"
                 );
@@ -859,7 +1141,10 @@ mod tests {
         // On a platform we sample, a reading was taken and recorded as the peak;
         // elsewhere it stays 0. Either way peak is monotonic across cycles.
         let after_first = sweep.peak_rss.load(std::sync::atomic::Ordering::Relaxed);
-        sweep.run().await.expect("second monitor cycle must not error");
+        sweep
+            .run()
+            .await
+            .expect("second monitor cycle must not error");
         let after_second = sweep.peak_rss.load(std::sync::atomic::Ordering::Relaxed);
         assert!(after_second >= after_first, "peak RSS must never decrease");
     }
@@ -936,6 +1221,323 @@ mod tests {
                 .push((title.to_string(), body.to_string()));
             Ok(())
         }
+    }
+
+    // ── CronJobSweep ──────────────────────────────────────────────────────────
+
+    #[derive(Default)]
+    struct FakeCronRepo {
+        jobs: Mutex<Vec<CronJob>>,
+    }
+
+    #[async_trait]
+    impl CronJobRepository for FakeCronRepo {
+        async fn save(&self, job: &CronJob) -> anyhow::Result<()> {
+            self.jobs.lock().unwrap().push(job.clone());
+            Ok(())
+        }
+        async fn list(&self) -> anyhow::Result<Vec<CronJob>> {
+            Ok(self.jobs.lock().unwrap().clone())
+        }
+        async fn find_by_name(&self, name: &str) -> anyhow::Result<Option<CronJob>> {
+            Ok(self
+                .jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|j| j.name == name)
+                .cloned())
+        }
+        async fn update(&self, job: &CronJob) -> anyhow::Result<()> {
+            let mut jobs = self.jobs.lock().unwrap();
+            let slot = jobs
+                .iter_mut()
+                .find(|j| j.id == job.id)
+                .ok_or_else(|| anyhow::anyhow!("not found"))?;
+            *slot = job.clone();
+            Ok(())
+        }
+        async fn delete(&self, name: &str) -> anyhow::Result<bool> {
+            let mut jobs = self.jobs.lock().unwrap();
+            let before = jobs.len();
+            jobs.retain(|j| j.name != name);
+            Ok(jobs.len() < before)
+        }
+    }
+
+    /// A command job due now, running `/bin/sh -c <script>` with a 10s budget.
+    fn due_job(name: &str, script: &str) -> CronJob {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        CronJob::new(
+            name,
+            "* * * * *",
+            CronAction::Command {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                workdir: None,
+                timeout_secs: 10,
+            },
+            now,
+        )
+    }
+
+    fn cron_sweep_with(
+        jobs: Vec<CronJob>,
+        notifier_fail: bool,
+    ) -> (CronJobSweep, Arc<FakeCronRepo>, Arc<FakeNotifier>) {
+        cron_sweep_full(jobs, notifier_fail, None)
+    }
+
+    fn cron_sweep_full(
+        jobs: Vec<CronJob>,
+        notifier_fail: bool,
+        runtime: Option<Arc<dyn MessageHandler>>,
+    ) -> (CronJobSweep, Arc<FakeCronRepo>, Arc<FakeNotifier>) {
+        let repo = Arc::new(FakeCronRepo {
+            jobs: Mutex::new(jobs),
+        });
+        let notifier = Arc::new(FakeNotifier {
+            fail: notifier_fail,
+            ..Default::default()
+        });
+        let sweep = CronJobSweep {
+            jobs: repo.clone(),
+            notifier: notifier.clone(),
+            runtime,
+        };
+        (sweep, repo, notifier)
+    }
+
+    #[tokio::test]
+    async fn cron_job_success_delivers_stdout_and_reschedules() {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let (sweep, repo, notifier) =
+            cron_sweep_with(vec![due_job("test-job", "echo hello-from-job")], false);
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.jobs_run, 1);
+        let calls = notifier.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].0.contains("test-job"));
+        assert_eq!(calls[0].1, "hello-from-job");
+        let job = repo.jobs.lock().unwrap()[0].clone();
+        assert!(job.next_run_at > now, "the fired slot is rescheduled");
+        assert_eq!(job.last_status, Some(CronRunStatus::Ok));
+        assert!(job.last_error.is_empty());
+        assert!(job.last_run_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn cron_job_failure_records_and_delivers_exit_and_stderr() {
+        let (sweep, repo, notifier) = cron_sweep_with(
+            vec![due_job("test-job", "echo partial; echo boom >&2; exit 3")],
+            false,
+        );
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(
+            summary.jobs_run, 0,
+            "a failed command is not a completed job"
+        );
+        let calls = notifier.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "failure is delivered, not just logged");
+        assert!(calls[0].0.contains("failed"));
+        assert!(
+            calls[0].1.contains("3"),
+            "exit code surfaces: {}",
+            calls[0].1
+        );
+        assert!(calls[0].1.contains("partial"));
+        assert!(calls[0].1.contains("boom"));
+        let job = repo.jobs.lock().unwrap()[0].clone();
+        assert_eq!(job.last_status, Some(CronRunStatus::Failed));
+        assert!(job.last_error.contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn cron_job_skips_future_and_disabled_jobs() {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut future = due_job("future", "echo nope");
+        future.next_run_at = now + 3600;
+        let mut disabled = due_job("disabled", "echo nope");
+        disabled.enabled = false;
+        let (sweep, repo, notifier) = cron_sweep_with(vec![future, disabled], false);
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.jobs_run, 0);
+        assert!(notifier.calls.lock().unwrap().is_empty());
+        // Neither was claimed or touched.
+        assert!(
+            repo.jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|j| j.last_run_at.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_job_broken_schedule_is_disabled_not_run() {
+        let mut job = due_job("broken", "echo nope");
+        job.schedule = "not a cron".into();
+        let (sweep, repo, notifier) = cron_sweep_with(vec![job], false);
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.jobs_run, 0);
+        assert!(
+            notifier.calls.lock().unwrap().is_empty(),
+            "the command never ran"
+        );
+        let job = repo.jobs.lock().unwrap()[0].clone();
+        assert!(!job.enabled, "a broken schedule disables the job");
+        assert!(job.last_error.contains("invalid schedule"));
+    }
+
+    #[tokio::test]
+    async fn cron_job_timeout_kills_and_reports() {
+        let mut job = due_job("slow", "sleep 30");
+        if let CronAction::Command { timeout_secs, .. } = &mut job.action {
+            *timeout_secs = 1;
+        }
+        let (sweep, _repo, notifier) = cron_sweep_with(vec![job], false);
+        let started = std::time::Instant::now();
+        let summary = sweep.run().await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait must not outlive the budget"
+        );
+        assert_eq!(summary.jobs_run, 0);
+        let calls = notifier.calls.lock().unwrap();
+        assert!(calls[0].1.contains("timed out"), "got: {}", calls[0].1);
+    }
+
+    #[tokio::test]
+    async fn cron_job_spawn_error_is_delivered() {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let job = CronJob::new(
+            "ghost",
+            "* * * * *",
+            CronAction::Command {
+                command: "/nonexistent/komo-test-binary".into(),
+                args: vec![],
+                workdir: None,
+                timeout_secs: 5,
+            },
+            now,
+        );
+        let (sweep, _repo, notifier) = cron_sweep_with(vec![job], false);
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.jobs_run, 0);
+        let calls = notifier.calls.lock().unwrap();
+        assert!(calls[0].1.contains("could not start"));
+    }
+
+    /// A fake agent handler that records (session_id, message), to exercise
+    /// agent-mode cron jobs. (The briefing tests' `FakeHandler` records only the
+    /// message; cron needs the session id too.)
+    struct FakeCronHandler {
+        reply: String,
+        seen: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl MessageHandler for FakeCronHandler {
+        async fn handle(&self, session_id: &str, message: String) -> anyhow::Result<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), message));
+            Ok(self.reply.clone())
+        }
+    }
+
+    fn agent_job(name: &str, prompt: &str, skills: Vec<String>) -> CronJob {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        CronJob::new(
+            name,
+            "* * * * *",
+            CronAction::Agent {
+                prompt: prompt.to_string(),
+                skills,
+            },
+            now,
+        )
+    }
+
+    #[tokio::test]
+    async fn cron_agent_job_runs_turn_and_delivers_reply() {
+        let handler = Arc::new(FakeCronHandler {
+            reply: "本周值班：Alice".to_string(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let (sweep, repo, notifier) = cron_sweep_full(
+            vec![agent_job(
+                "brief",
+                "总结告警轮换",
+                vec!["alarmhandler".into()],
+            )],
+            false,
+            Some(handler.clone()),
+        );
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.jobs_run, 1);
+        // The turn ran on a per-run cron session, with the skill-load preamble.
+        let seen = handler.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].0.starts_with("cron:brief:"));
+        assert!(
+            seen[0].1.contains("alarmhandler"),
+            "skill preamble: {}",
+            seen[0].1
+        );
+        assert!(seen[0].1.contains("总结告警轮换"));
+        // The reply was delivered and recorded.
+        assert_eq!(notifier.calls.lock().unwrap()[0].1, "本周值班：Alice");
+        assert_eq!(
+            repo.jobs.lock().unwrap()[0].last_status,
+            Some(CronRunStatus::Ok)
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_agent_job_without_runtime_reports_error() {
+        let (sweep, repo, notifier) =
+            cron_sweep_full(vec![agent_job("brief", "do it", vec![])], false, None);
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.jobs_run, 0);
+        assert!(notifier.calls.lock().unwrap()[0].0.contains("failed"));
+        assert_eq!(
+            repo.jobs.lock().unwrap()[0].last_status,
+            Some(CronRunStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn cron_agent_prompt_prepends_skill_load() {
+        assert_eq!(cron_agent_prompt("do X", &[]), "do X");
+        let p = cron_agent_prompt("do X", &["a".into(), "b".into()]);
+        assert!(p.contains("action=view: a, b"));
+        assert!(p.contains("do X"));
+    }
+
+    #[tokio::test]
+    async fn cron_job_notifier_failure_fails_the_cycle() {
+        // Nothing reached the operator — that is the one outcome worth the
+        // breaker (a failed *command* still returns Ok, it was delivered).
+        let (sweep, repo, _notifier) = cron_sweep_with(vec![due_job("test-job", "echo hi")], true);
+        assert!(sweep.run().await.is_err());
+        // The slot was still claimed and the outcome still recorded.
+        let job = repo.jobs.lock().unwrap()[0].clone();
+        assert_eq!(job.last_status, Some(CronRunStatus::Ok));
+    }
+
+    #[test]
+    fn job_output_truncation_keeps_boundaries_and_discloses() {
+        assert_eq!(truncate_head("short", 100), "short");
+        assert_eq!(truncate_tail("short", 100), "short");
+        let long = "然".repeat(100); // 3 bytes per char — caps land mid-char
+        let head = truncate_head(&long, 10);
+        assert!(head.starts_with("然然然"));
+        assert!(head.ends_with("…(output truncated)"));
+        let tail = truncate_tail(&long, 10);
+        assert!(tail.starts_with("…(earlier output truncated)"));
+        assert!(tail.ends_with("然然然"));
     }
 
     fn sweep_with(

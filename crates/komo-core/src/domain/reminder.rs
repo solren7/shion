@@ -43,10 +43,7 @@ pub struct Reminder {
 impl Reminder {
     pub fn new(message: String, run_at: i64) -> Self {
         Self {
-            id: format!(
-                "rem-{}",
-                time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-            ),
+            id: format!("rem-{}", uuid::Uuid::now_v7()),
             message,
             run_at,
             status: ReminderStatus::Pending,
@@ -57,10 +54,7 @@ impl Reminder {
 
     pub fn recurring(message: String, run_at: i64, schedule: String) -> Self {
         Self {
-            id: format!(
-                "rem-{}",
-                time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-            ),
+            id: format!("rem-{}", uuid::Uuid::now_v7()),
             message,
             run_at,
             status: ReminderStatus::Pending,

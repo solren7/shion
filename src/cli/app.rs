@@ -197,8 +197,50 @@ enum ModelAction {
 
 #[derive(Subcommand)]
 enum CronAction {
-    /// List pending reminders with their schedules and next fire times
+    /// List scheduled jobs (cron.db) and pending reminders
     List,
+    /// Add a command job: a fixed command the gateway runs on a cron
+    /// schedule, its stdout delivered to the home channel (deterministic, no LLM)
+    Add {
+        /// Unique job name (e.g. weekly-alarmhandler-rotation)
+        name: String,
+        /// 5-field cron expression in local time (e.g. "0 14 * * 5")
+        schedule: String,
+        /// Program to execute (absolute path; run directly, not via a shell)
+        command: String,
+        /// Arguments passed to the command (after `--`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Working directory for the command
+        #[arg(long)]
+        workdir: Option<String>,
+        /// Wall-clock budget in seconds (default 900; process killed past it)
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+    },
+    /// Add an agent job: the gateway runs a prompt through an unattended,
+    /// tool-capable agent turn on schedule and delivers the reply. Side effects
+    /// are gated by [policy] (only `unattended = true` rules grant them).
+    AddAgent {
+        /// Unique job name
+        name: String,
+        /// 5-field cron expression in local time (e.g. "0 8 * * *")
+        schedule: String,
+        /// The instruction the agent runs each fire
+        prompt: String,
+        /// Skill(s) to load before running the prompt (repeatable)
+        #[arg(long = "skill")]
+        skills: Vec<String>,
+    },
+    /// Remove a scheduled job by name
+    Remove { name: String },
+    /// Re-enable a disabled job (next fire recomputed from now)
+    Enable { name: String },
+    /// Disable a job without deleting it
+    Disable { name: String },
+    /// Fire a job now: it becomes due and runs on the gateway's next sweep
+    /// tick (within a minute)
+    Run { name: String },
 }
 
 #[derive(Subcommand)]
@@ -411,6 +453,55 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Upgrade { no_restart } => upgrade::run(no_restart),
         Commands::Cron { action } => match action {
             CronAction::List => inspect::cron_list(&operator(&config).await?).await,
+            CronAction::Add {
+                name,
+                schedule,
+                command,
+                args,
+                workdir,
+                timeout_secs,
+            } => {
+                inspect::cron_add(
+                    &operator(&config).await?,
+                    crate::domain::cron::CronJobSpec {
+                        name,
+                        schedule,
+                        action: crate::domain::cron::CronAction::Command {
+                            command,
+                            args,
+                            workdir,
+                            timeout_secs: timeout_secs.unwrap_or(0),
+                        },
+                    },
+                )
+                .await
+            }
+            CronAction::AddAgent {
+                name,
+                schedule,
+                prompt,
+                skills,
+            } => {
+                inspect::cron_add(
+                    &operator(&config).await?,
+                    crate::domain::cron::CronJobSpec {
+                        name,
+                        schedule,
+                        action: crate::domain::cron::CronAction::Agent { prompt, skills },
+                    },
+                )
+                .await
+            }
+            CronAction::Remove { name } => {
+                inspect::cron_remove(&operator(&config).await?, &name).await
+            }
+            CronAction::Enable { name } => {
+                inspect::cron_set_enabled(&operator(&config).await?, &name, true).await
+            }
+            CronAction::Disable { name } => {
+                inspect::cron_set_enabled(&operator(&config).await?, &name, false).await
+            }
+            CronAction::Run { name } => inspect::cron_run(&operator(&config).await?, &name).await,
         },
         Commands::Session { action } => match action {
             SessionAction::List => inspect::session_list(&operator(&config).await?).await,

@@ -1,0 +1,457 @@
+//! The cron store: durable scheduled jobs, in their **own** SQLite file
+//! (`~/.komo/cron.db`), separate from disposable `state.db` (mirroring
+//! `kanban.db`'s rationale: a job silently vanishing on a state reset means its
+//! work silently stops happening). `CronDb` is the only place toasty appears
+//! for cron jobs. Born Turso-native — no legacy SQLite migration path.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use toasty_driver_turso::Turso;
+
+use crate::domain::cron::{CronAction, CronJob, CronJobRepository, parse_cron_run_status};
+use crate::infra::persistence::{DEFAULT_POOL_SIZE, prepare_turso_path, with_write_retry};
+
+// Optional i64 fields use 0 as the "unset" sentinel; `args` is a JSON array
+// string; `enabled` is 0/1; `last_status` is ""/"ok"/"failed" (same conventions
+// as the other stores).
+#[derive(Debug, toasty::Model)]
+struct CronJobRecord {
+    #[key]
+    id: String,
+    #[index]
+    name: String,
+    schedule: String,
+    /// "command" | "agent" — discriminates the columns below.
+    kind: String,
+    // Command-mode columns (empty/0 for agent jobs).
+    command: String,
+    args: String,
+    workdir: String,
+    timeout_secs: i64,
+    // Agent-mode columns (empty for command jobs).
+    prompt: String,
+    skills: String,
+    enabled: i64,
+    next_run_at: i64,
+    last_run_at: i64,
+    last_status: String,
+    last_error: String,
+    created_at: i64,
+}
+
+/// Connection to the cron database. Holds only `CronJobRecord`.
+pub struct CronDb {
+    inner: Arc<toasty::Db>,
+}
+
+impl CronDb {
+    pub async fn connect(url: &str) -> anyhow::Result<Self> {
+        let (path, is_new) = prepare_turso_path(url)?;
+        // Durable data must never need a destructive reset: bring an existing
+        // file up to the current column set in place (additive ALTER TABLE ADD
+        // COLUMN), before toasty opens it. This is what lets a cron.db written
+        // by the command-only version gain the agent-mode columns
+        // (kind/prompt/skills) on upgrade. Extend `EXPECTED` for every new
+        // `CronJobRecord` column. See `infra/persistence::ensure_columns`.
+        if !is_new && let Some(p) = &path {
+            const EXPECTED: &[(&str, &str)] = &[
+                ("kind", "\"kind\" text NOT NULL DEFAULT 'command'"),
+                ("prompt", "\"prompt\" text NOT NULL DEFAULT ''"),
+                ("skills", "\"skills\" text NOT NULL DEFAULT ''"),
+            ];
+            crate::infra::persistence::ensure_columns(p, "cron_job_records", EXPECTED).await?;
+        }
+        let driver = match &path {
+            Some(p) => Turso::file(p).concurrent_writes(),
+            None => Turso::in_memory().concurrent_writes(),
+        };
+        let db = toasty::Db::builder()
+            .models(toasty::models!(CronJobRecord))
+            .max_pool_size(DEFAULT_POOL_SIZE)
+            .build(driver)
+            .await?;
+        if is_new {
+            db.push_schema().await?;
+        }
+        if let Some(p) = &path {
+            // Born Turso-native: stamp the marker so the shared prologue never
+            // mistakes this file for a legacy SQLite db later.
+            let marker = crate::infra::persistence::turso_marker_path(p);
+            if !marker.exists() {
+                std::fs::write(&marker, b"turso-native\n").ok();
+            }
+        }
+        Ok(Self {
+            inner: Arc::new(db),
+        })
+    }
+}
+
+#[async_trait]
+impl CronJobRepository for CronDb {
+    async fn save(&self, job: &CronJob) -> anyhow::Result<()> {
+        let cols = ActionColumns::from_action(&job.action)?;
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            toasty::create!(CronJobRecord {
+                id: job.id.clone(),
+                name: job.name.clone(),
+                schedule: job.schedule.clone(),
+                kind: job.action.kind().to_string(),
+                command: cols.command.clone(),
+                args: cols.args.clone(),
+                workdir: cols.workdir.clone(),
+                timeout_secs: cols.timeout_secs,
+                prompt: cols.prompt.clone(),
+                skills: cols.skills.clone(),
+                enabled: job.enabled as i64,
+                next_run_at: job.next_run_at,
+                last_run_at: job.last_run_at.unwrap_or(0),
+                last_status: job
+                    .last_status
+                    .as_ref()
+                    .map(|s| s.as_str().to_string())
+                    .unwrap_or_default(),
+                last_error: job.last_error.clone(),
+                created_at: job.created_at,
+            })
+            .exec(&mut conn)
+            .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<CronJob>> {
+        let mut conn = self.inner.connection().await?;
+        let rows = toasty::query!(CronJobRecord).exec(&mut conn).await?;
+        let mut jobs = rows
+            .into_iter()
+            .map(job_from_record)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        jobs.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(jobs)
+    }
+
+    async fn find_by_name(&self, name: &str) -> anyhow::Result<Option<CronJob>> {
+        let mut conn = self.inner.connection().await?;
+        let rows = toasty::query!(CronJobRecord).exec(&mut conn).await?;
+        for record in rows {
+            if record.name == name {
+                return Ok(Some(job_from_record(record)?));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn update(&self, job: &CronJob) -> anyhow::Result<()> {
+        let cols = ActionColumns::from_action(&job.action)?;
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let mut record = CronJobRecord::get_by_id(&mut conn, &job.id).await?;
+            record
+                .update()
+                .name(job.name.clone())
+                .schedule(job.schedule.clone())
+                .kind(job.action.kind().to_string())
+                .command(cols.command.clone())
+                .args(cols.args.clone())
+                .workdir(cols.workdir.clone())
+                .timeout_secs(cols.timeout_secs)
+                .prompt(cols.prompt.clone())
+                .skills(cols.skills.clone())
+                .enabled(job.enabled as i64)
+                .next_run_at(job.next_run_at)
+                .last_run_at(job.last_run_at.unwrap_or(0))
+                .last_status(
+                    job.last_status
+                        .as_ref()
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_default(),
+                )
+                .last_error(job.last_error.clone())
+                .exec(&mut conn)
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete(&self, name: &str) -> anyhow::Result<bool> {
+        let Some(job) = self.find_by_name(name).await? else {
+            return Ok(false);
+        };
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let record = CronJobRecord::get_by_id(&mut conn, &job.id).await?;
+            record.delete().exec(&mut conn).await?;
+            Ok(())
+        })
+        .await?;
+        Ok(true)
+    }
+}
+
+/// The action fields flattened into record columns; the unused side stays
+/// empty/zero. Keeps the enum → columns mapping in one place for save/update.
+struct ActionColumns {
+    command: String,
+    args: String,
+    workdir: String,
+    timeout_secs: i64,
+    prompt: String,
+    skills: String,
+}
+
+impl ActionColumns {
+    fn from_action(action: &CronAction) -> anyhow::Result<Self> {
+        Ok(match action {
+            CronAction::Command {
+                command,
+                args,
+                workdir,
+                timeout_secs,
+            } => Self {
+                command: command.clone(),
+                args: serde_json::to_string(args)?,
+                workdir: workdir.clone().unwrap_or_default(),
+                timeout_secs: *timeout_secs as i64,
+                prompt: String::new(),
+                skills: String::new(),
+            },
+            CronAction::Agent { prompt, skills } => Self {
+                command: String::new(),
+                args: String::new(),
+                workdir: String::new(),
+                timeout_secs: 0,
+                prompt: prompt.clone(),
+                skills: serde_json::to_string(skills)?,
+            },
+        })
+    }
+}
+
+fn job_from_record(record: CronJobRecord) -> anyhow::Result<CronJob> {
+    let nonzero = |v: i64| (v != 0).then_some(v);
+    // Default to command for legacy rows written before `kind` existed.
+    let action = if record.kind == "agent" {
+        CronAction::Agent {
+            prompt: record.prompt,
+            skills: serde_json::from_str(&record.skills).unwrap_or_default(),
+        }
+    } else {
+        CronAction::Command {
+            command: record.command,
+            args: serde_json::from_str(&record.args).unwrap_or_default(),
+            workdir: (!record.workdir.is_empty()).then_some(record.workdir),
+            timeout_secs: record.timeout_secs.max(0) as u64,
+        }
+    };
+    Ok(CronJob {
+        id: record.id,
+        name: record.name,
+        schedule: record.schedule,
+        action,
+        enabled: record.enabled != 0,
+        next_run_at: record.next_run_at,
+        last_run_at: nonzero(record.last_run_at),
+        last_status: parse_cron_run_status(&record.last_status),
+        last_error: record.last_error,
+        created_at: record.created_at,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::cron::CronRunStatus;
+
+    fn turso_url(name: &str) -> String {
+        let path = std::env::temp_dir().join(name);
+        crate::infra::persistence::reset_test_db(&path);
+        format!("turso:{}", path.display())
+    }
+
+    #[tokio::test]
+    async fn job_roundtrip_update_and_delete() {
+        let db = CronDb::connect(&turso_url("komo_cron_repo_test.db"))
+            .await
+            .unwrap();
+        let job = CronJob::new(
+            "weekly",
+            "0 14 * * 5",
+            CronAction::Command {
+                command: "/opt/rotate.py".into(),
+                args: vec!["--push".into(), "第二个".into()],
+                workdir: Some("/opt".into()),
+                timeout_secs: 600,
+            },
+            1234,
+        );
+
+        db.save(&job).await.unwrap();
+        let listed = db.list().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "weekly");
+        let CronAction::Command {
+            command,
+            args,
+            workdir,
+            timeout_secs,
+        } = &listed[0].action
+        else {
+            panic!("command job");
+        };
+        assert_eq!(command, "/opt/rotate.py");
+        assert_eq!(args, &vec!["--push".to_string(), "第二个".to_string()]);
+        assert_eq!(workdir.as_deref(), Some("/opt"));
+        assert_eq!(*timeout_secs, 600);
+        assert_eq!(listed[0].next_run_at, 1234);
+        assert!(listed[0].enabled);
+        assert!(listed[0].last_status.is_none());
+
+        let mut updated = listed[0].clone();
+        updated.enabled = false;
+        updated.next_run_at = 9999;
+        updated.last_run_at = Some(5000);
+        updated.last_status = Some(CronRunStatus::Failed);
+        updated.last_error = "exit status: 3".into();
+        db.update(&updated).await.unwrap();
+
+        let found = db.find_by_name("weekly").await.unwrap().unwrap();
+        assert!(!found.enabled);
+        assert_eq!(found.next_run_at, 9999);
+        assert_eq!(found.last_run_at, Some(5000));
+        assert_eq!(found.last_status, Some(CronRunStatus::Failed));
+        assert_eq!(found.last_error, "exit status: 3");
+
+        assert!(db.delete("weekly").await.unwrap());
+        assert!(
+            !db.delete("weekly").await.unwrap(),
+            "second delete is a no-op"
+        );
+        assert!(db.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upgrades_command_only_schema_in_place() {
+        let path = std::env::temp_dir().join("komo_cron_addcol.db");
+        crate::infra::persistence::reset_test_db(&path);
+
+        // 1. Seed a turso file with the OLD command-only schema (no
+        //    kind/prompt/skills) + one command row, then drop the handle.
+        {
+            let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+            conn.execute(
+                "CREATE TABLE \"cron_job_records\" (\
+                 \"id\" TEXT NOT NULL, \"name\" TEXT NOT NULL, \"schedule\" TEXT NOT NULL, \
+                 \"command\" TEXT NOT NULL, \"args\" TEXT NOT NULL, \"workdir\" TEXT NOT NULL, \
+                 \"timeout_secs\" BIGINT NOT NULL, \"enabled\" BIGINT NOT NULL, \
+                 \"next_run_at\" BIGINT NOT NULL, \"last_run_at\" BIGINT NOT NULL, \
+                 \"last_status\" TEXT NOT NULL, \"last_error\" TEXT NOT NULL, \
+                 \"created_at\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO \"cron_job_records\" VALUES \
+                 ('id-1', 'legacy', '0 14 * * 5', '/opt/rotate.py', '[\"--push\"]', '', \
+                 900, 1, 1000, 0, '', '', 100)",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        std::fs::write(
+            crate::infra::persistence::turso_marker_path(&path),
+            b"turso-native\n",
+        )
+        .unwrap();
+
+        // 2. Connect: ensure_columns adds kind/prompt/skills in place, and the
+        //    legacy row reads back as a command job (kind defaults to 'command').
+        let db = CronDb::connect(&format!("turso:{}", path.display()))
+            .await
+            .unwrap();
+        let found = db.find_by_name("legacy").await.unwrap().unwrap();
+        let CronAction::Command { command, args, .. } = &found.action else {
+            panic!("legacy row must read as a command job");
+        };
+        assert_eq!(command, "/opt/rotate.py");
+        assert_eq!(args, &vec!["--push".to_string()]);
+
+        // 3. The added columns are usable: an agent job saves and reads back.
+        db.save(&CronJob::new(
+            "brief",
+            "0 8 * * *",
+            CronAction::Agent {
+                prompt: "hi".into(),
+                skills: vec!["s".into()],
+            },
+            0,
+        ))
+        .await
+        .unwrap();
+        let agent = db.find_by_name("brief").await.unwrap().unwrap();
+        assert_eq!(agent.action.kind(), "agent");
+    }
+
+    #[tokio::test]
+    async fn agent_job_roundtrips() {
+        let db = CronDb::connect(&turso_url("komo_cron_agent_test.db"))
+            .await
+            .unwrap();
+        let job = CronJob::new(
+            "brief",
+            "0 8 * * *",
+            CronAction::Agent {
+                prompt: "总结我今天的日程".into(),
+                skills: vec!["calendar".into(), "weather".into()],
+            },
+            42,
+        );
+        db.save(&job).await.unwrap();
+        let found = db.find_by_name("brief").await.unwrap().unwrap();
+        let CronAction::Agent { prompt, skills } = &found.action else {
+            panic!("agent job");
+        };
+        assert_eq!(prompt, "总结我今天的日程");
+        assert_eq!(skills, &vec!["calendar".to_string(), "weather".to_string()]);
+        assert_eq!(found.next_run_at, 42);
+    }
+
+    #[tokio::test]
+    async fn find_by_name_returns_none_for_unknown() {
+        let db = CronDb::connect(&turso_url("komo_cron_find_test.db"))
+            .await
+            .unwrap();
+        assert!(db.find_by_name("nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn list_orders_by_name() {
+        let db = CronDb::connect(&turso_url("komo_cron_order_test.db"))
+            .await
+            .unwrap();
+        for name in ["zeta", "alpha", "mid"] {
+            db.save(&CronJob::new_command(name, "* * * * *", "/bin/true", 0))
+                .await
+                .unwrap();
+        }
+        let names: Vec<String> = db
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|j| j.name)
+            .collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+}

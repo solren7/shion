@@ -6,6 +6,7 @@
 //! single source of truth, not in either transport.
 
 use crate::domain::{
+    cron::{CronJob, CronJobSpec},
     memory::Memory,
     reminder::Reminder,
     run::{Run, RunStep},
@@ -43,6 +44,8 @@ pub enum OperatorQuery {
     SkillAudit { name: String },
     /// The `/sethome` runtime override (`None` when unset).
     HomeOverride,
+    /// Every scheduled cron job (enabled or not), by name.
+    CronJobs,
 }
 
 /// The reply to an [`OperatorQuery`], variant-for-variant. Callers match
@@ -59,6 +62,7 @@ pub enum OperatorQueryResult {
     DreamPreview(DreamReport),
     SkillAudit(Vec<SkillInvocation>),
     HomeOverride(Option<String>),
+    CronJobs(Vec<CronJob>),
 }
 
 /// A state-changing operator action (host-operator writes; the gateway serves
@@ -80,6 +84,17 @@ pub enum OperatorCommand {
     PairRevoke { id: String },
     /// Run one dreaming consolidation cycle.
     DreamApply,
+    /// Create a scheduled cron job (validated; duplicate names refused).
+    CronAdd { spec: CronJobSpec },
+    /// Delete a cron job by name.
+    CronRemove { name: String },
+    /// Enable or disable a cron job. Re-enabling recomputes `next_run_at`
+    /// from now, so a long-disabled job doesn't fire immediately off its
+    /// stale slot.
+    CronSetEnabled { name: String, enabled: bool },
+    /// Make a job due now — it fires on the gateway's next sweep tick
+    /// (within a minute). With no gateway running, it fires once one starts.
+    CronTrigger { name: String },
 }
 
 /// The reply to an [`OperatorCommand`], variant-for-variant.
@@ -102,6 +117,11 @@ pub enum OperatorCommandResult {
         promoted: usize,
         archived: usize,
     },
+    /// The created job (with its computed `next_run_at`).
+    CronAdded(Box<CronJob>),
+    CronRemoved,
+    /// The job after an enable/disable/trigger update.
+    CronUpdated(Box<CronJob>),
 }
 
 /// A memory governance transition. The domain owns the semantics

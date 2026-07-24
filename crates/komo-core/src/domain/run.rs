@@ -97,10 +97,7 @@ impl Run {
     /// Open a new run for `session_id`, started now.
     pub fn start(session_id: &str, input: &str) -> Self {
         Self {
-            id: format!(
-                "run-{}",
-                time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-            ),
+            id: format!("run-{}", uuid::Uuid::now_v7()),
             session_id: session_id.to_string(),
             input: truncate(input, RUN_FIELD_CAP),
             plan: String::new(),
